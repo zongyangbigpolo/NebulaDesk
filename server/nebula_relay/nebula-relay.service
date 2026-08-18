@@ -1,0 +1,26 @@
+[Unit]
+Description=Nebula QUIC relay (blind-forward, media fallback)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust paths to where you installed the binary and certificate.
+ExecStart=/usr/local/bin/nebula_relay --port 7100 \
+    --cert /etc/nebula-relay/relay_cert.pem \
+    --key  /etc/nebula-relay/relay_key.pem
+Restart=always
+RestartSec=2
+# Run unprivileged; port 7100 is > 1024 so no extra capability is needed.
+User=nebula-relay
+Group=nebula-relay
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/etc/nebula-relay
+# QUIC is UDP; no special socket options required.
+
+[Install]
+WantedBy=multi-user.target

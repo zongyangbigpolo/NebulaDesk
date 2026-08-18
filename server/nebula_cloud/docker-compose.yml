@@ -1,0 +1,45 @@
+version: '3.9'
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: nebula
+      POSTGRES_PASSWORD: nebula
+      POSTGRES_DB: nebula_cloud
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U nebula -d nebula_cloud']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  nebula-cloud:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PORT: 4000
+      HOST: 0.0.0.0
+      DATABASE_URL: postgresql://nebula:nebula@postgres:5432/nebula_cloud?schema=public
+      JWT_ACCESS_SECRET: compose-access-secret-1234567890
+      JWT_REFRESH_SECRET: compose-refresh-secret-1234567890
+      JWT_SESSION_SECRET: compose-session-secret-1234567890
+      ACCESS_TOKEN_TTL_SECONDS: 900
+      REFRESH_TOKEN_TTL_SECONDS: 2592000
+      SESSION_TOKEN_TTL_SECONDS: 60
+      CLAIM_CODE_TTL_SECONDS: 3600
+      DEVICE_ONLINE_WINDOW_SECONDS: 120
+      RELAY_PUBLIC_HOST: host.docker.internal
+      RELAY_PUBLIC_PORT: 7100
+      RELAY_SHARED_SECRET: compose-relay-shared-secret-1234
+    ports:
+      - '4000:4000'
+
+volumes:
+  postgres-data:

@@ -1,0 +1,4 @@
+.deploybuild/
+build/
+CMakeLists.deploy.txt
+certs/*.pem

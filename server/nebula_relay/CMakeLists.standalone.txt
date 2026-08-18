@@ -1,0 +1,44 @@
+# Standalone build for nebula_relay so it can be compiled on a Linux server
+# without the rest of the Nebula tree. Only needs RelayProtocol.h from core.
+#
+#   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+#   cmake --build build
+#
+cmake_minimum_required(VERSION 3.16)
+project(nebula_relay LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+# Locate msquic (Linux: /usr/lib or /usr/local/lib; macOS: Homebrew).
+find_path(MSQUIC_INCLUDE_DIR msquic.h
+    HINTS /usr/include /usr/local/include /opt/homebrew/include
+          ${CMAKE_CURRENT_SOURCE_DIR}/msquic/include)
+find_library(MSQUIC_LIB msquic
+    HINTS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib /opt/homebrew/lib
+          ${CMAKE_CURRENT_SOURCE_DIR}/msquic/lib)
+
+if(NOT MSQUIC_INCLUDE_DIR OR NOT MSQUIC_LIB)
+    message(FATAL_ERROR
+        "msquic not found. Install it first:\n"
+        "  Ubuntu/Debian: see https://github.com/microsoft/msquic/blob/main/docs/Deployment.md\n"
+        "  macOS:         brew install libmsquic")
+endif()
+
+# For the optional SaaS authorization callback (--saas-auth-url/--saas-auth-secret).
+find_package(CURL REQUIRED)
+
+add_executable(nebula_relay main.cpp)
+# RelayProtocol.h may sit next to main.cpp (standalone copy) or in the repo's
+# core/inc (full checkout). Add both so either layout compiles.
+target_include_directories(nebula_relay PRIVATE
+    ${MSQUIC_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/inc
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../core/inc)
+target_link_libraries(nebula_relay PRIVATE ${MSQUIC_LIB} CURL::libcurl pthread)
+
+install(TARGETS nebula_relay RUNTIME DESTINATION bin)

@@ -1,0 +1,96 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum AccessGrantRole {
+  VIEWER
+  CONTROLLER
+}
+
+enum ConnectionAuditResult {
+  ISSUED
+  AUTHORIZED
+  DENIED
+  EXPIRED
+}
+
+model User {
+  id              String         @id @default(uuid()) @db.Uuid
+  email           String         @unique
+  passwordHash    String
+  displayName     String
+  createdAt       DateTime       @default(now())
+  ownedDevices    Device[]       @relation("OwnedDevices")
+  grants          AccessGrant[]  @relation("GrantedDevices")
+  createdGrants   AccessGrant[]  @relation("GrantCreator")
+  refreshTokens   RefreshToken[]
+  connectionAudit ConnectionAudit[]
+}
+
+model Device {
+  id                 String            @id @default(uuid()) @db.Uuid
+  ownerUserId        String            @db.Uuid
+  name               String
+  relayDeviceId      String            @unique
+  relayTokenHash     String
+  claimCodeHash      String?
+  claimCodeExpiresAt DateTime?
+  createdAt          DateTime          @default(now())
+  lastSeenAt         DateTime?
+  owner              User              @relation("OwnedDevices", fields: [ownerUserId], references: [id], onDelete: Cascade)
+  accessGrants       AccessGrant[]
+  connectionAudit    ConnectionAudit[]
+
+  @@index([ownerUserId])
+}
+
+model AccessGrant {
+  id              String          @id @default(uuid()) @db.Uuid
+  deviceId         String          @db.Uuid
+  granteeUserId    String          @db.Uuid
+  role             AccessGrantRole
+  createdAt        DateTime        @default(now())
+  revokedAt        DateTime?
+  createdByUserId  String          @db.Uuid
+  device           Device          @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  granteeUser      User            @relation("GrantedDevices", fields: [granteeUserId], references: [id], onDelete: Cascade)
+  createdByUser    User            @relation("GrantCreator", fields: [createdByUserId], references: [id], onDelete: Cascade)
+
+  @@unique([deviceId, granteeUserId])
+  @@index([granteeUserId])
+}
+
+model RefreshToken {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId      String    @db.Uuid
+  tokenHash   String    @unique
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  createdAt   DateTime  @default(now())
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model ConnectionAudit {
+  id               String                @id @default(uuid()) @db.Uuid
+  deviceId          String                @db.Uuid
+  requestedByUserId String                @db.Uuid
+  issuedTokenHash   String
+  issuedAt          DateTime              @default(now())
+  expiresAt         DateTime
+  usedAt            DateTime?
+  sourceIp          String?
+  result            ConnectionAuditResult @default(ISSUED)
+  reason            String?
+  device            Device                @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  requestedByUser   User                  @relation(fields: [requestedByUserId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId])
+  @@index([requestedByUserId])
+}

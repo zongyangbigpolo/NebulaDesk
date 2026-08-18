@@ -1,0 +1,155 @@
+:root {
+  color-scheme: light dark;
+  font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  background: #0f172a;
+  color: #e2e8f0;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: linear-gradient(180deg, #0f172a 0%, #111827 100%);
+}
+
+main {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 2rem 1rem 4rem;
+}
+
+.auth-shell,
+.dashboard-shell {
+  display: grid;
+  gap: 1rem;
+}
+
+.panel-grid {
+  display: grid;
+  gap: 1rem;
+}
+
+.two-up {
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+
+.panel,
+.hero-card,
+.device-card {
+  background: rgba(15, 23, 42, 0.85);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: 16px;
+  padding: 1rem;
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.25);
+}
+
+.topbar,
+.device-card-header,
+.inline-actions,
+.grant-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.device-card {
+  display: grid;
+  gap: 1rem;
+}
+
+.device-list {
+  display: grid;
+  gap: 1rem;
+}
+
+.stacked-form {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.stacked-form.compact {
+  grid-template-columns: 1.5fr 1fr auto;
+  align-items: end;
+}
+
+label {
+  display: grid;
+  gap: 0.35rem;
+  color: #cbd5e1;
+}
+
+input,
+select,
+button,
+textarea {
+  font: inherit;
+}
+
+input,
+select {
+  padding: 0.7rem 0.85rem;
+  border-radius: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.45);
+  background: rgba(15, 23, 42, 0.7);
+  color: #e2e8f0;
+}
+
+button {
+  padding: 0.7rem 1rem;
+  border: none;
+  border-radius: 10px;
+  background: #2563eb;
+  color: white;
+  cursor: pointer;
+}
+
+button.secondary {
+  background: #475569;
+}
+
+button.danger {
+  background: #dc2626;
+}
+
+button:hover {
+  filter: brightness(1.08);
+}
+
+.output,
+code {
+  font-family: "SFMono-Regular", ui-monospace, Menlo, Monaco, Consolas, monospace;
+}
+
+.output {
+  overflow: auto;
+  white-space: pre-wrap;
+  margin: 0;
+  padding: 0.8rem;
+  border-radius: 12px;
+  background: rgba(2, 6, 23, 0.85);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  min-height: 2.5rem;
+}
+
+.grant-section {
+  display: grid;
+  gap: 0.75rem;
+}
+
+@media (max-width: 720px) {
+  .stacked-form.compact,
+  .topbar,
+  .device-card-header,
+  .inline-actions,
+  .grant-item {
+    grid-template-columns: 1fr;
+    display: grid;
+    justify-content: stretch;
+  }
+}

@@ -1,0 +1,12 @@
+# Build output
+build/
+outputs/
+*.o
+*.a
+
+# macOS
+.DS_Store
+
+# AI contribution tracking (ephemeral)
+.ai-contributions.json
+dist/
