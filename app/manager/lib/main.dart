@@ -1,8 +1,12 @@
 import 'package:flutter/material.dart';
 
+import 'cloud_session_controller.dart';
+import 'cloud_tab.dart';
+import 'host_tab.dart';
 import 'models.dart';
 import 'session_launcher.dart';
 import 'store.dart';
+import 'vda_launcher.dart';
 
 void main() {
   runApp(const NebulaManagerApp());
@@ -32,9 +36,15 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> {
+class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin {
+  late final TabController _tabController;
   final _store = VdaStore();
   final _launcher = SessionLauncher();
+  final _cloudLauncher = SessionLauncher();
+  final _vdaLauncher = VdaLauncher();
+  // Shared by the "Cloud" and "Host this Mac" tabs — one login, two
+  // capabilities (viewing accessible devices vs. hosting this Mac as one).
+  final _cloudSession = CloudSessionController();
   final List<VdaEntry> _vdas = [];
   // vda index -> live session state / pid
   final Map<int, SessionState> _states = {};
@@ -43,6 +53,7 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
+    _tabController = TabController(length: 3, vsync: this);
     _load();
   }
 
@@ -111,21 +122,41 @@ class _HomePageState extends State<HomePage> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Nebula — Connections'),
+        bottom: TabBar(
+          controller: _tabController,
+          tabs: const [
+            Tab(text: 'Direct', icon: Icon(Icons.link)),
+            Tab(text: 'Cloud', icon: Icon(Icons.cloud_outlined)),
+            Tab(text: 'Host this Mac', icon: Icon(Icons.podcasts)),
+          ],
+        ),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.add),
-            tooltip: 'Add VDA',
-            onPressed: () => _addOrEdit(),
+          AnimatedBuilder(
+            animation: _tabController,
+            builder: (_, _) => _tabController.index == 0
+                ? IconButton(
+                    icon: const Icon(Icons.add),
+                    tooltip: 'Add VDA',
+                    onPressed: () => _addOrEdit(),
+                  )
+                : const SizedBox.shrink(),
           ),
         ],
       ),
-      body: _vdas.isEmpty
-          ? const Center(child: Text('No VDAs yet. Tap + to add one.'))
-          : ListView.separated(
-              itemCount: _vdas.length,
-              separatorBuilder: (_, _) => const Divider(height: 1),
-              itemBuilder: (_, i) => _vdaTile(i),
-            ),
+      body: TabBarView(
+        controller: _tabController,
+        children: [
+          _vdas.isEmpty
+              ? const Center(child: Text('No VDAs yet. Tap + to add one.'))
+              : ListView.separated(
+                  itemCount: _vdas.length,
+                  separatorBuilder: (_, _) => const Divider(height: 1),
+                  itemBuilder: (_, i) => _vdaTile(i),
+                ),
+          CloudTab(controller: _cloudSession, launcher: _cloudLauncher),
+          HostTab(controller: _cloudSession, launcher: _vdaLauncher),
+        ],
+      ),
     );
   }
 
@@ -191,7 +222,11 @@ class _HomePageState extends State<HomePage> {
 
   @override
   void dispose() {
+    _tabController.dispose();
     _launcher.terminateAll();
+    _cloudLauncher.terminateAll();
+    _vdaLauncher.stop();
+    _cloudSession.dispose();
     super.dispose();
   }
 }

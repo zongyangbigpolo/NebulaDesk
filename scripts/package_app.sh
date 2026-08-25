@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 #
-# package_app.sh - build the native helpers + Flutter manager, then embed the
-# session helper into the manager .app bundle as Contents/Helpers/nebula_session.
+# package_app.sh - build the native helpers + Flutter manager, then embed both
+# the session (CWA viewer) and vda (host) helpers into the manager .app bundle
+# as Contents/Helpers/nebula_session and Contents/Helpers/nebula_vda.
 #
-# Result: app/manager/build/macos/Build/Products/Debug/nebula_manager.app that can
-# launch independent session viewer processes.
+# Result: app/manager/build/macos/Build/Products/Debug/nebula_manager.app that
+# can, from the same app, launch independent CWA session viewer processes
+# ("Direct"/"Cloud" tabs) AND host this Mac as a VDA ("Host this Mac" tab) —
+# see README.md for the "one app, both roles" design.
 #
 set -euo pipefail
 
@@ -21,16 +24,20 @@ echo "==> [2/3] Building Flutter manager…"
 APP="app/manager/build/macos/Build/Products/Debug/nebula_manager.app"
 HELPERS="$APP/Contents/Helpers"
 SESSION_BIN="build/app/session/nebula_session"
+VDA_BIN="build/app/vda/nebula_vda"
 
-echo "==> [3/3] Embedding session helper into $APP …"
+echo "==> [3/3] Embedding session + vda helpers into $APP …"
 mkdir -p "$HELPERS"
 cp -f "$SESSION_BIN" "$HELPERS/nebula_session"
-# Ad-hoc sign the helper so it runs without a developer cert (dev only).
+cp -f "$VDA_BIN" "$HELPERS/nebula_vda"
+# Ad-hoc sign the helpers so they run without a developer cert (dev only).
 codesign --force --sign - "$HELPERS/nebula_session" 2>/dev/null || true
+codesign --force --sign - "$HELPERS/nebula_vda" 2>/dev/null || true
 
 echo
 echo "Done. Launch with:"
 echo "  open \"$APP\""
 echo
-echo "VDA side (the shared Mac), run separately:"
+echo "The app's 'Host this Mac' tab can now register + run nebula_vda directly"
+echo "(no separate binary/terminal needed). To run nebula_vda standalone instead:"
 echo "  ./build/app/vda/nebula_vda --port 7000"

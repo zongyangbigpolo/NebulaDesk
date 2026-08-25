@@ -35,6 +35,10 @@ dependencies:
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
 
+  # HTTP client used by the "Cloud" tab to talk to a nebula_cloud instance
+  # (login, device list, connect ticket issuance).
+  http: ^1.2.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

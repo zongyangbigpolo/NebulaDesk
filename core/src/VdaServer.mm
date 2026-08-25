@@ -14,6 +14,7 @@
 #include "WebRtcGateway.h"
 #include "InputInjector.h"
 #include "NebulaInput.h"
+#include "SessionStatus.h"
 
 #include <atomic>
 #include <thread>
@@ -101,6 +102,7 @@ struct VdaServer::Impl {
         std::thread([this] {
             if (!venc->start(video)) {
                 NEBULA_LOGE(TAG, "video encoder failed to start");
+                ReportSessionStatus(SessionState::Error);
                 return;
             }
             if (!aenc->start(audio))
@@ -109,9 +111,15 @@ struct VdaServer::Impl {
                 NEBULA_LOGW(TAG, "opus encoder failed to start; WebRTC viewers get video-only");
             if (!capture->start(video, audio)) {
                 NEBULA_LOGE(TAG, "mandatory virtual display capture failed");
+                ReportSessionStatus(SessionState::Error);
                 return;
             }
             injector->setTargetDisplay(capture->displayId());
+            // A viewer's HELLO is what triggered this pipeline start, so by
+            // the time capture is actually up there's an active viewer —
+            // mirrors nebula_session's "Streaming" (first frame) semantics
+            // closely enough for the manager's status display.
+            ReportSessionStatus(SessionState::Streaming);
         }).detach();
     }
 
@@ -224,6 +232,7 @@ bool VdaServer::enableWebRtc(const std::string& signalingUrl, const std::string&
 bool VdaServer::run(uint16_t port, const VideoConfig& video, const AudioConfig& audio) {
     m_impl->video = video;
     m_impl->audio = audio;
+    ReportSessionStatus(SessionState::Connecting);
     m_impl->controlReader = std::make_unique<FrameReader>(
         [this](const NebulaFrameHeader& h, const uint8_t* p, size_t l) {
             m_impl->onControl(h, p, l);
@@ -234,8 +243,12 @@ bool VdaServer::run(uint16_t port, const VideoConfig& video, const AudioConfig& 
             if (ch == ITransport::Channel::Control)
                 m_impl->controlReader->feed(data, len);
         });
-    m_impl->transport->setOnState([](bool connected) {
+    m_impl->transport->setOnState([this](bool connected) {
         NEBULA_LOGI(TAG, "transport %s", connected ? "connected" : "disconnected");
+        // "Connected" here means registered with the relay (or listening
+        // directly) and waiting for a viewer — startPipeline()'s Streaming
+        // report above supersedes it once one actually shows up.
+        ReportSessionStatus(connected ? SessionState::Connected : SessionState::Disconnected);
     });
 
     // Relay mode dials the relay; direct mode listens on the port.

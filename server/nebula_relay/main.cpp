@@ -42,6 +42,14 @@ static HQUIC gConfiguration = nullptr;
 static std::string gSaasAuthUrl;
 static std::string gSaasAuthSecret;
 
+// Optional: report registered VDAs to the SaaS control plane's
+// /internal/heartbeat (see server/nebula_cloud) so its `online`/`lastSeenAt`
+// reflects the QUIC-path relay session too — previously only the WebRTC
+// signaling path ever refreshed that. Reuses gSaasAuthSecret as the shared
+// secret (same cloud instance, same X-Relay-Secret contract). Empty = off.
+static std::string gSaasHeartbeatUrl;
+static int gSaasHeartbeatIntervalSecs = 30;
+
 // ALPN must match what the client uses for relay connections.
 static const QUIC_BUFFER kAlpn = { sizeof("nebula-relay") - 1, (uint8_t*)"nebula-relay" };
 
@@ -252,6 +260,55 @@ bool SaasAuthorize(const std::string& deviceId, const std::string& token) {
     return truePos != std::string::npos && (falsePos == std::string::npos || truePos < falsePos);
 }
 
+// Reports a registered VDA as alive to the SaaS control plane (see
+// server/nebula_cloud's POST /internal/heartbeat), keyed by relayDeviceId —
+// the only identifier the relay itself ever has. Fire-and-forget: a failed
+// or unreachable call just logs and moves on, it never affects the relay's
+// own bridging/pairing behavior (heartbeat is purely for the cloud's
+// online/lastSeenAt display, not an authorization decision).
+void SendHeartbeat(const std::string& deviceId) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return;
+
+    std::string body = "{\"deviceId\":\"" + JsonEscape(deviceId) + "\"}";
+    std::string response;
+    struct curl_slist* headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    std::string secretHeader = "X-Relay-Secret: " + gSaasAuthSecret;
+    headers = curl_slist_append(headers, secretHeader.c_str());
+
+    curl_easy_setopt(curl, CURLOPT_URL, gSaasHeartbeatUrl.c_str());
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteToString);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 3000L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 1500L);
+
+    CURLcode rc = curl_easy_perform(curl);
+    long httpCode = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (rc != CURLE_OK) {
+        RLOG("SaaS heartbeat call failed for device-id=%s: %s", deviceId.c_str(), curl_easy_strerror(rc));
+        return;
+    }
+    if (httpCode == 401) {
+        RLOG("SaaS heartbeat rejected our --saas-auth-secret (401) — check configuration");
+        return;
+    }
+    if (httpCode == 404) {
+        RLOG("SaaS heartbeat: cloud doesn't know device-id=%s (deleted?)", deviceId.c_str());
+        return;
+    }
+    if (httpCode != 200) {
+        RLOG("SaaS heartbeat returned unexpected HTTP %ld for device-id=%s", httpCode, deviceId.c_str());
+    }
+}
+
 // Send a Paired status to a VDA, followed by a fixed-size PeerAddr block
 // carrying the CWA's relay-observed public endpoint (see RelayProtocol.h) —
 // the VDA's free NAT-punch candidate for that viewer.
@@ -312,6 +369,12 @@ void HandleHello(PeerLink* link) {
         RLOG("VDA registered device-id=%s (observed %s:%u)", link->deviceId.c_str(),
              link->observedIp.c_str(), link->observedPort);
         SendStatus(link, nebula::RelayStatus::Registered);
+        if (!gSaasHeartbeatUrl.empty()) {
+            // Report immediately on (re)registration rather than waiting for
+            // the next periodic tick, so the cloud's "online" flag flips
+            // promptly instead of lagging by up to gSaasHeartbeatIntervalSecs.
+            std::thread(SendHeartbeat, link->deviceId).detach();
+        }
         if (hasPending) {
             // The VDA reconnected within the grace window while its previous
             // viewer was still waiting — silently resume the same session
@@ -468,6 +531,24 @@ void ReaperLoop() {
     }
 }
 
+// Background: periodically reports every currently-registered VDA to the
+// SaaS control plane's /internal/heartbeat (see SendHeartbeat above), so a
+// long-lived connection stays "online" between the one-shot heartbeats fired
+// on (re)registration. No-op loop (never started) if --saas-heartbeat-url is
+// unset. Each call runs on its own detached thread so one slow/unreachable
+// cloud instance can't delay the next tick or block other devices' calls.
+void HeartbeatLoop() {
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(gSaasHeartbeatIntervalSecs));
+        std::vector<std::string> deviceIds;
+        {
+            std::lock_guard<std::mutex> lk(gMutex);
+            for (auto& [deviceId, link] : gWaitingVdas) deviceIds.push_back(deviceId);
+        }
+        for (auto& deviceId : deviceIds) std::thread(SendHeartbeat, deviceId).detach();
+    }
+}
+
 // ----- msquic callbacks ----------------------------------------------------
 
 QUIC_STATUS QUIC_API StreamCallback(HQUIC stream, void* ctx, QUIC_STREAM_EVENT* ev) {
@@ -587,6 +668,8 @@ int main(int argc, char** argv) {
         else if (a == "--key")  key  = next(key);
         else if (a == "--saas-auth-url")    gSaasAuthUrl = next("");
         else if (a == "--saas-auth-secret") gSaasAuthSecret = next("");
+        else if (a == "--saas-heartbeat-url") gSaasHeartbeatUrl = next("");
+        else if (a == "--saas-heartbeat-interval-secs") gSaasHeartbeatIntervalSecs = atoi(next("30"));
     }
     if (!gSaasAuthUrl.empty() && gSaasAuthSecret.empty()) {
         RLOG("--saas-auth-url requires --saas-auth-secret; refusing to start unauthenticated callback");
@@ -594,6 +677,13 @@ int main(int argc, char** argv) {
     }
     if (!gSaasAuthUrl.empty()) {
         RLOG("SaaS mode: CWA authorization delegated to %s", gSaasAuthUrl.c_str());
+    }
+    if (!gSaasHeartbeatUrl.empty() && gSaasAuthSecret.empty()) {
+        RLOG("--saas-heartbeat-url requires --saas-auth-secret (same shared secret as authorize); refusing to start");
+        return 1;
+    }
+    if (!gSaasHeartbeatUrl.empty()) {
+        RLOG("SaaS mode: reporting registered VDAs to %s every %ds", gSaasHeartbeatUrl.c_str(), gSaasHeartbeatIntervalSecs);
     }
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
@@ -621,6 +711,11 @@ int main(int argc, char** argv) {
 
     // Background reaper: expires VDA-reattach grace windows and old tickets.
     std::thread(ReaperLoop).detach();
+
+    // Background: periodic VDA heartbeat to the SaaS control plane (opt-in).
+    if (!gSaasHeartbeatUrl.empty()) {
+        std::thread(HeartbeatLoop).detach();
+    }
 
     // Block until terminated by a signal (robust for a background server).
     sigset_t set;

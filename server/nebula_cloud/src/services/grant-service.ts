@@ -15,8 +15,8 @@ export class GrantService {
     if (!device) {
       throw new NotFoundError('Device not found');
     }
-    if (device.ownerUserId !== input.actor.userId) {
-      throw new ForbiddenError('Only the owner can manage grants');
+    if (device.ownerUserId !== input.actor.userId && input.actor.role !== 'ADMIN') {
+      throw new ForbiddenError('Only the owner or an admin can manage grants');
     }
     const grantee = await this.store.findUserByEmail(input.granteeEmail.trim().toLowerCase());
     if (!grantee) {
@@ -39,8 +39,8 @@ export class GrantService {
     if (!device) {
       throw new NotFoundError('Device not found');
     }
-    if (device.ownerUserId !== actor.userId) {
-      throw new ForbiddenError('Only the owner can view grants');
+    if (device.ownerUserId !== actor.userId && actor.role !== 'ADMIN') {
+      throw new ForbiddenError('Only the owner or an admin can view grants');
     }
     return this.store.listDeviceGrants(deviceId);
   }
@@ -54,8 +54,8 @@ export class GrantService {
     if (!device) {
       throw new NotFoundError('Device not found');
     }
-    if (device.ownerUserId !== actor.userId) {
-      throw new ForbiddenError('Only the owner can revoke grants');
+    if (device.ownerUserId !== actor.userId && actor.role !== 'ADMIN') {
+      throw new ForbiddenError('Only the owner or an admin can revoke grants');
     }
     return this.store.revokeGrant(grantId, new Date());
   }

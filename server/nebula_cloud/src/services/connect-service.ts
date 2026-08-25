@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 
 import { AppConfig } from '../config';
-import { NotFoundError } from '../domain/errors';
+import { InsufficientCreditError, NotFoundError } from '../domain/errors';
 import { AuthenticatedUser } from '../domain/types';
 import { DataStore } from '../repositories/types';
 import { sha256 } from '../utils/crypto';
@@ -11,7 +11,7 @@ import { SessionTokenClaims, TokenService } from './token-service';
 export class ConnectService {
   constructor(
     private readonly store: DataStore,
-    private readonly config: Pick<AppConfig, 'SESSION_TOKEN_TTL_SECONDS' | 'RELAY_SHARED_SECRET'>,
+    private readonly config: Pick<AppConfig, 'SESSION_TOKEN_TTL_SECONDS' | 'RELAY_SHARED_SECRET' | 'CONNECT_CREDIT_COST_SECONDS'>,
     private readonly tokenService: TokenService,
     private readonly deviceService: DeviceService,
   ) {}
@@ -22,9 +22,26 @@ export class ConnectService {
       throw new NotFoundError('Device not found');
     }
 
-    const role = await this.store.getEffectiveRole(input.actor.userId, device.id);
+    // Admins can connect to any device without needing an explicit
+    // owner/grant/group relationship — see DeviceService.listAccessibleDevices
+    // for the read-side equivalent.
+    const role = input.actor.role === 'ADMIN' ? 'ADMIN' : await this.store.getEffectiveRole(input.actor.userId, device.id);
     if (!role) {
       throw new NotFoundError('Device not found');
+    }
+
+    // Trial credit (see README.md's "Trial credit" section): a flat cost is
+    // deducted from the caller's balance per successful connect, regardless
+    // of how long the resulting session actually lasts (metering real
+    // session duration would need the relay/VDA to report it back, which
+    // doesn't exist today — see ROADMAP.md). Admins are never metered; the
+    // spend is atomic at the DB layer so concurrent connects can't both pass
+    // a stale balance check (see PrismaDataStore.spendUserCredit).
+    if (input.actor.role !== 'ADMIN') {
+      const spent = await this.store.spendUserCredit(input.actor.userId, this.config.CONNECT_CREDIT_COST_SECONDS);
+      if (!spent) {
+        throw new InsufficientCreditError('Not enough connect credit remaining — ask an admin to top up your account');
+      }
     }
 
     const auditId = crypto.randomUUID();
@@ -49,6 +66,11 @@ export class ConnectService {
     return {
       ...this.deviceService.getRelayConnectionInfo(device),
       sessionToken,
+      // Handed back only to a caller who already passed the role check above
+      // (owner/grant/group-member/admin) — the same trust boundary that
+      // gates the connection itself, so exposing the PSK here doesn't widen
+      // who can decrypt the session beyond who can already open one.
+      psk: device.psk,
       expiresAt,
       role,
     };
@@ -121,7 +143,7 @@ export class ConnectService {
       return { statusCode: 200, body: { authorized: false, reason: 'session ticket already used' } };
     }
 
-    const role = await this.store.getEffectiveRole(claims.sub, device.id);
+    const role = await this.getEffectiveRoleLive(claims.sub, device.id);
     if (!role) {
       await this.markAuditFailure(audit.id, 'DENIED', 'User is no longer authorized for this device');
       return { statusCode: 200, body: { authorized: false, reason: 'user is no longer authorized for this device' } };
@@ -134,6 +156,19 @@ export class ConnectService {
     });
 
     return { statusCode: 200, body: { authorized: true } };
+  }
+
+  // Re-derives the requester's role from live DB state at authorize time
+  // (not from anything cached in the session JWT), so a revoked grant/group
+  // membership or an admin demotion takes effect immediately — the same
+  // real-time-authorization property §7 of ARCHITECTURE_OVERVIEW.md documents
+  // for the rest of this endpoint.
+  private async getEffectiveRoleLive(userId: string, deviceId: string) {
+    const user = await this.store.findUserById(userId);
+    if (user?.role === 'ADMIN') {
+      return 'ADMIN' as const;
+    }
+    return this.store.getEffectiveRole(userId, deviceId);
   }
 
   private async markAuditFailure(

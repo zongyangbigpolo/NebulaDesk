@@ -19,6 +19,10 @@ const baseConfig: AppConfig = {
   RELAY_PUBLIC_HOST: 'relay.nebula.test',
   RELAY_PUBLIC_PORT: 7100,
   RELAY_SHARED_SECRET: 'relay-shared-secret-1234',
+  INITIAL_ADMIN_EMAILS: [],
+  DEVICE_ENROLLMENT_TOKEN: 'enroll-secret-1234',
+  DEFAULT_TRIAL_CREDIT_SECONDS: 600,
+  CONNECT_CREDIT_COST_SECONDS: 0, // neutralize credit metering for tests unrelated to it
 };
 
 describe('Nebula Cloud API', () => {
@@ -125,8 +129,10 @@ describe('Nebula Cloud API', () => {
       expect(createDevice.statusCode).toBe(201);
       const created = createDevice.json();
       expect(created.registration.relayToken).toBeTypeOf('string');
+      expect(created.registration.psk).toBeTypeOf('string');
       expect(created.registration.claimCode).toMatch(/^NEB-/);
       expect(created.registration.vdaCommand).toContain('--relay relay.nebula.test --relay-port 7100');
+      expect(created.registration.vdaCommand).toContain(`--psk ${created.registration.psk}`);
 
       const claim = await app.inject({
         method: 'POST',
@@ -137,6 +143,9 @@ describe('Nebula Cloud API', () => {
       const redeemed = claim.json();
       expect(redeemed.device.relayDeviceId).toBe(created.device.relayDeviceId);
       expect(redeemed.registration.relayToken).not.toBe(created.registration.relayToken);
+      // The PSK is NOT rotated on claim redemption — it's the same
+      // end-to-end encryption secret handed out once at creation.
+      expect(redeemed.registration.psk).toBe(created.registration.psk);
 
       const secondClaim = await app.inject({
         method: 'POST',
@@ -268,6 +277,8 @@ describe('Nebula Cloud API', () => {
         headers: { authorization: `Bearer ${viewer.accessToken}` },
       });
       const connectPayload = connectResponse.json();
+      expect(connectPayload.psk).toBeTypeOf('string');
+      expect(connectPayload.sessionCommand).toContain(`NEBULA_PSK=${connectPayload.psk}`);
 
       const wrongSecret = await app.inject({
         method: 'POST',
@@ -370,6 +381,61 @@ describe('Nebula Cloud API', () => {
       });
       expect(authorizeResponse.statusCode).toBe(200);
       expect(authorizeResponse.json().authorized).toBe(false);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('lets nebula_relay report a VDA heartbeat keyed by relayDeviceId, keeping the device online', async () => {
+    const app = await createApp();
+    try {
+      const owner = await registerAndLogin(app, {
+        email: 'owner@example.com',
+        displayName: 'Owner',
+      });
+
+      const createDevice = await app.inject({
+        method: 'POST',
+        url: '/devices',
+        headers: { authorization: `Bearer ${owner.accessToken}` },
+        payload: { name: 'Relay Heartbeat Mac' },
+      });
+      const relayDeviceId = createDevice.json().device.relayDeviceId;
+
+      const wrongSecret = await app.inject({
+        method: 'POST',
+        url: '/internal/heartbeat',
+        headers: { 'x-relay-secret': 'not-the-secret' },
+        payload: { deviceId: relayDeviceId },
+      });
+      expect(wrongSecret.statusCode).toBe(401);
+
+      const unknownDevice = await app.inject({
+        method: 'POST',
+        url: '/internal/heartbeat',
+        headers: { 'x-relay-secret': baseConfig.RELAY_SHARED_SECRET },
+        payload: { deviceId: 'no-such-relay-device-id' },
+      });
+      expect(unknownDevice.statusCode).toBe(404);
+
+      const heartbeat = await app.inject({
+        method: 'POST',
+        url: '/internal/heartbeat',
+        headers: { 'x-relay-secret': baseConfig.RELAY_SHARED_SECRET },
+        payload: { deviceId: relayDeviceId },
+      });
+      expect(heartbeat.statusCode).toBe(200);
+      expect(heartbeat.json().ok).toBe(true);
+      expect(heartbeat.json().lastSeenAt).toBeTypeOf('string');
+
+      const devices = await app.inject({
+        method: 'GET',
+        url: '/devices',
+        headers: { authorization: `Bearer ${owner.accessToken}` },
+      });
+      const listed = devices.json().devices.find((d: { relayDeviceId: string }) => d.relayDeviceId === relayDeviceId);
+      expect(listed.online).toBe(true);
+      expect(listed.lastSeenAt).toBeTypeOf('string');
     } finally {
       await app.close();
     }

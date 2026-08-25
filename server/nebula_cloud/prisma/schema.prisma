@@ -19,17 +19,31 @@ enum ConnectionAuditResult {
   EXPIRED
 }
 
+enum UserRole {
+  USER
+  ADMIN
+}
+
 model User {
-  id              String         @id @default(uuid()) @db.Uuid
-  email           String         @unique
-  passwordHash    String
-  displayName     String
-  createdAt       DateTime       @default(now())
-  ownedDevices    Device[]       @relation("OwnedDevices")
-  grants          AccessGrant[]  @relation("GrantedDevices")
-  createdGrants   AccessGrant[]  @relation("GrantCreator")
-  refreshTokens   RefreshToken[]
-  connectionAudit ConnectionAudit[]
+  id               String            @id @default(uuid()) @db.Uuid
+  email            String            @unique
+  passwordHash     String
+  displayName      String
+  role             UserRole          @default(USER)
+  // Remaining "connect" credit, in seconds — see README.md's "Trial credit"
+  // section. New accounts get DEFAULT_TRIAL_CREDIT_SECONDS for free; each
+  // successful POST /devices/:id/connect deducts a flat CONNECT_CREDIT_COST_SECONDS
+  // (unless the caller is an admin, who is never metered). An admin tops this
+  // up via PATCH /admin/users/:id/credit.
+  creditSeconds    Int               @default(600)
+  createdAt        DateTime          @default(now())
+  ownedDevices     Device[]          @relation("OwnedDevices")
+  grants           AccessGrant[]     @relation("GrantedDevices")
+  createdGrants    AccessGrant[]     @relation("GrantCreator")
+  refreshTokens    RefreshToken[]
+  connectionAudit  ConnectionAudit[]
+  groupMemberships GroupMembership[]
+  createdGroups    Group[]           @relation("GroupCreator")
 }
 
 model Device {
@@ -38,47 +52,83 @@ model Device {
   name               String
   relayDeviceId      String            @unique
   relayTokenHash     String
+  // Application-layer session encryption secret shared between this VDA and
+  // every CWA it talks to (see core/inc/NebulaCrypto.h / ARCHITECTURE.md §4a).
+  // Unlike relayTokenHash, callers need the *plaintext* back (every connecting
+  // viewer needs it for NEBULA_PSK), so it can't be stored as a one-way hash —
+  // see README.md "Groups & admin role"/PSK distribution note for the
+  // resulting at-rest-plaintext trade-off and its hardening recommendation.
+  psk                String
   claimCodeHash      String?
   claimCodeExpiresAt DateTime?
+  groupId            String?           @db.Uuid
   createdAt          DateTime          @default(now())
   lastSeenAt         DateTime?
   owner              User              @relation("OwnedDevices", fields: [ownerUserId], references: [id], onDelete: Cascade)
+  group              Group?            @relation(fields: [groupId], references: [id], onDelete: SetNull)
   accessGrants       AccessGrant[]
   connectionAudit    ConnectionAudit[]
 
   @@index([ownerUserId])
+  @@index([groupId])
+}
+
+// A named collection of devices an admin curates, so a set of users can be
+// granted blanket VIEWER/CONTROLLER access (GroupMembership) to every device
+// in the group instead of one AccessGrant per device per user.
+model Group {
+  id              String            @id @default(uuid()) @db.Uuid
+  name            String
+  createdByUserId String            @db.Uuid
+  createdAt       DateTime          @default(now())
+  createdByUser   User              @relation("GroupCreator", fields: [createdByUserId], references: [id], onDelete: Cascade)
+  devices         Device[]
+  memberships     GroupMembership[]
+}
+
+model GroupMembership {
+  id        String          @id @default(uuid()) @db.Uuid
+  groupId   String          @db.Uuid
+  userId    String          @db.Uuid
+  role      AccessGrantRole
+  createdAt DateTime        @default(now())
+  group     Group           @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  user      User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, userId])
+  @@index([userId])
 }
 
 model AccessGrant {
   id              String          @id @default(uuid()) @db.Uuid
-  deviceId         String          @db.Uuid
-  granteeUserId    String          @db.Uuid
-  role             AccessGrantRole
-  createdAt        DateTime        @default(now())
-  revokedAt        DateTime?
-  createdByUserId  String          @db.Uuid
-  device           Device          @relation(fields: [deviceId], references: [id], onDelete: Cascade)
-  granteeUser      User            @relation("GrantedDevices", fields: [granteeUserId], references: [id], onDelete: Cascade)
-  createdByUser    User            @relation("GrantCreator", fields: [createdByUserId], references: [id], onDelete: Cascade)
+  deviceId        String          @db.Uuid
+  granteeUserId   String          @db.Uuid
+  role            AccessGrantRole
+  createdAt       DateTime        @default(now())
+  revokedAt       DateTime?
+  createdByUserId String          @db.Uuid
+  device          Device          @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  granteeUser     User            @relation("GrantedDevices", fields: [granteeUserId], references: [id], onDelete: Cascade)
+  createdByUser   User            @relation("GrantCreator", fields: [createdByUserId], references: [id], onDelete: Cascade)
 
   @@unique([deviceId, granteeUserId])
   @@index([granteeUserId])
 }
 
 model RefreshToken {
-  id         String    @id @default(uuid()) @db.Uuid
-  userId      String    @db.Uuid
-  tokenHash   String    @unique
-  expiresAt   DateTime
-  revokedAt   DateTime?
-  createdAt   DateTime  @default(now())
-  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
 }
 
 model ConnectionAudit {
-  id               String                @id @default(uuid()) @db.Uuid
+  id                String                @id @default(uuid()) @db.Uuid
   deviceId          String                @db.Uuid
   requestedByUserId String                @db.Uuid
   issuedTokenHash   String

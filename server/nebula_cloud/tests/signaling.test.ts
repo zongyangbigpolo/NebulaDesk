@@ -20,6 +20,10 @@ const baseConfig: AppConfig = {
   RELAY_PUBLIC_HOST: 'relay.nebula.test',
   RELAY_PUBLIC_PORT: 7100,
   RELAY_SHARED_SECRET: 'relay-shared-secret-1234',
+  INITIAL_ADMIN_EMAILS: [],
+  DEVICE_ENROLLMENT_TOKEN: 'enroll-secret-1234',
+  DEFAULT_TRIAL_CREDIT_SECONDS: 600,
+  CONNECT_CREDIT_COST_SECONDS: 0, // neutralize credit metering for tests unrelated to it
 };
 
 // Waits for exactly one JSON message from `ws`, optionally filtered by type.

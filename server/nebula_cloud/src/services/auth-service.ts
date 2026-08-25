@@ -8,7 +8,10 @@ import { TokenService } from './token-service';
 export class AuthService {
   constructor(
     private readonly store: DataStore,
-    private readonly config: Pick<AppConfig, 'REFRESH_TOKEN_TTL_SECONDS' | 'ACCESS_TOKEN_TTL_SECONDS'>,
+    private readonly config: Pick<
+      AppConfig,
+      'REFRESH_TOKEN_TTL_SECONDS' | 'ACCESS_TOKEN_TTL_SECONDS' | 'INITIAL_ADMIN_EMAILS' | 'DEFAULT_TRIAL_CREDIT_SECONDS'
+    >,
     private readonly tokenService: TokenService,
   ) {}
 
@@ -20,7 +23,18 @@ export class AuthService {
     }
 
     const passwordHash = await hashPassword(input.password);
-    return this.store.createUser({ email, passwordHash, displayName: input.displayName.trim() });
+    // Bootstrap mechanism for the very first admin(s): there's no superuser
+    // by default, so an operator lists trusted emails in INITIAL_ADMIN_EMAILS
+    // and whoever registers with one of them becomes an admin immediately.
+    // Further admins are promoted by an existing admin afterwards.
+    const role = this.config.INITIAL_ADMIN_EMAILS.includes(email) ? 'ADMIN' : 'USER';
+    return this.store.createUser({
+      email,
+      passwordHash,
+      displayName: input.displayName.trim(),
+      role,
+      creditSeconds: this.config.DEFAULT_TRIAL_CREDIT_SECONDS,
+    });
   }
 
   async login(input: { email: string; password: string }): Promise<{
@@ -88,6 +102,7 @@ export class AuthService {
       userId: user.id,
       email: user.email,
       displayName: user.displayName,
+      role: user.role,
     };
 
     return {

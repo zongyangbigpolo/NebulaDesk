@@ -1,9 +1,20 @@
 //
-// SessionStatus.h - manager<->session status contract (header-only)
+// SessionStatus.h - manager<->child-process status contract (header-only)
 //
-// A session process reports lifecycle state to its parent (the Flutter manager)
-// by writing a single line "NEBULA_STATUS:<state>\n" to stdout and flushing.
-// stderr carries human logs; stdout is reserved for this machine-readable channel.
+// A supervised child process (nebula_session on the CWA side, or nebula_vda
+// on the VDA side — see app/manager's "Direct"/"Cloud" tabs and its new
+// "Host this Mac" tab) reports lifecycle state to its parent (the Flutter
+// manager) by writing a single line "NEBULA_STATUS:<state>\n" to stdout and
+// flushing. stderr carries human logs; stdout is reserved for this
+// machine-readable channel.
+//
+// The same SessionState enum is reused for both roles since the states map
+// naturally onto either lifecycle:
+//   CWA (nebula_session): Connecting -> Connected (transport up, caps
+//     negotiated) -> Streaming (first frame rendered) -> Disconnected/Error.
+//   VDA (nebula_vda): Connecting (starting up) -> Connected (registered with
+//     the relay / listening directly, waiting for a viewer) -> Streaming (a
+//     viewer's HELLO started the capture pipeline) -> Disconnected/Error.
 //
 #pragma once
 

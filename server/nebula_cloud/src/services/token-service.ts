@@ -4,12 +4,13 @@ import jwt from 'jsonwebtoken';
 
 import { AppConfig } from '../config';
 import { UnauthorizedError } from '../domain/errors';
-import { AuthenticatedUser } from '../domain/types';
+import { AuthenticatedUser, UserRole } from '../domain/types';
 
 interface AccessTokenClaims {
   sub: string;
   email: string;
   displayName: string;
+  role: UserRole;
   type: 'access';
   iat?: number;
   exp?: number;
@@ -32,6 +33,7 @@ export class TokenService {
       sub: user.userId,
       email: user.email,
       displayName: user.displayName,
+      role: user.role,
       type: 'access',
     };
     return jwt.sign(payload, this.config.JWT_ACCESS_SECRET, {
@@ -53,6 +55,9 @@ export class TokenService {
         userId: payload.sub,
         email: payload.email,
         displayName: payload.displayName,
+        // Older tokens issued before roles existed won't carry this claim;
+        // treat them as a regular user rather than failing to parse.
+        role: payload.role ?? 'USER',
       };
     } catch (error) {
       if (error instanceof UnauthorizedError) {

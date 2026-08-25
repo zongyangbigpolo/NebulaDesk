@@ -64,6 +64,15 @@ int main(int argc, const char* argv[]) {
             iceServers.push_back({"stun:stun.l.google.com:19302", "", ""});
         }
 
+        // Secrets are also accepted via environment (never visible in `ps`,
+        // unlike argv) — same convention as app/session/main.mm. Env takes
+        // priority over --psk/--token when both are present, so a caller
+        // that wants argv-free secrets (e.g. the Flutter manager's "Host
+        // this Mac" tab) can rely on this without disabling the CLI flags
+        // for direct/manual use.
+        if (const char* envPsk = getenv("NEBULA_PSK")) psk = envPsk;
+        if (const char* envToken = getenv("NEBULA_RELAY_TOKEN")) token = envToken;
+
         // Width and height are normally supplied by the CWA HELLO before
         // capture starts; when WebRTC-only (no native CWA expected), the
         // virtual display instead uses the fixed --webrtc-width/-height,

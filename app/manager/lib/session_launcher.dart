@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'cloud_models.dart';
 import 'models.dart';
 
 // Launches and tracks an independent nebula_session process per VDA connection.
@@ -34,8 +35,7 @@ class SessionLauncher {
     VdaEntry vda, {
     required void Function(SessionState) onState,
     required void Function(int exitCode) onExit,
-  }) async {
-    final exe = _sessionExecutablePath();
+  }) {
     final args = <String>[
       '--host', vda.host,
       '--port', '${vda.port}',
@@ -46,15 +46,57 @@ class SessionLauncher {
         '--device', vda.deviceId,
       ],
     ];
-
-    final proc = await Process.start(
-      exe,
+    return _spawn(
       args,
       environment: {
         'NEBULA_PSK': vda.secret,
         'NEBULA_RELAY_TOKEN': vda.token,
       },
+      onState: onState,
+      onExit: onExit,
     );
+  }
+
+  // Launches a session using a nebula_cloud connect ticket (see
+  // cloud_client.dart's CloudClient.connect) instead of a manually-configured
+  // VdaEntry: relay routing, the short-lived session JWT, and the PSK all
+  // come from the ticket, so there's nothing left for the user to type in.
+  // --host/--port are required argv but are ignored once --relay is present
+  // (see CwaClient::connect in core/src/CwaClient.mm), so any placeholder
+  // works.
+  Future<Process> launchCloud(
+    CloudConnectTicket ticket, {
+    required String title,
+    required void Function(SessionState) onState,
+    required void Function(int exitCode) onExit,
+  }) {
+    final args = <String>[
+      '--host', '127.0.0.1',
+      '--port', '0',
+      '--title', title,
+      '--relay', ticket.relayHost,
+      '--relay-port', '${ticket.relayPort}',
+      '--device', ticket.relayDeviceId,
+    ];
+    return _spawn(
+      args,
+      environment: {
+        'NEBULA_PSK': ticket.psk,
+        'NEBULA_RELAY_TOKEN': ticket.sessionToken,
+      },
+      onState: onState,
+      onExit: onExit,
+    );
+  }
+
+  Future<Process> _spawn(
+    List<String> args, {
+    required Map<String, String> environment,
+    required void Function(SessionState) onState,
+    required void Function(int exitCode) onExit,
+  }) async {
+    final exe = _sessionExecutablePath();
+    final proc = await Process.start(exe, args, environment: environment);
 
     proc.stdout.transform(utf8.decoder).transform(const LineSplitter()).listen((line) {
       const prefix = 'NEBULA_STATUS:';

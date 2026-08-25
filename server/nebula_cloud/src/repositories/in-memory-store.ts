@@ -7,8 +7,12 @@ import {
   ConnectionAuditRecord,
   DeviceRecord,
   EffectiveRole,
+  GroupMembershipRecord,
+  GroupMembershipWithUser,
+  GroupRecord,
   RefreshTokenRecord,
   UserRecord,
+  UserRole,
 } from '../domain/types';
 import { DataStore } from './types';
 
@@ -25,14 +29,25 @@ export class InMemoryDataStore implements DataStore {
   private readonly grantByDeviceAndUser = new Map<string, string>();
   private readonly refreshTokens = new Map<string, RefreshTokenRecord>();
   private readonly connectionAudits = new Map<string, ConnectionAuditRecord>();
+  private readonly groups = new Map<string, GroupRecord>();
+  private readonly groupMemberships = new Map<string, GroupMembershipRecord>();
+  private readonly membershipByGroupAndUser = new Map<string, string>();
 
-  async createUser(input: { email: string; passwordHash: string; displayName: string }): Promise<UserRecord> {
+  async createUser(input: {
+    email: string;
+    passwordHash: string;
+    displayName: string;
+    role: UserRole;
+    creditSeconds: number;
+  }): Promise<UserRecord> {
     const id = crypto.randomUUID();
     const user: UserRecord = {
       id,
       email: input.email,
       passwordHash: input.passwordHash,
       displayName: input.displayName,
+      role: input.role,
+      creditSeconds: input.creditSeconds,
       createdAt: new Date(),
     };
     this.users.set(id, user);
@@ -48,6 +63,39 @@ export class InMemoryDataStore implements DataStore {
   async findUserById(id: string): Promise<UserRecord | null> {
     const user = this.users.get(id);
     return user ? this.copyUser(user) : null;
+  }
+
+  async listUsers(): Promise<UserRecord[]> {
+    return [...this.users.values()]
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+      .map((user) => this.copyUser(user));
+  }
+
+  async updateUserRole(userId: string, role: UserRole): Promise<UserRecord | null> {
+    const user = this.users.get(userId);
+    if (!user) {
+      return null;
+    }
+    user.role = role;
+    return this.copyUser(user);
+  }
+
+  async spendUserCredit(userId: string, amountSeconds: number): Promise<UserRecord | null> {
+    const user = this.users.get(userId);
+    if (!user || user.creditSeconds < amountSeconds) {
+      return null;
+    }
+    user.creditSeconds -= amountSeconds;
+    return this.copyUser(user);
+  }
+
+  async addUserCredit(userId: string, amountSeconds: number): Promise<UserRecord | null> {
+    const user = this.users.get(userId);
+    if (!user) {
+      return null;
+    }
+    user.creditSeconds = Math.max(0, user.creditSeconds + amountSeconds);
+    return this.copyUser(user);
   }
 
   async createRefreshToken(input: { userId: string; tokenHash: string; expiresAt: Date }): Promise<RefreshTokenRecord> {
@@ -83,6 +131,7 @@ export class InMemoryDataStore implements DataStore {
     name: string;
     relayDeviceId: string;
     relayTokenHash: string;
+    psk: string;
     claimCodeHash: string;
     claimCodeExpiresAt: Date;
   }): Promise<DeviceRecord> {
@@ -92,8 +141,10 @@ export class InMemoryDataStore implements DataStore {
       name: input.name,
       relayDeviceId: input.relayDeviceId,
       relayTokenHash: input.relayTokenHash,
+      psk: input.psk,
       claimCodeHash: input.claimCodeHash,
       claimCodeExpiresAt: new Date(input.claimCodeExpiresAt),
+      groupId: null,
       createdAt: new Date(),
       lastSeenAt: null,
     };
@@ -124,6 +175,12 @@ export class InMemoryDataStore implements DataStore {
     return results;
   }
 
+  async listAllDevices(): Promise<DeviceRecord[]> {
+    return [...this.devices.values()]
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+      .map((device) => this.copyDevice(device));
+  }
+
   async getEffectiveRole(userId: string, deviceId: string): Promise<EffectiveRole | null> {
     const device = this.devices.get(deviceId);
     if (!device) {
@@ -133,14 +190,21 @@ export class InMemoryDataStore implements DataStore {
       return 'OWNER';
     }
     const grantId = this.grantByDeviceAndUser.get(`${deviceId}:${userId}`);
-    if (!grantId) {
+    const grant = grantId ? this.grants.get(grantId) : undefined;
+    const grantRole = grant && !grant.revokedAt ? grant.role : null;
+
+    const membershipId = device.groupId ? this.membershipByGroupAndUser.get(`${device.groupId}:${userId}`) : undefined;
+    const membership = membershipId ? this.groupMemberships.get(membershipId) : undefined;
+    const groupRole = membership ? membership.role : null;
+
+    if (!grantRole && !groupRole) {
       return null;
     }
-    const grant = this.grants.get(grantId);
-    if (!grant || grant.revokedAt) {
-      return null;
+    // A CONTROLLER grant from either source outranks a VIEWER grant from the other.
+    if (grantRole === 'CONTROLLER' || groupRole === 'CONTROLLER') {
+      return 'CONTROLLER';
     }
-    return grant.role;
+    return 'VIEWER';
   }
 
   async deleteDevice(id: string): Promise<void> {
@@ -171,6 +235,15 @@ export class InMemoryDataStore implements DataStore {
       return null;
     }
     device.lastSeenAt = new Date(seenAt);
+    return this.copyDevice(device);
+  }
+
+  async assignDeviceGroup(deviceId: string, groupId: string | null): Promise<DeviceRecord | null> {
+    const device = this.devices.get(deviceId);
+    if (!device) {
+      return null;
+    }
+    device.groupId = groupId;
     return this.copyDevice(device);
   }
 
@@ -296,6 +369,93 @@ export class InMemoryDataStore implements DataStore {
     return this.copyConnectionAudit(record);
   }
 
+  async createGroup(input: { name: string; createdByUserId: string }): Promise<GroupRecord> {
+    const record: GroupRecord = {
+      id: crypto.randomUUID(),
+      name: input.name,
+      createdByUserId: input.createdByUserId,
+      createdAt: new Date(),
+    };
+    this.groups.set(record.id, record);
+    return this.copyGroup(record);
+  }
+
+  async listGroups(): Promise<GroupRecord[]> {
+    return [...this.groups.values()]
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+      .map((group) => this.copyGroup(group));
+  }
+
+  async findGroupById(id: string): Promise<GroupRecord | null> {
+    const group = this.groups.get(id);
+    return group ? this.copyGroup(group) : null;
+  }
+
+  async deleteGroup(id: string): Promise<void> {
+    if (!this.groups.delete(id)) {
+      return;
+    }
+    for (const [membershipId, membership] of [...this.groupMemberships.entries()]) {
+      if (membership.groupId === id) {
+        this.groupMemberships.delete(membershipId);
+        this.membershipByGroupAndUser.delete(`${membership.groupId}:${membership.userId}`);
+      }
+    }
+    for (const device of this.devices.values()) {
+      if (device.groupId === id) {
+        device.groupId = null;
+      }
+    }
+  }
+
+  async upsertGroupMembership(input: { groupId: string; userId: string; role: 'VIEWER' | 'CONTROLLER' }): Promise<GroupMembershipWithUser> {
+    const key = `${input.groupId}:${input.userId}`;
+    const existingId = this.membershipByGroupAndUser.get(key);
+    const membership: GroupMembershipRecord = existingId
+      ? this.groupMemberships.get(existingId)!
+      : {
+          id: crypto.randomUUID(),
+          groupId: input.groupId,
+          userId: input.userId,
+          role: input.role,
+          createdAt: new Date(),
+        };
+    membership.role = input.role;
+    this.groupMemberships.set(membership.id, membership);
+    this.membershipByGroupAndUser.set(key, membership.id);
+    return this.enrichMembership(membership);
+  }
+
+  async removeGroupMembership(groupId: string, userId: string): Promise<void> {
+    const key = `${groupId}:${userId}`;
+    const id = this.membershipByGroupAndUser.get(key);
+    if (!id) {
+      return;
+    }
+    this.membershipByGroupAndUser.delete(key);
+    this.groupMemberships.delete(id);
+  }
+
+  async listGroupMemberships(groupId: string): Promise<GroupMembershipWithUser[]> {
+    const memberships = [...this.groupMemberships.values()]
+      .filter((membership) => membership.groupId === groupId)
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+    return Promise.all(memberships.map((membership) => this.enrichMembership(membership)));
+  }
+
+  async getGroupMembership(groupId: string, userId: string): Promise<GroupMembershipWithUser | null> {
+    const id = this.membershipByGroupAndUser.get(`${groupId}:${userId}`);
+    const membership = id ? this.groupMemberships.get(id) : undefined;
+    return membership ? this.enrichMembership(membership) : null;
+  }
+
+  async listGroupDevices(groupId: string): Promise<DeviceRecord[]> {
+    return [...this.devices.values()]
+      .filter((device) => device.groupId === groupId)
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+      .map((device) => this.copyDevice(device));
+  }
+
   private copyUser(user: UserRecord): UserRecord {
     return { ...user, createdAt: new Date(user.createdAt) };
   }
@@ -337,6 +497,27 @@ export class InMemoryDataStore implements DataStore {
       createdAt: new Date(grant.createdAt),
       revokedAt: cloneDate(grant.revokedAt),
       granteeUser: {
+        id: user.id,
+        email: user.email,
+        displayName: user.displayName,
+        createdAt: new Date(user.createdAt),
+      },
+    };
+  }
+
+  private copyGroup(group: GroupRecord): GroupRecord {
+    return { ...group, createdAt: new Date(group.createdAt) };
+  }
+
+  private enrichMembership(membership: GroupMembershipRecord): GroupMembershipWithUser {
+    const user = this.users.get(membership.userId);
+    if (!user) {
+      throw new Error(`Missing user ${membership.userId}`);
+    }
+    return {
+      ...membership,
+      createdAt: new Date(membership.createdAt),
+      user: {
         id: user.id,
         email: user.email,
         displayName: user.displayName,

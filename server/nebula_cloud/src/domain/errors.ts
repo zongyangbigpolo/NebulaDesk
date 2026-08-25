@@ -38,3 +38,9 @@ export class ConflictError extends AppError {
     super(409, 'conflict', message);
   }
 }
+
+export class InsufficientCreditError extends AppError {
+  constructor(message = 'Insufficient credit') {
+    super(402, 'insufficient_credit', message);
+  }
+}

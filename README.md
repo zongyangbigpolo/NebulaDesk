@@ -124,9 +124,26 @@ Or launch/manage sessions from the **Flutter GUI manager** instead of the CLI:
 open "app/manager/build/macos/Build/Products/Debug/nebula_manager.app"
 ```
 
-Add a VDA (name / host / port / optional relay / key) and click **Connect**;
-it spawns and supervises a `nebula_session` subprocess, tracking its lifecycle
-via the `NEBULA_STATUS:` stdout protocol (see `core/inc/SessionStatus.h`).
+(`./scripts/package_app.sh` builds everything and bundles both native helpers —
+`nebula_session` and `nebula_vda` — into this one `.app`.) It has three tabs:
+
+![Nebula Manager — Direct / Cloud / Host this Mac tabs](docs/screenshots/manager-app.png)
+
+- **Direct**: manually add a VDA (name / host / port / optional relay / key)
+  and click **Connect**; spawns and supervises a `nebula_session` subprocess,
+  tracking its lifecycle via the `NEBULA_STATUS:` stdout protocol (see
+  `core/inc/SessionStatus.h`).
+- **Cloud**: sign into a `server/nebula_cloud` instance and see/connect to
+  every device your account can reach — owned, granted, via a Group, or all
+  of them if you're an admin — with no manual relay/token/PSK entry; see
+  `app/manager/lib/cloud_client.dart` and `server/nebula_cloud/README.md`'s
+  "Groups & admin role" / "PSK distribution" sections.
+- **Host this Mac**: the same login as the Cloud tab (one account, both
+  capabilities) lets you register *this* Mac as a VDA with a shared
+  enrollment token and supervise its `nebula_vda` process the same way — see
+  `app/manager/lib/host_tab.dart` and `server/nebula_cloud/README.md`'s
+  "Self-registration & trial credit" section for the enrollment-token /
+  free-trial-credit model.
 
 For relay/NAT-traversal, the SaaS control plane, and the browser/WebRTC path,
 see **[USAGE.md](./USAGE.md)** for full command lines and flows.
@@ -143,9 +160,9 @@ see **[USAGE.md](./USAGE.md)** for full command lines and flows.
 | `core/` | Portable C++: `NebulaProtocol`, `NebulaCrypto`, `NebulaInput`, `NebulaLog`, `NebulaTypes`/`NebulaFrame`, `Signaling`, `RelayProtocol`, `OpusAudioEncoder`, `WebRtcSession`/`WebRtcGateway` (libdatachannel wrapper), `SessionStatus` |
 | `platform/mac/` | `ScreenCapture`, `VirtualDisplay`, `VideoEncoder`/`Decoder`, `AudioEncoder`/`Decoder`, `MetalRenderer`, `AudioPlayer`, `InputInjector`/`InputView`, `QuicTransport`, `RelayTransport`, `UpgradingTransport`, `ProcessSpawner`, `VdaServer`, `CwaClient` |
 | `app/vda`, `app/session` | native entry points (`nebula_vda`, `nebula_session`) |
-| `app/manager` | Flutter desktop GUI: manages a list of VDAs, spawns/supervises `nebula_session` |
+| `app/manager` | Flutter desktop GUI: Direct (manual VDA list) + Cloud (login, device list, connect) + Host this Mac (self-register + supervise `nebula_vda`) tabs |
 | `server/nebula_relay` | blind-forwarding QUIC relay (msquic), reconnect tickets/grace period, optional SaaS authorization callback |
-| `server/nebula_cloud` | optional SaaS control plane (Node/TS + PostgreSQL): accounts, device sharing, session tickets, WebRTC signaling, web dashboard |
+| `server/nebula_cloud` | optional SaaS control plane (Node/TS + PostgreSQL): accounts, groups/admin role, device sharing, self-registration + trial credit, session tickets, WebRTC signaling, web dashboard |
 | `tests/` | `test_input.cpp` (input protocol), `test_crypto.cpp` (session encryption), `test_webrtc_session.cpp` (WebRTC offer/ICE) |
 
 ## Notes
@@ -165,4 +182,11 @@ see **[USAGE.md](./USAGE.md)** for full command lines and flows.
 - The QUIC path serves **one active viewer at a time** (a new CWA supersedes
   the previous one); the WebRTC path supports genuinely concurrent browser
   viewers since each has independent DTLS/SRTP keys. See ROADMAP.md §3.
+- `nebula_vda` accepts its `--psk`/`--token` secrets via the `NEBULA_PSK`/
+  `NEBULA_RELAY_TOKEN` environment variables too (checked after argv, taking
+  priority when set) — same "never in argv, not visible in `ps`" convention
+  `nebula_session` already used, and what the Flutter manager's "Host this
+  Mac" tab relies on. It also now reports lifecycle state via the same
+  `NEBULA_STATUS:` stdout protocol as `nebula_session` (see
+  `core/inc/SessionStatus.h`).
 - Windows/Linux backends are tracked in ROADMAP.md as future work.

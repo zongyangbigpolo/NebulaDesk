@@ -70,7 +70,25 @@ CWA 断线重连(同一 `nebula_session` 再次运行,或短暂网络抖动)会�
 ```sh
 open "app/manager/build/macos/Build/Products/Debug/nebula_manager.app"
 ```
-在界面里「+」添加 VDA(名称 / host / port / 可选中继 / 密钥),点 **Connect**。
+
+界面有三个 tab:
+
+![Nebula 管理器 — Direct / Cloud / Host this Mac 三个 tab](docs/screenshots/manager-app.png)
+
+- **Direct**:在界面里「+」手动添加 VDA(名称 / host / port / 可选中继 / 密钥),点 **Connect**。
+- **Cloud**:登录一个 `server/nebula_cloud` 账号,自动列出该账号能访问的全部设备
+  (自己拥有的 + 别人分享给你的 + 所在 Group 里的 + admin 能看到全部),点 **Connect**
+  即可——中继地址、短期会话票据、应用层加密密钥(PSK)全部由 `nebula_cloud` 自动下发,
+  不需要手动填任何连接参数。详见 [server/nebula_cloud/README.md](server/nebula_cloud/README.md)
+  的「Groups & admin role」「PSK distribution」两节。
+- **Host this Mac**(新增):跟 Cloud tab 用同一个登录账号——把这台 Mac 自己注册成一台
+  VDA。填设备名 + 入网密钥(`DEVICE_ENROLLMENT_TOKEN`,管理员配置的共享密钥)点
+  **Register & Start Hosting**,就会调用 `POST /devices/self-register` 拿到长期凭证并
+  本地持久化,然后在同一个 app 里拉起并托管 `nebula_vda` 子进程(跟 Direct/Cloud tab 托管
+  `nebula_session` 是同一套机制,状态也走同样的 `NEBULA_STATUS:` 协议)。也就是同一台电脑、
+  同一个 app,既能当 CWA 查看别的设备,也能把自己注册成 VDA 被别人连——详见
+  [server/nebula_cloud/README.md](server/nebula_cloud/README.md) 的「Self-registration &
+  trial credit」一节。
 
 虚拟显示器是捕获的必需条件。CWA 会在 HELLO 中发送本机主屏幕的逻辑尺寸,
 VDA 必须创建并捕获一个完全匹配该尺寸的虚拟显示器;创建失败时会报错且不会
@@ -84,12 +102,23 @@ VDA 必须创建并捕获一个完全匹配该尺寸的虚拟显示器;创建失
 `server/nebula_cloud/` 提供一个独立的 Node.js/TypeScript + PostgreSQL 服务,
 在 `nebula_relay` 的 device-id+token 配对协议之上加了一层账号体系:注册/登录、
 设备归属、按邮箱分享授权、短期会话票据签发(60s 有效期的 JWT)、连接审计,
-以及一个能跑起来的最小 Web 控制台。详见 [server/nebula_cloud/README.md](server/nebula_cloud/README.md)。
+以及一个能跑起来的最小 Web 控制台。此外还有 **Group + admin 角色**:
+`INITIAL_ADMIN_EMAILS` 引导出第一个 admin,admin 能看到/连接所有设备,
+并把设备分组后批量授权给一批用户,不用逐台设备加分享。
+
+还有 **自助注册 + 试用额度**:配置 `DEVICE_ENROLLMENT_TOKEN`(共享入网密钥)后,
+任何已登录用户都能直接 `POST /devices/self-register` 把设备注册到自己账号下,不需要
+admin 先手动建设备/发 claim code(见上面 Flutter「Host this Mac」tab)。新账号默认送
+`DEFAULT_TRIAL_CREDIT_SECONDS`(默认 600 秒 = 10 分钟)的连接额度,每次 `/connect`
+成功扣一次 `CONNECT_CREDIT_COST_SECONDS`(固定扣费,不按实际连接时长计费),额度不够
+会返回 402,admin 可以用 `PATCH /admin/users/:id/credit` 充值(admin 自己不计费)。
+详见 [server/nebula_cloud/README.md](server/nebula_cloud/README.md)。
 
 启用方式:`nebula_relay` 追加 `--saas-auth-url <cloud>/internal/authorize --saas-auth-secret <同 RELAY_SHARED_SECRET>`
 后,CWA 连接的授权判定会实时回调该服务(而不是本地静态 token 比较),
 支持撤销授权、审计、按账号可见性等能力;VDA 的注册仍使用 SaaS 创建设备时
-下发的长期 token,不受影响。
+下发的长期 token,不受影响。追加 `--saas-heartbeat-url <cloud>/internal/heartbeat`
+后,中继还会周期性上报已注册的 VDA,让 Web 控制台的在线状态在经典 QUIC 路径下也准确。
 
 ### 5. 浏览器直接观看(WebRTC,无需安装原生客户端)
 

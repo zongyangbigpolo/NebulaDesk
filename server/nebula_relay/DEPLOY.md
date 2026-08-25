@@ -155,6 +155,36 @@ VDA 的注册流程不受影响,仍然用 `nebula_cloud` 创建设备时分配�
 
 ---
 
+## 可选:让中继维护设备在线状态(`--saas-heartbeat-url`)
+
+默认情况下,中继与 VDA 之间的 QUIC 连接只有 msquic 自己的 PING 保活
+(§ [ARCHITECTURE.md](../../ARCHITECTURE.md) 里说的 15s KeepAlive),
+`nebula_cloud` 完全不知道这条连接的存在——经典 QUIC+relay 路径下,Web 控制台
+看到的设备 `online`/`lastSeenAt` 不会更新(该字段此前只由 WebRTC 信令路径维护)。
+
+加上这个参数后,中继会在**VDA 注册/重新注册时立即上报一次**,之后**每隔
+`--saas-heartbeat-interval-secs` 秒**(默认 30s)对所有当前仍注册在中继上的
+VDA 各上报一次,调用 `nebula_cloud` 的 `POST /internal/heartbeat`
+(同样用 `X-Relay-Secret` 头,`deviceId` 是 `relayDeviceId`):
+
+```sh
+./nebula_relay --port 7100 \
+  --cert /etc/nebula-relay/relay_cert.pem --key /etc/nebula-relay/relay_key.pem \
+  --saas-auth-url  https://<nebula_cloud_host>/internal/authorize \
+  --saas-auth-secret <与 nebula_cloud 的 RELAY_SHARED_SECRET 一致> \
+  --saas-heartbeat-url https://<nebula_cloud_host>/internal/heartbeat \
+  --saas-heartbeat-interval-secs 30
+```
+
+- `--saas-heartbeat-url` 需要 `--saas-auth-secret` 已设置(复用同一个共享密钥,
+  不需要单独再配一个)。
+- 心跳只影响 `nebula_cloud` 里 `online`/`lastSeenAt` 的展示,**不参与任何鉴权
+  判断**——调用失败/超时只会打日志,不影响中继自身的配对/转发行为。
+- 只要 `--saas-auth-url` 没配(纯自托管、无 SaaS 模式),这个参数也不需要配,
+  中继不会发起任何 HTTP 调用。
+
+---
+
 ## 生产加固清单
 
 - [ ] 用**真实证书**(Let's Encrypt 等)替换自签证书;并去掉客户端的 trust-all
@@ -163,6 +193,8 @@ VDA 的注册流程不受影响,仍然用 `nebula_cloud` 创建设备时分配�
 - [ ] 生产环境建议接入上面的 **SaaS 授权回调**(`--saas-auth-url`),而不是只
       依赖静态 token——静态 token 一旦泄露就要手动改 VDA 注册的 token,
       而 SaaS 模式下撤销授权立即生效,且有完整的连接审计。
+- [ ] 同时建议接入 **`--saas-heartbeat-url`**,否则经典 QUIC 路径下的设备在
+      Web 控制台会一直显示离线,即便实际连接正常。
 - [ ] 多实例 + 负载均衡时,注意会话亲和(同一 device 的 VDA/CWA 要落到同一实例,
       因为配对表、reconnect ticket、VDA重连宽限期都在进程内存中)。
 - [ ] 监控:`journalctl` / 容器日志;关注 `paired` / `Superseded` / `VDA reattached` /
