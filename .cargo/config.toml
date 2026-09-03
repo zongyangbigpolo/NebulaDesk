@@ -1,0 +1,15 @@
+# Build settings that must be in place before any dependency's build script
+# runs, which rules out doing this from a build.rs of our own.
+
+[env]
+# ScreenCaptureKit's Rust bindings compile a small Swift shim. Swift links its
+# concurrency runtime out of the OS from macOS 12 onwards, but back-deploys a
+# private copy for anything older -- and that copy is not shipped, so the
+# binary links fine and then fails to launch with a missing
+# `libswift_Concurrency.dylib`.
+#
+# NebulaDesk targets the two most recent macOS releases, so naming a modern
+# deployment target is not a workaround here, it is the truth.
+#
+# Ignored on every other platform.
+MACOSX_DEPLOYMENT_TARGET = "26.0"

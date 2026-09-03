@@ -1,14 +1,13 @@
 //! The macOS backend.
 //!
-//! Capture and encode are not written yet, so this platform provides real
-//! input injection over a synthetic picture. That combination is not a
-//! finished product but it is an honest one: input can be verified against a
-//! real desktop today, and the video source is replaced without anything
-//! above this module changing.
+//! ScreenCaptureKit for pixels, VideoToolbox for encoding, CoreGraphics for
+//! input. All three are the paths the system itself uses, which is what makes
+//! a session feel like sitting at the machine rather than watching it.
 
+pub mod capture;
 pub mod input;
 
-use crate::media::{InputInjector, Platform, SyntheticVideo, VideoSource};
+use crate::media::{InputInjector, Platform, VideoSource};
 
 /// Media backend for macOS.
 #[derive(Debug, Default, Clone, Copy)]
@@ -16,7 +15,7 @@ pub struct MacOs;
 
 impl Platform for MacOs {
     fn video(&self) -> anyhow::Result<Box<dyn VideoSource>> {
-        Ok(Box::new(SyntheticVideo::default()))
+        Ok(Box::new(capture::MacVideo::new()))
     }
 
     fn input(&self) -> anyhow::Result<Box<dyn InputInjector>> {
