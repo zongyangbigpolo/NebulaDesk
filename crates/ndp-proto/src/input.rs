@@ -530,7 +530,8 @@ mod tests {
 
     #[test]
     fn ragged_batch_is_rejected() {
-        let mut encoded = InputEvent::encode_batch(&[InputEvent::mouse_move(0.0, 0.0, Modifiers::NONE)]);
+        let mut encoded =
+            InputEvent::encode_batch(&[InputEvent::mouse_move(0.0, 0.0, Modifiers::NONE)]);
         encoded.truncate(INPUT_EVENT_LEN - 1);
         assert!(InputEvent::decode_batch(&encoded).is_err());
         assert!(iter_batch(&encoded).any(|r| r.is_err()));

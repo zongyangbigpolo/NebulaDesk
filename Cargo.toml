@@ -4,7 +4,7 @@ members = [
     "crates/nebula-common",
     "crates/ndp-proto",
     "crates/ndp-crypto",
-
+    "crates/ndp-transport",
 ]
 
 [workspace.package]

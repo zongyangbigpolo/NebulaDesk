@@ -68,11 +68,7 @@ impl ReplayWindow {
         }
         if seq > self.highest {
             let shift = seq - self.highest;
-            self.bitmap = if shift >= 64 {
-                0
-            } else {
-                self.bitmap << shift
-            };
+            self.bitmap = if shift >= 64 { 0 } else { self.bitmap << shift };
             self.bitmap |= 1;
             self.highest = seq;
             return true;

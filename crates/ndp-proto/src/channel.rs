@@ -17,7 +17,7 @@ pub enum Channel {
     Audio = 2,
     /// Keyboard/mouse/touch events, client to agent. Reliable and ordered.
     Input = 3,
-    /// Clipboard synchronisation, bidirectional.
+    /// Clipboard synchronisation, one stream per transfer.
     Clipboard = 4,
     /// File transfer, one stream per transfer.
     File = 5,
@@ -68,7 +68,7 @@ impl Channel {
     /// multiplexing everything onto one long-lived stream.
     #[must_use]
     pub const fn is_stream_per_message(self) -> bool {
-        matches!(self, Channel::Video | Channel::File)
+        matches!(self, Channel::Video | Channel::Clipboard | Channel::File)
     }
 
     /// Human-readable name, used in logs and metrics labels.
@@ -99,6 +99,24 @@ mod tests {
     #[test]
     fn unknown_channel_is_rejected() {
         assert!(Channel::from_id(99).is_err());
+    }
+
+    #[test]
+    fn ordered_and_per_message_channels_are_disjoint_and_total() {
+        // Every channel must have exactly one carrier: unreliable (datagram),
+        // per-message stream, or the long-lived ordered stream.
+        for ch in Channel::ALL {
+            assert!(
+                !(ch.is_unreliable() && ch.is_stream_per_message()),
+                "{} claims two carriers",
+                ch.name()
+            );
+        }
+        let ordered: Vec<_> = Channel::ALL
+            .into_iter()
+            .filter(|c| !c.is_unreliable() && !c.is_stream_per_message())
+            .collect();
+        assert_eq!(ordered, vec![Channel::Control, Channel::Input]);
     }
 
     #[test]

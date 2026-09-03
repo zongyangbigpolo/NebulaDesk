@@ -35,10 +35,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod handshake;
 mod keys;
 mod record;
 mod replay;
-mod handshake;
 
 pub use handshake::{HandshakeResult, Initiator, Responder, NOISE_PARAMS};
 pub use keys::{PublicKey, StaticKeypair, PUBLIC_KEY_LEN, SECRET_KEY_LEN};

@@ -173,8 +173,10 @@ impl Responder {
 
     /// Produce the reply and derive the session keys.
     ///
-    /// Call only after the ticket from [`Self::read_first`] has been accepted.
-    pub fn write_second(mut self, payload: &[u8]) -> Result<HandshakeResult> {
+    /// Returns the bytes to send back to the client alongside the completed
+    /// handshake. Call only after the ticket recovered by
+    /// [`Self::read_first`] has been accepted.
+    pub fn write_second(mut self, payload: &[u8]) -> Result<(Vec<u8>, HandshakeResult)> {
         if payload.len() > MAX_HANDSHAKE_PAYLOAD {
             return Err(CryptoError::PayloadTooLarge(payload.len()));
         }
@@ -188,11 +190,10 @@ impl Responder {
                 "IK pattern not complete after the reply".into(),
             ));
         }
-        let mut result = finish(self.hs, Vec::new(), false)?;
-        // The reply bytes travel back to the client; hand them to the caller
-        // via `peer_payload`'s slot is wrong, so return them explicitly.
-        result.peer_payload = reply;
-        Ok(result)
+        // The responder never receives a payload of its own: the client's
+        // payload was already surfaced by `read_first`.
+        let result = finish(self.hs, Vec::new(), false)?;
+        Ok((reply, result))
     }
 }
 
@@ -233,15 +234,16 @@ mod tests {
         let seen_ticket = responder.read_first(&msg1)?.to_vec();
         assert_eq!(seen_ticket, ticket);
 
-        let agent = responder.write_second(b"agent-hello")?;
-        let client = initiator.read_second(&agent.peer_payload)?;
+        let (msg2, agent) = responder.write_second(b"agent-hello")?;
+        let client = initiator.read_second(&msg2)?;
+        assert_eq!(client.peer_payload, b"agent-hello");
 
         Ok(Handshaken { client, agent })
     }
 
     #[test]
     fn handshake_establishes_a_working_record_layer() {
-        let mut h = run(b"session-1", b"ticket-bytes").unwrap();
+        let h = run(b"session-1", b"ticket-bytes").unwrap();
 
         let record = h
             .client
@@ -329,8 +331,8 @@ mod tests {
     #[test]
     fn two_sessions_derive_different_keys() {
         let agent_kp = StaticKeypair::generate();
-        let mut a = run_with(&agent_kp, agent_kp.public(), b"s1", b"s1", b"t").unwrap();
-        let mut b = run_with(&agent_kp, agent_kp.public(), b"s2", b"s2", b"t").unwrap();
+        let a = run_with(&agent_kp, agent_kp.public(), b"s1", b"s1", b"t").unwrap();
+        let b = run_with(&agent_kp, agent_kp.public(), b"s2", b"s2", b"t").unwrap();
 
         let record = a
             .client

@@ -250,10 +250,7 @@ mod tests {
 
     #[test]
     fn kind_matches_variant() {
-        assert_eq!(
-            ControlMessage::Ping { echo_us: 0 }.kind(),
-            MsgKind::Ping
-        );
+        assert_eq!(ControlMessage::Ping { echo_us: 0 }.kind(), MsgKind::Ping);
         assert_eq!(
             ControlMessage::Bye {
                 reason: ByeReason::IdleTimeout,

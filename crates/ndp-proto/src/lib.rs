@@ -50,7 +50,7 @@ pub use caps::{
 pub use channel::Channel;
 pub use control::{ByeReason, ControlMessage, CursorShape, QosReport};
 pub use header::{MsgFlags, MsgHeader, MsgKind, HEADER_LEN, PROTOCOL_VERSION};
-pub use input::{InputEvent, InputKind, KeyCode, MouseButton, Modifiers};
+pub use input::{InputEvent, InputKind, KeyCode, Modifiers, MouseButton};
 pub use media::{AudioFrameInfo, VideoFrameInfo};
 pub use transfer::{ClipboardFormat, ClipboardOffer, FileChunkHeader, FileOffer};
 
@@ -110,7 +110,9 @@ macro_rules! read_int {
     ($name:ident, $ty:ty, $n:literal) => {
         pub(crate) fn $name(buf: &mut &[u8]) -> Result<$ty> {
             let bytes = take(buf, $n)?;
-            Ok(<$ty>::from_le_bytes(bytes.try_into().expect("length checked")))
+            Ok(<$ty>::from_le_bytes(
+                bytes.try_into().expect("length checked"),
+            ))
         }
     };
 }
