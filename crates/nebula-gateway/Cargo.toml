@@ -1,0 +1,42 @@
+[package]
+name = "nebula-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NebulaDesk edge gateway: the only public entry point, brokering clients onto agent control tunnels."
+
+[dependencies]
+nebula-common = { workspace = true }
+ndp-signal = { workspace = true }
+ndp-transport = { workspace = true }
+
+quinn = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+hex = { workspace = true }
+time = { workspace = true }
+jsonwebtoken = { workspace = true }
+base64 = { workspace = true }
+
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+
+[[bin]]
+name = "nebula-gateway"
+path = "src/main.rs"
+
+[dev-dependencies]
+nebula-manager = { workspace = true }
+nebula-relay = { workspace = true }
+ndp-crypto = { workspace = true }
+ndp-proto = { workspace = true }
+axum = { workspace = true }

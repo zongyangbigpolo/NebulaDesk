@@ -263,14 +263,34 @@ pub struct EntitledResource {
     pub allow_audio: bool,
 }
 
-/// The SQL that resolves a user's entitlements, directly or via a group.
+/// How long a machine may go unheard-from before it counts as offline.
+///
+/// A machine's stored status is whatever its agent last claimed, and an agent
+/// that crashes never gets to retract "ONLINE". Its gateway reports the
+/// machine as draining when the control tunnel drops, but a gateway can crash
+/// too, so liveness is also derived from the clock. Without this, one killed
+/// process would leave a machine advertised as reachable indefinitely.
+const LIVENESS_GRACE: &str = "90 seconds";
+
+/// The status a machine actually has, as opposed to the one it last claimed.
+fn live_status() -> String {
+    format!(
+        "CASE WHEN m.status = 'ONLINE'
+                   AND m.last_seen_at < now() - interval '{LIVENESS_GRACE}'
+              THEN 'OFFLINE' ELSE m.status END"
+    )
+}
+
+/// Every resource one user may launch, and the terms they may launch it on.
 ///
 /// Kept in one place because both the resource list and the session-creation
 /// authorisation check must agree exactly; two subtly different queries here
 /// would be a privilege escalation waiting to happen.
-const ENTITLED_RESOURCES_SQL: &str = "
+fn entitled_resources_sql() -> String {
+    format!(
+        "
     SELECT r.id, r.kind, r.name, r.description,
-           m.status AS machine_status, m.os AS machine_os,
+           {} AS machine_status, m.os AS machine_os,
            e.role, e.allow_clipboard, e.allow_file_transfer, e.allow_audio
     FROM entitlements e
     JOIN published_resources r ON r.id = e.resource_id
@@ -285,7 +305,10 @@ const ENTITLED_RESOURCES_SQL: &str = "
                 SELECT group_id FROM user_group_members
                 WHERE tenant_id = $1 AND user_id = $2))
       )
-";
+",
+        live_status()
+    )
+}
 
 /// `GET /v1/resources`
 ///
@@ -295,12 +318,14 @@ pub async fn list_mine(
     State(state): State<AppState>,
     caller: AuthUser,
 ) -> ApiResult<Json<Vec<EntitledResource>>> {
-    let rows =
-        sqlx::query_as::<_, EntitledResource>(&format!("{ENTITLED_RESOURCES_SQL} ORDER BY r.name"))
-            .bind(caller.tenant.as_uuid())
-            .bind(caller.id.as_uuid())
-            .fetch_all(&state.db)
-            .await?;
+    let rows = sqlx::query_as::<_, EntitledResource>(&format!(
+        "{} ORDER BY r.name",
+        entitled_resources_sql()
+    ))
+    .bind(caller.tenant.as_uuid())
+    .bind(caller.id.as_uuid())
+    .fetch_all(&state.db)
+    .await?;
     Ok(Json(rows))
 }
 
@@ -352,12 +377,14 @@ pub async fn resolve_grant(
     resource: Uuid,
 ) -> ApiResult<Option<ResolvedGrant>> {
     let sql = format!(
-        "SELECT m.id AS machine_id, m.status AS machine_status, m.noise_public_key,
+        "SELECT m.id AS machine_id, {} AS machine_status, m.noise_public_key,
                 g.role, g.allow_clipboard, g.allow_file_transfer, g.allow_audio
-         FROM ({ENTITLED_RESOURCES_SQL}) g
+         FROM ({}) g
          JOIN published_resources r ON r.id = g.id
          JOIN machines m ON m.id = r.machine_id
-         WHERE g.id = $3"
+         WHERE g.id = $3",
+        live_status(),
+        entitled_resources_sql()
     );
     Ok(sqlx::query_as::<_, ResolvedGrant>(&sql)
         .bind(caller.tenant.as_uuid())
