@@ -1,10 +1,8 @@
 //! The `nebula-agent` executable.
 
-use std::path::PathBuf;
-use std::sync::Arc;
-
 use clap::{Parser, Subcommand};
-use nebula_agent::{enroll, Agent, Identity, TestPattern};
+use nebula_agent::{enroll, native, Agent, Identity};
+use std::path::PathBuf;
 
 /// NebulaDesk server machine agent.
 #[derive(Debug, Parser)]
@@ -69,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
                     path.display()
                 )
             })?;
-            let agent = Agent::new(identity, Arc::new(TestPattern))?;
+            let agent = Agent::new(identity, native())?;
             tracing::info!(key = %agent.public_key(), "agent starting");
             agent.run().await
         }
@@ -77,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Status => {
             match Identity::load(&path)? {
                 Some(identity) => {
-                    let agent = Agent::new(identity.clone(), Arc::new(TestPattern))?;
+                    let agent = Agent::new(identity.clone(), native())?;
                     println!("machine    {}", identity.machine_id);
                     println!("manager    {}", identity.manager_url);
                     println!("noise key  {}", agent.public_key());

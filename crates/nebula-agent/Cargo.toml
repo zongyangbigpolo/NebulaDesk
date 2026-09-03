@@ -34,6 +34,9 @@ clap = { workspace = true }
 name = "nebula-agent"
 path = "src/main.rs"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.25"
+
 [dev-dependencies]
 tempfile = "3"
 nebula-manager = { workspace = true }

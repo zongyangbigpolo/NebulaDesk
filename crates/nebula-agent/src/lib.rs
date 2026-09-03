@@ -15,6 +15,7 @@
 pub mod identity;
 pub mod manager;
 pub mod media;
+pub mod platform;
 pub mod session;
 
 use std::sync::Arc;
@@ -30,6 +31,7 @@ use tokio::sync::mpsc;
 pub use identity::Identity;
 pub use manager::ManagerClient;
 pub use media::{Platform, TestPattern};
+pub use platform::native;
 
 /// The shortest and longest waits between reconnection attempts.
 ///
