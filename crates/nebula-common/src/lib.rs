@@ -5,8 +5,10 @@
 
 pub mod ids;
 pub mod obs;
+pub mod ticket;
 
 pub use ids::{MachineId, RelayId, ResourceId, SessionId, TenantId, UserId};
+pub use ticket::{Jwk, Jwks, SessionPolicy, SessionRole, TicketClaims};
 
 /// Errors that are meaningful across component boundaries.
 #[derive(Debug, thiserror::Error)]

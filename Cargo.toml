@@ -5,6 +5,7 @@ members = [
     "crates/ndp-proto",
     "crates/ndp-crypto",
     "crates/ndp-transport",
+    "crates/nebula-manager",
 ]
 
 [workspace.package]
@@ -71,10 +72,29 @@ clap = { version = "4", features = ["derive", "env"] }
 figment = { version = "0.10", features = ["toml", "env"] }
 
 # --- time ---
-time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
+time = { version = "0.3", features = ["serde", "serde-well-known", "formatting", "parsing", "macros"] }
+
+# --- control plane ---
+axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
+http-body-util = "0.1"
+tower-http = { version = "0.6", features = ["trace", "cors", "request-id", "limit"] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls-aws-lc-rs",
+    "postgres",
+    "uuid",
+    "time",
+    "json",
+    "macros",
+    "migrate",
+] }
+jsonwebtoken = "9"
+http = "1"
 
 # --- testing ---
 tokio-test = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [profile.release]
 opt-level = 3

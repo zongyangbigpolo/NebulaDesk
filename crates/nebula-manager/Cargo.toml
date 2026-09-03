@@ -1,0 +1,45 @@
+[package]
+name = "nebula-manager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NebulaDesk control plane: tenants, users, machines, published resources, entitlements and session tickets."
+
+[dependencies]
+nebula-common = { workspace = true }
+
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+http = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+
+argon2 = { workspace = true }
+ed25519-dalek = { workspace = true }
+jsonwebtoken = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+time = { workspace = true }
+
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+http-body-util = { workspace = true }
+
+[[bin]]
+name = "nebula-manager"
+path = "src/main.rs"

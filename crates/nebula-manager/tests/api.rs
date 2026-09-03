@@ -1,0 +1,1072 @@
+//! End-to-end tests for the manager's HTTP surface.
+//!
+//! These run against a real Postgres because the interesting behaviour lives
+//! in the SQL: composite foreign keys that make cross-tenant references
+//! impossible, single-statement token rotation, and the entitlement join that
+//! decides who may launch what. Mocking the database would test none of it.
+//!
+//! Point `NEBULA_TEST_DATABASE_URL` at a scratch database; the default is a
+//! local `nebula_manager_test`. Every test creates its own tenant, so they
+//! are safe to run in parallel.
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use axum::Router;
+use http_body_util::BodyExt;
+use nebula_manager::{routes, AppState, Config};
+use serde_json::{json, Value};
+use tower::ServiceExt;
+use uuid::Uuid;
+
+/// A running manager plus a freshly created tenant to work in.
+struct App {
+    router: Router,
+    tenant_slug: String,
+    owner_token: String,
+    owner_id: Uuid,
+}
+
+fn database_url() -> String {
+    std::env::var("NEBULA_TEST_DATABASE_URL")
+        .unwrap_or_else(|_| "postgres:///nebula_manager_test".into())
+}
+
+const BOOTSTRAP: &str = "test-bootstrap-token";
+const PASSWORD: &str = "correct horse battery staple";
+
+impl App {
+    async fn start() -> Self {
+        let state = AppState::bootstrap(Config::for_test(database_url()))
+            .await
+            .expect("the manager should start against the test database");
+        let router = routes::router(state);
+
+        let slug = format!("t{}", Uuid::now_v7().simple());
+        let body = request(
+            &router,
+            "POST",
+            "/v1/tenants",
+            Some(BOOTSTRAP),
+            json!({
+                "name": "Acme",
+                "slug": slug,
+                "owner_email": "owner@acme.test",
+                "owner_password": PASSWORD,
+                "owner_display_name": "Owner",
+            }),
+        )
+        .await
+        .expect_status(StatusCode::CREATED)
+        .json();
+
+        let owner_id: Uuid = body["owner"]["id"].as_str().unwrap().parse().unwrap();
+        let mut app = Self {
+            router,
+            tenant_slug: slug,
+            owner_token: String::new(),
+            owner_id,
+        };
+        app.owner_token = app.login("owner@acme.test", PASSWORD).await;
+        app
+    }
+
+    async fn login(&self, email: &str, password: &str) -> String {
+        let body = self
+            .post(
+                "/v1/auth/login",
+                None,
+                json!({ "tenant": self.tenant_slug, "email": email, "password": password }),
+            )
+            .await
+            .expect_status(StatusCode::OK)
+            .json();
+        body["access_token"].as_str().unwrap().to_string()
+    }
+
+    // These return an un-sent request rather than a future so that a caller
+    // can swap in a machine or node credential before awaiting it.
+    fn post(&self, path: &str, token: Option<&str>, body: Value) -> PendingRequest<'_> {
+        request(&self.router, "POST", path, token, body)
+    }
+
+    fn patch(&self, path: &str, token: Option<&str>, body: Value) -> PendingRequest<'_> {
+        request(&self.router, "PATCH", path, token, body)
+    }
+
+    fn get(&self, path: &str, token: Option<&str>) -> PendingRequest<'_> {
+        request(&self.router, "GET", path, token, Value::Null)
+    }
+
+    fn delete(&self, path: &str, token: Option<&str>) -> PendingRequest<'_> {
+        request(&self.router, "DELETE", path, token, Value::Null)
+    }
+
+    /// Create a user and return `(id, access token)`.
+    async fn user(&self, email: &str, role: &str) -> (Uuid, String) {
+        let body = self
+            .post(
+                "/v1/users",
+                Some(&self.owner_token),
+                json!({
+                    "email": email,
+                    "password": PASSWORD,
+                    "display_name": email,
+                    "role": role,
+                }),
+            )
+            .await
+            .expect_status(StatusCode::CREATED)
+            .json();
+        let id = body["id"].as_str().unwrap().parse().unwrap();
+        (id, self.login(email, PASSWORD).await)
+    }
+
+    /// Enrol a machine and return `(machine id, credential)`.
+    async fn machine(&self, name: &str) -> (Uuid, String) {
+        let token = self
+            .post(
+                "/v1/machines/enrollment-tokens",
+                Some(&self.owner_token),
+                json!({ "machine_name": name }),
+            )
+            .await
+            .expect_status(StatusCode::CREATED)
+            .json()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let body = self
+            .post(
+                "/v1/machines/enroll",
+                None,
+                json!({
+                    "token": token,
+                    "name": name,
+                    "os": "MACOS",
+                    "os_version": "26.0",
+                    "arch": "arm64",
+                    "agent_version": "0.1.0",
+                    "noise_public_key": hex::encode(rand_key()),
+                }),
+            )
+            .await
+            .expect_status(StatusCode::CREATED)
+            .json();
+        (
+            body["machine_id"].as_str().unwrap().parse().unwrap(),
+            body["credential"].as_str().unwrap().to_string(),
+        )
+    }
+
+    /// Enrol a machine, mark it online and publish a desktop from it.
+    ///
+    /// `gateway` pins which gateway the machine's control tunnel is attached
+    /// to, which is what makes session placement deterministic when several
+    /// tests share a database.
+    async fn online_machine_with_desktop(&self, name: &str, gateway: Option<Uuid>) -> (Uuid, Uuid) {
+        let (machine, credential) = self.machine(name).await;
+        self.post(
+            "/v1/machines/heartbeat",
+            None,
+            json!({ "status": "ONLINE", "gateway_id": gateway }),
+        )
+        .with_machine(&credential)
+        .await
+        .expect_status(StatusCode::NO_CONTENT);
+
+        let resource = self
+            .post(
+                &format!("/v1/machines/{machine}/resources"),
+                Some(&self.owner_token),
+                json!({ "kind": "DESKTOP", "name": "Desktop" }),
+            )
+            .await
+            .expect_status(StatusCode::CREATED)
+            .json()["id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        (machine, resource)
+    }
+
+    /// Register one gateway and one relay so sessions can be placed, and
+    /// return the gateway's id and credential.
+    async fn infrastructure(&self) -> (Uuid, String) {
+        let suffix = Uuid::now_v7().simple().to_string();
+        let gateway = self
+            .post(
+                "/v1/gateways",
+                Some(BOOTSTRAP),
+                json!({
+                    "name": format!("gw-{suffix}"),
+                    "public_url": "https://gw.test",
+                    "quic_addr": "gw.test:7443",
+                    "cert_pin": "ab".repeat(32),
+                }),
+            )
+            .await
+            .expect_status(StatusCode::CREATED)
+            .json();
+
+        self.post(
+            "/v1/relays",
+            Some(BOOTSTRAP),
+            json!({
+                "name": format!("relay-{suffix}"),
+                "quic_addr": "relay.test:7444",
+                "cert_pin": "cd".repeat(32),
+            }),
+        )
+        .await
+        .expect_status(StatusCode::CREATED);
+
+        (
+            gateway["id"].as_str().unwrap().parse().unwrap(),
+            gateway["credential"].as_str().unwrap().to_string(),
+        )
+    }
+}
+
+fn rand_key() -> [u8; 32] {
+    rand::random()
+}
+
+/// A captured HTTP response.
+struct Response {
+    status: StatusCode,
+    body: Vec<u8>,
+}
+
+impl Response {
+    fn expect_status(self, expected: StatusCode) -> Self {
+        assert_eq!(
+            self.status,
+            expected,
+            "unexpected status; body was {}",
+            String::from_utf8_lossy(&self.body)
+        );
+        self
+    }
+
+    fn json(&self) -> Value {
+        serde_json::from_slice(&self.body).unwrap_or_else(|e| {
+            panic!(
+                "expected JSON, got {:?}: {e}",
+                String::from_utf8_lossy(&self.body)
+            )
+        })
+    }
+}
+
+/// A request that has been built but not yet sent, so the auth scheme can be
+/// swapped for a machine or node credential.
+struct PendingRequest<'a> {
+    router: &'a Router,
+    method: &'static str,
+    path: String,
+    body: Value,
+    auth: Option<String>,
+}
+
+impl PendingRequest<'_> {
+    fn with_machine(mut self, credential: &str) -> Self {
+        self.auth = Some(format!("Machine {credential}"));
+        self
+    }
+
+    fn with_node(mut self, credential: &str) -> Self {
+        self.auth = Some(format!("Node {credential}"));
+        self
+    }
+}
+
+impl std::future::IntoFuture for PendingRequest<'_> {
+    type Output = Response;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        // Everything is moved out first so the returned future owns its data
+        // and does not borrow the caller's router.
+        let (router, method, path, auth, body) = (
+            self.router.clone(),
+            self.method,
+            self.path,
+            self.auth,
+            self.body,
+        );
+        Box::pin(async move { send(&router, method, &path, auth, body).await })
+    }
+}
+
+fn request<'a>(
+    router: &'a Router,
+    method: &'static str,
+    path: &str,
+    token: Option<&str>,
+    body: Value,
+) -> PendingRequest<'a> {
+    PendingRequest {
+        router,
+        method,
+        path: path.to_string(),
+        body,
+        auth: token.map(|t| format!("Bearer {t}")),
+    }
+}
+
+async fn send(
+    router: &Router,
+    method: &str,
+    path: &str,
+    auth: Option<String>,
+    body: Value,
+) -> Response {
+    let mut builder = Request::builder().method(method).uri(path);
+    if let Some(auth) = auth {
+        builder = builder.header("authorization", auth);
+    }
+    let request = if body.is_null() {
+        builder.body(Body::empty()).unwrap()
+    } else {
+        builder
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    };
+    let response = router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    Response {
+        status,
+        body: body.to_vec(),
+    }
+}
+
+#[tokio::test]
+async fn health_and_jwks_are_public() {
+    let app = App::start().await;
+    app.get("/health", None).await.expect_status(StatusCode::OK);
+    app.get("/ready", None)
+        .await
+        .expect_status(StatusCode::NO_CONTENT);
+
+    let jwks = app
+        .get("/.well-known/jwks.json", None)
+        .await
+        .expect_status(StatusCode::OK)
+        .json();
+    // A gateway with no key cannot verify a ticket, so an empty set here
+    // would silently break every session launch.
+    let key = &jwks["keys"][0];
+    assert_eq!(key["kty"], "OKP");
+    assert_eq!(key["crv"], "Ed25519");
+    assert!(key["kid"].as_str().is_some_and(|k| !k.is_empty()));
+}
+
+#[tokio::test]
+async fn tenant_creation_requires_the_bootstrap_secret() {
+    let app = App::start().await;
+    for token in [None, Some("wrong")] {
+        app.post(
+            "/v1/tenants",
+            token,
+            json!({
+                "name": "Squatter",
+                "slug": format!("s{}", Uuid::now_v7().simple()),
+                "owner_email": "a@b.test",
+                "owner_password": PASSWORD,
+                "owner_display_name": "A",
+            }),
+        )
+        .await
+        .expect_status(StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[tokio::test]
+async fn login_rejects_bad_credentials_without_saying_why() {
+    let app = App::start().await;
+    let wrong_password = app
+        .post(
+            "/v1/auth/login",
+            None,
+            json!({ "tenant": app.tenant_slug, "email": "owner@acme.test", "password": "nope" }),
+        )
+        .await
+        .expect_status(StatusCode::UNAUTHORIZED)
+        .json();
+    let missing_user = app
+        .post(
+            "/v1/auth/login",
+            None,
+            json!({ "tenant": app.tenant_slug, "email": "ghost@acme.test", "password": PASSWORD }),
+        )
+        .await
+        .expect_status(StatusCode::UNAUTHORIZED)
+        .json();
+    // Identical responses: anything else turns login into a user directory.
+    assert_eq!(wrong_password, missing_user);
+}
+
+#[tokio::test]
+async fn refresh_tokens_rotate_and_the_old_one_dies() {
+    let app = App::start().await;
+    let first = app
+        .post(
+            "/v1/auth/login",
+            None,
+            json!({ "tenant": app.tenant_slug, "email": "owner@acme.test", "password": PASSWORD }),
+        )
+        .await
+        .expect_status(StatusCode::OK)
+        .json()["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let second = app
+        .post("/v1/auth/refresh", None, json!({ "refresh_token": first }))
+        .await
+        .expect_status(StatusCode::OK)
+        .json()["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(first, second);
+
+    // Replaying the consumed token must fail: that is what makes theft
+    // detectable rather than silently useful forever.
+    app.post("/v1/auth/refresh", None, json!({ "refresh_token": first }))
+        .await
+        .expect_status(StatusCode::UNAUTHORIZED);
+
+    app.post("/v1/auth/logout", None, json!({ "refresh_token": second }))
+        .await
+        .expect_status(StatusCode::NO_CONTENT);
+    app.post("/v1/auth/refresh", None, json!({ "refresh_token": second }))
+        .await
+        .expect_status(StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_plain_user_cannot_administer_the_tenant() {
+    let app = App::start().await;
+    let (_, user_token) = app.user("user@acme.test", "USER").await;
+
+    app.get("/v1/users", Some(&user_token))
+        .await
+        .expect_status(StatusCode::FORBIDDEN);
+    app.get("/v1/machines", Some(&user_token))
+        .await
+        .expect_status(StatusCode::FORBIDDEN);
+    app.post(
+        "/v1/machines/enrollment-tokens",
+        Some(&user_token),
+        json!({}),
+    )
+    .await
+    .expect_status(StatusCode::FORBIDDEN);
+
+    // But their own identity and resource list are always available.
+    app.get("/v1/auth/me", Some(&user_token))
+        .await
+        .expect_status(StatusCode::OK);
+    let resources = app
+        .get("/v1/resources", Some(&user_token))
+        .await
+        .expect_status(StatusCode::OK)
+        .json();
+    assert_eq!(resources.as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn only_an_owner_may_create_another_owner() {
+    let app = App::start().await;
+    let (_, admin_token) = app.user("admin@acme.test", "ADMIN").await;
+
+    app.post(
+        "/v1/users",
+        Some(&admin_token),
+        json!({
+            "email": "usurper@acme.test",
+            "password": PASSWORD,
+            "display_name": "U",
+            "role": "OWNER",
+        }),
+    )
+    .await
+    .expect_status(StatusCode::FORBIDDEN);
+
+    // An admin promoting an existing account is the same escalation.
+    let (victim, _) = app.user("victim@acme.test", "USER").await;
+    app.patch(
+        &format!("/v1/users/{victim}"),
+        Some(&admin_token),
+        json!({ "role": "OWNER" }),
+    )
+    .await
+    .expect_status(StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn disabling_a_user_takes_effect_immediately() {
+    let app = App::start().await;
+    let (id, token) = app.user("temp@acme.test", "USER").await;
+    app.get("/v1/auth/me", Some(&token))
+        .await
+        .expect_status(StatusCode::OK);
+
+    app.patch(
+        &format!("/v1/users/{id}"),
+        Some(&app.owner_token),
+        json!({ "disabled": true }),
+    )
+    .await
+    .expect_status(StatusCode::NO_CONTENT);
+
+    // The access token is still cryptographically valid; the live row is
+    // what decides, so it must stop working right away.
+    app.get("/v1/auth/me", Some(&token))
+        .await
+        .expect_status(StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn an_enrollment_token_works_once_and_pins_the_name() {
+    let app = App::start().await;
+    let token = app
+        .post(
+            "/v1/machines/enrollment-tokens",
+            Some(&app.owner_token),
+            json!({ "machine_name": "studio" }),
+        )
+        .await
+        .expect_status(StatusCode::CREATED)
+        .json()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let enroll = |name: &str, token: &str| {
+        app.post(
+            "/v1/machines/enroll",
+            None,
+            json!({
+                "token": token,
+                "name": name,
+                "os": "MACOS",
+                "noise_public_key": hex::encode(rand_key()),
+            }),
+        )
+    };
+
+    // A token bound to one name must not enrol an impostor under another.
+    enroll("impostor", &token)
+        .await
+        .expect_status(StatusCode::FORBIDDEN);
+    enroll("studio", &token)
+        .await
+        .expect_status(StatusCode::CREATED);
+    // And it is consumed, so a leaked copy is worthless.
+    enroll("studio", &token)
+        .await
+        .expect_status(StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_machine_credential_is_not_a_user_credential() {
+    let app = App::start().await;
+    let (_, credential) = app.machine("laptop").await;
+
+    // Neither as a bearer token...
+    app.get("/v1/machines", Some(&credential))
+        .await
+        .expect_status(StatusCode::UNAUTHORIZED);
+    // ...nor for anything but its own heartbeat.
+    app.post(
+        "/v1/machines/heartbeat",
+        None,
+        json!({ "status": "ONLINE" }),
+    )
+    .with_machine(&credential)
+    .await
+    .expect_status(StatusCode::NO_CONTENT);
+    app.post(
+        "/v1/machines/heartbeat",
+        None,
+        json!({ "status": "ONLINE" }),
+    )
+    .with_machine("not.a-credential")
+    .await
+    .expect_status(StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn published_resources_must_be_coherent() {
+    let app = App::start().await;
+    let (machine, _) = app.machine("workstation").await;
+    let path = format!("/v1/machines/{machine}/resources");
+
+    app.post(
+        &path,
+        Some(&app.owner_token),
+        json!({ "kind": "APP", "name": "Xcode" }),
+    )
+    .await
+    .expect_status(StatusCode::BAD_REQUEST);
+
+    app.post(
+        &path,
+        Some(&app.owner_token),
+        json!({ "kind": "DESKTOP", "name": "Desktop", "launch_path": "/bin/sh" }),
+    )
+    .await
+    .expect_status(StatusCode::BAD_REQUEST);
+
+    app.post(
+        &path,
+        Some(&app.owner_token),
+        json!({
+            "kind": "APP",
+            "name": "Xcode",
+            "launch_path": "/Applications/Xcode.app",
+            "launch_args": ["--new"],
+        }),
+    )
+    .await
+    .expect_status(StatusCode::CREATED);
+
+    // Two resources with the same name on one machine would be
+    // indistinguishable in the client.
+    app.post(
+        &path,
+        Some(&app.owner_token),
+        json!({ "kind": "APP", "name": "Xcode", "launch_path": "/other" }),
+    )
+    .await
+    .expect_status(StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn a_user_only_sees_resources_they_are_entitled_to() {
+    let app = App::start().await;
+    let (_, resource) = app.online_machine_with_desktop("mac-studio", None).await;
+    let (alice_id, alice) = app.user("alice@acme.test", "USER").await;
+    let (_, bob) = app.user("bob@acme.test", "USER").await;
+
+    assert_eq!(list_len(&app, &alice).await, 0);
+
+    app.post(
+        &format!("/v1/resources/{resource}/entitlements"),
+        Some(&app.owner_token),
+        json!({
+            "subject_kind": "USER",
+            "subject_id": alice_id,
+            "role": "CONTROLLER",
+            "allow_clipboard": true,
+        }),
+    )
+    .await
+    .expect_status(StatusCode::CREATED);
+
+    let mine = app
+        .get("/v1/resources", Some(&alice))
+        .await
+        .expect_status(StatusCode::OK)
+        .json();
+    assert_eq!(mine.as_array().unwrap().len(), 1);
+    assert_eq!(mine[0]["name"], "Desktop");
+    assert_eq!(mine[0]["role"], "CONTROLLER");
+    // The point of the whole design: no machine identity is exposed.
+    assert!(mine[0].get("machine_id").is_none());
+
+    // Bob was never granted anything.
+    assert_eq!(list_len(&app, &bob).await, 0);
+}
+
+#[tokio::test]
+async fn group_membership_grants_access_and_revocation_removes_it() {
+    let app = App::start().await;
+    let (_, resource) = app.online_machine_with_desktop("mac-mini", None).await;
+    let (user_id, user_token) = app.user("carol@acme.test", "USER").await;
+
+    let group: Uuid = app
+        .post(
+            "/v1/groups",
+            Some(&app.owner_token),
+            json!({ "name": "Designers" }),
+        )
+        .await
+        .expect_status(StatusCode::CREATED)
+        .json()["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let entitlement: Uuid = app
+        .post(
+            &format!("/v1/resources/{resource}/entitlements"),
+            Some(&app.owner_token),
+            json!({ "subject_kind": "GROUP", "subject_id": group, "role": "VIEWER" }),
+        )
+        .await
+        .expect_status(StatusCode::CREATED)
+        .json()["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // Entitled group, but not yet a member.
+    assert_eq!(list_len(&app, &user_token).await, 0);
+
+    app.post(
+        &format!("/v1/groups/{group}/members"),
+        Some(&app.owner_token),
+        json!({ "user_id": user_id }),
+    )
+    .await
+    .expect_status(StatusCode::NO_CONTENT);
+    assert_eq!(list_len(&app, &user_token).await, 1);
+
+    app.delete(
+        &format!("/v1/groups/{group}/members/{user_id}"),
+        Some(&app.owner_token),
+    )
+    .await
+    .expect_status(StatusCode::NO_CONTENT);
+    assert_eq!(list_len(&app, &user_token).await, 0);
+
+    // Re-join, then revoke the entitlement itself.
+    app.post(
+        &format!("/v1/groups/{group}/members"),
+        Some(&app.owner_token),
+        json!({ "user_id": user_id }),
+    )
+    .await
+    .expect_status(StatusCode::NO_CONTENT);
+    assert_eq!(list_len(&app, &user_token).await, 1);
+
+    app.delete(
+        &format!("/v1/entitlements/{entitlement}"),
+        Some(&app.owner_token),
+    )
+    .await
+    .expect_status(StatusCode::NO_CONTENT);
+    assert_eq!(list_len(&app, &user_token).await, 0);
+}
+
+#[tokio::test]
+async fn a_session_ticket_carries_the_clamped_policy() {
+    let app = App::start().await;
+    let (gateway, _) = app.infrastructure().await;
+    let (machine, resource) = app
+        .online_machine_with_desktop("mac-pro", Some(gateway))
+        .await;
+    let (viewer_id, viewer) = app.user("viewer@acme.test", "USER").await;
+
+    // Deliberately over-permissive entitlement on a viewer role.
+    app.post(
+        &format!("/v1/resources/{resource}/entitlements"),
+        Some(&app.owner_token),
+        json!({
+            "subject_kind": "USER",
+            "subject_id": viewer_id,
+            "role": "VIEWER",
+            "allow_clipboard": true,
+            "allow_file_transfer": true,
+        }),
+    )
+    .await
+    .expect_status(StatusCode::CREATED);
+
+    let ticket = app
+        .post(
+            "/v1/sessions",
+            Some(&viewer),
+            json!({ "resource_id": resource }),
+        )
+        .await
+        .expect_status(StatusCode::CREATED)
+        .json();
+
+    assert_eq!(ticket["relay_addr"], "relay.test:7444");
+    assert_eq!(ticket["gateway_addr"], "gw.test:7443");
+    assert!(ticket["expires_in"].as_i64().unwrap() > 0);
+
+    let claims = decode_claims(ticket["ticket"].as_str().unwrap());
+    assert_eq!(claims["role"], "VIEWER");
+    assert_eq!(claims["mid"], machine.to_string());
+    assert_eq!(claims["jti"], ticket["session_id"]);
+    // The role is the ceiling: the entitlement cannot hand a viewer input,
+    // a clipboard or file transfer no matter what the row says.
+    assert_eq!(claims["policy"]["input"], false);
+    assert_eq!(claims["policy"]["clipboard"], false);
+    assert_eq!(claims["policy"]["file_transfer"], false);
+    // The agent key must be the one the client will encrypt to.
+    assert_eq!(claims["agent_key"].as_str().unwrap().len(), 64);
+}
+
+#[tokio::test]
+async fn a_session_is_refused_without_an_entitlement_or_an_online_machine() {
+    let app = App::start().await;
+    app.infrastructure().await;
+    let (_, user_token) = app.user("dave@acme.test", "USER").await;
+
+    // Machine deliberately left offline.
+    let (machine, _) = app.machine("sleeping").await;
+    let resource: Uuid = app
+        .post(
+            &format!("/v1/machines/{machine}/resources"),
+            Some(&app.owner_token),
+            json!({ "kind": "DESKTOP", "name": "Desktop" }),
+        )
+        .await
+        .expect_status(StatusCode::CREATED)
+        .json()["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // Without an entitlement the resource must look absent, not forbidden:
+    // a 403 would confirm that it exists.
+    app.post(
+        "/v1/sessions",
+        Some(&user_token),
+        json!({ "resource_id": resource }),
+    )
+    .await
+    .expect_status(StatusCode::NOT_FOUND);
+
+    let (dave_id, _) = app.user("dave2@acme.test", "USER").await;
+    app.post(
+        &format!("/v1/resources/{resource}/entitlements"),
+        Some(&app.owner_token),
+        json!({ "subject_kind": "USER", "subject_id": dave_id, "role": "CONTROLLER" }),
+    )
+    .await
+    .expect_status(StatusCode::CREATED);
+
+    let dave = app.login("dave2@acme.test", PASSWORD).await;
+    app.post(
+        "/v1/sessions",
+        Some(&dave),
+        json!({ "resource_id": resource }),
+    )
+    .await
+    .expect_status(StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn a_gateway_reports_session_progress() {
+    let app = App::start().await;
+    let (gateway, credential) = app.infrastructure().await;
+    let (_, resource) = app
+        .online_machine_with_desktop("reported", Some(gateway))
+        .await;
+    let (user_id, user_token) = app.user("erin@acme.test", "USER").await;
+    app.post(
+        &format!("/v1/resources/{resource}/entitlements"),
+        Some(&app.owner_token),
+        json!({ "subject_kind": "USER", "subject_id": user_id, "role": "CONTROLLER" }),
+    )
+    .await
+    .expect_status(StatusCode::CREATED);
+
+    let session = app
+        .post(
+            "/v1/sessions",
+            Some(&user_token),
+            json!({ "resource_id": resource }),
+        )
+        .await
+        .expect_status(StatusCode::CREATED)
+        .json()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Only a node credential may report, and only with a valid state.
+    app.post(
+        &format!("/v1/sessions/{session}/report"),
+        Some(&user_token),
+        json!({ "state": "ACTIVE" }),
+    )
+    .await
+    .expect_status(StatusCode::UNAUTHORIZED);
+
+    app.post(
+        &format!("/v1/sessions/{session}/report"),
+        None,
+        json!({ "state": "ACTIVE", "bytes_up": 1024, "bytes_down": 4096 }),
+    )
+    .with_node(&credential)
+    .await
+    .expect_status(StatusCode::NO_CONTENT);
+
+    let listed = app
+        .get("/v1/sessions", Some(&user_token))
+        .await
+        .expect_status(StatusCode::OK)
+        .json();
+    assert_eq!(listed[0]["state"], "ACTIVE");
+    assert_eq!(listed[0]["bytes_down"], 4096);
+    assert!(listed[0]["started_at"].is_string());
+
+    app.post(
+        &format!("/v1/sessions/{session}/report"),
+        None,
+        json!({ "state": "CLOSED", "reason": "client_disconnect", "bytes_down": 1 }),
+    )
+    .with_node(&credential)
+    .await
+    .expect_status(StatusCode::NO_CONTENT);
+
+    let listed = app
+        .get("/v1/sessions", Some(&user_token))
+        .await
+        .expect_status(StatusCode::OK)
+        .json();
+    assert_eq!(listed[0]["state"], "CLOSED");
+    // Counters are cumulative; a late, smaller report must not rewind them.
+    assert_eq!(listed[0]["bytes_down"], 4096);
+}
+
+#[tokio::test]
+async fn tenants_cannot_reach_across_the_boundary() {
+    let app = App::start().await;
+    let other = App::start().await;
+
+    let (machine, resource) = app.online_machine_with_desktop("private", None).await;
+    let (victim_id, _) = app.user("victim@acme.test", "USER").await;
+
+    // Another tenant's owner knows the ids but must be told nothing exists.
+    let leaked = other
+        .get(
+            &format!("/v1/machines/{machine}/resources"),
+            Some(&other.owner_token),
+        )
+        .await
+        .expect_status(StatusCode::OK)
+        .json();
+    assert!(
+        leaked.as_array().unwrap().is_empty(),
+        "leaked another tenant's resources"
+    );
+
+    other
+        .delete(&format!("/v1/machines/{machine}"), Some(&other.owner_token))
+        .await
+        .expect_status(StatusCode::NOT_FOUND);
+    other
+        .delete(
+            &format!("/v1/resources/{resource}"),
+            Some(&other.owner_token),
+        )
+        .await
+        .expect_status(StatusCode::NOT_FOUND);
+    other
+        .patch(
+            &format!("/v1/users/{victim_id}"),
+            Some(&other.owner_token),
+            json!({ "disabled": true }),
+        )
+        .await
+        .expect_status(StatusCode::NOT_FOUND);
+
+    // And it cannot grant itself access to a resource it does not own.
+    other
+        .post(
+            &format!("/v1/resources/{resource}/entitlements"),
+            Some(&other.owner_token),
+            json!({
+                "subject_kind": "USER",
+                "subject_id": other.owner_id,
+                "role": "ADMIN",
+            }),
+        )
+        .await
+        .expect_status(StatusCode::NOT_FOUND);
+
+    // The victim's own view is unchanged.
+    assert_eq!(
+        app.get("/v1/machines", Some(&app.owner_token))
+            .await
+            .json()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn an_expired_entitlement_stops_granting_access() {
+    let app = App::start().await;
+    let (_, resource) = app.online_machine_with_desktop("clock", None).await;
+    let (user_id, user_token) = app.user("frank@acme.test", "USER").await;
+
+    app.post(
+        &format!("/v1/resources/{resource}/entitlements"),
+        Some(&app.owner_token),
+        json!({
+            "subject_kind": "USER",
+            "subject_id": user_id,
+            "role": "CONTROLLER",
+            "expires_at": "2000-01-01T00:00:00Z",
+        }),
+    )
+    .await
+    .expect_status(StatusCode::CREATED);
+
+    assert_eq!(list_len(&app, &user_token).await, 0);
+}
+
+#[tokio::test]
+async fn a_disabled_resource_disappears_from_the_list() {
+    let app = App::start().await;
+    let (_, resource) = app.online_machine_with_desktop("toggle", None).await;
+    let (user_id, user_token) = app.user("grace@acme.test", "USER").await;
+    app.post(
+        &format!("/v1/resources/{resource}/entitlements"),
+        Some(&app.owner_token),
+        json!({ "subject_kind": "USER", "subject_id": user_id, "role": "CONTROLLER" }),
+    )
+    .await
+    .expect_status(StatusCode::CREATED);
+    assert_eq!(list_len(&app, &user_token).await, 1);
+
+    app.patch(
+        &format!("/v1/resources/{resource}"),
+        Some(&app.owner_token),
+        json!({ "enabled": false }),
+    )
+    .await
+    .expect_status(StatusCode::NO_CONTENT);
+    assert_eq!(list_len(&app, &user_token).await, 0);
+}
+
+async fn list_len(app: &App, token: &str) -> usize {
+    app.get("/v1/resources", Some(token))
+        .await
+        .expect_status(StatusCode::OK)
+        .json()
+        .as_array()
+        .unwrap()
+        .len()
+}
+
+/// Decode a JWT payload without verifying: the signature is checked by
+/// `TicketSigner`'s own tests, and here we only care about the contents.
+fn decode_claims(token: &str) -> Value {
+    use base64::Engine as _;
+    let payload = token.split('.').nth(1).expect("a JWT has three parts");
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .expect("the payload should be base64url");
+    serde_json::from_slice(&bytes).expect("the payload should be JSON")
+}
