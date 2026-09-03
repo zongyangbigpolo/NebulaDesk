@@ -1,0 +1,21 @@
+[package]
+name = "ndp-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "End-to-end Noise IK handshake and AEAD record sealing for NebulaDesk sessions."
+
+[dependencies]
+ndp-proto = { workspace = true }
+snow = { workspace = true }
+chacha20poly1305 = { workspace = true }
+rand = { workspace = true }
+rand_core = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+zeroize = { workspace = true }
+x25519-dalek = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }

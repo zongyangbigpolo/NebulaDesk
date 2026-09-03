@@ -10,3 +10,11 @@ outputs/
 # AI contribution tracking (ephemeral)
 .ai-contributions.json
 dist/
+
+# Rust
+target/
+
+# Local secrets / dev certs
+*.pem
+*.key
+.env
