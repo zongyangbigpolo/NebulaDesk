@@ -1290,6 +1290,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ndp-signal"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "hmac",
+ "nebula-common",
+ "quinn",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "ndp-transport"
 version = "0.1.0"
 dependencies = [
@@ -1349,6 +1367,28 @@ dependencies = [
  "tokio",
  "tower",
  "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "nebula-relay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "hex",
+ "ndp-crypto",
+ "ndp-proto",
+ "ndp-signal",
+ "ndp-transport",
+ "nebula-common",
+ "quinn",
+ "serde",
+ "thiserror",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",

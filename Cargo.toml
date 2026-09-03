@@ -5,7 +5,9 @@ members = [
     "crates/ndp-proto",
     "crates/ndp-crypto",
     "crates/ndp-transport",
+    "crates/ndp-signal",
     "crates/nebula-manager",
+    "crates/nebula-relay",
 ]
 
 [workspace.package]
@@ -21,6 +23,8 @@ nebula-common = { path = "crates/nebula-common" }
 ndp-proto = { path = "crates/ndp-proto" }
 ndp-crypto = { path = "crates/ndp-crypto" }
 ndp-transport = { path = "crates/ndp-transport" }
+ndp-signal = { path = "crates/ndp-signal" }
+nebula-relay = { path = "crates/nebula-relay" }
 nebula-media-core = { path = "crates/nebula-media-core" }
 nebula-media-macos = { path = "crates/nebula-media-macos" }
 nebula-render = { path = "crates/nebula-render" }

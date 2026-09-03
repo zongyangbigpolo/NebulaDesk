@@ -77,6 +77,58 @@ impl Clone for ServerCredentials {
     }
 }
 
+impl ServerCredentials {
+    /// Load a certificate chain and private key from PEM files.
+    ///
+    /// Nodes are pinned rather than chained to a CA, so the certificate need
+    /// not be publicly trusted — but it does need to be *stable*. Generating
+    /// a fresh self-signed certificate on every restart would change the
+    /// fingerprint and lock out every peer holding the previous pin.
+    pub fn from_pem_files(cert: &std::path::Path, key: &std::path::Path) -> Result<Self> {
+        let read = |p: &std::path::Path| -> Result<Vec<u8>> {
+            std::fs::read(p)
+                .map_err(|e| TransportError::Config(format!("cannot read {}: {e}", p.display())))
+        };
+        let chain: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut read(cert)?.as_slice())
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|e| TransportError::Config(format!("bad certificate PEM: {e}")))?;
+        let leaf = chain
+            .first()
+            .ok_or_else(|| {
+                TransportError::Config("certificate file contained no certificate".into())
+            })?
+            .clone();
+        let key = rustls_pemfile::private_key(&mut read(key)?.as_slice())
+            .map_err(|e| TransportError::Config(format!("bad private key PEM: {e}")))?
+            .ok_or_else(|| TransportError::Config("key file contained no private key".into()))?;
+        Ok(Self {
+            fingerprint: CertificateFingerprint::of(&leaf),
+            chain,
+            key,
+        })
+    }
+
+    /// Load from PEM files if both are given, otherwise mint a development
+    /// certificate.
+    ///
+    /// The generated fingerprint is logged by callers so an operator running
+    /// without files can still pin it; nothing here silently trusts anything.
+    pub fn load_or_generate(
+        cert: Option<&std::path::Path>,
+        key: Option<&std::path::Path>,
+        subject_alt_names: &[String],
+    ) -> Result<Self> {
+        match (cert, key) {
+            (Some(c), Some(k)) => Self::from_pem_files(c, k),
+            (None, None) => dev_credentials(subject_alt_names),
+            _ => Err(TransportError::Config(
+                "a certificate and a private key must be given together".into(),
+            )),
+        }
+    }
+}
+
 /// Mint a self-signed certificate for development and for relay/gateway nodes
 /// that are pinned rather than chained to a CA.
 pub fn dev_credentials(subject_alt_names: &[String]) -> Result<ServerCredentials> {
