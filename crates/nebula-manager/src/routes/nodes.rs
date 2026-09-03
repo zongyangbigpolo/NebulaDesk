@@ -322,3 +322,58 @@ mod tests {
         assert!(validate_pin(&"zz".repeat(32)).is_err());
     }
 }
+
+/// How long a node may go quiet before placement stops choosing it.
+///
+/// Nodes are dialled directly by machines and clients, so a stale row is not
+/// a cosmetic problem: it hands out an address that will never answer, and
+/// the caller has no way to tell that from a network fault. The window is
+/// several heartbeat intervals so that a missed beat is not an outage.
+pub const NODE_LIVENESS: &str = "90 seconds";
+
+/// A SQL predicate selecting nodes that have reported recently.
+///
+/// Placement and discovery must agree on this, or a machine will be told to
+/// attach to a gateway that sessions are never placed on.
+#[must_use]
+pub fn alive(alias: &str) -> String {
+    format!("{alias}.last_seen_at > now() - interval '{NODE_LIVENESS}'")
+}
+
+/// What a node reports about itself.
+#[derive(Debug, Deserialize)]
+pub struct NodeHeartbeat {
+    /// Current load, in the node's own units. Omitted means unchanged.
+    pub load: Option<i32>,
+}
+
+/// `POST /v1/nodes/self/heartbeat`
+///
+/// A node stays placeable only while it says so. Load travels on the same
+/// call because a load figure that outlives its reporter is worse than none:
+/// it would keep attracting sessions to a process that has stopped.
+pub async fn heartbeat(
+    State(state): State<AppState>,
+    node: AuthNode,
+    body: Result<Json<NodeHeartbeat>, JsonRejection>,
+) -> ApiResult<StatusCode> {
+    let load = match body {
+        Ok(Json(req)) => req.load,
+        Err(_) => None,
+    };
+    if load.is_some_and(|load| load < 0) {
+        return Err(ApiError::BadRequest("load cannot be negative".into()));
+    }
+
+    // The table name comes from the credential's own kind, never from input.
+    let sql = format!(
+        "UPDATE {} SET last_seen_at = now(), load = COALESCE($2, load) WHERE id = $1",
+        node.kind.table()
+    );
+    sqlx::query(&sql)
+        .bind(node.id)
+        .bind(load)
+        .execute(&state.db)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}

@@ -36,6 +36,15 @@ struct Cli {
     /// Maximum concurrent connections; two per session.
     #[arg(long, env = "NEBULA_RELAY_MAX_CONNECTIONS", default_value_t = 2000)]
     max_connections: usize,
+
+    /// Manager base URL. Without it this relay never reports liveness, and
+    /// the manager will stop placing sessions on it.
+    #[arg(long, env = "NEBULA_MANAGER_URL")]
+    manager_url: Option<String>,
+
+    /// This relay's node credential, issued when it was registered.
+    #[arg(long, env = "NEBULA_NODE_CREDENTIAL")]
+    node_credential: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -70,6 +79,9 @@ async fn main() -> anyhow::Result<()> {
         key: cli.key,
         subject_alt_names: cli.subject_alt_names,
         max_connections: cli.max_connections,
+        manager_url: cli.manager_url,
+        node_credential: cli.node_credential,
+        ..Config::default()
     })?;
 
     tokio::select! {

@@ -22,6 +22,16 @@ use crate::state::AppState;
 /// How long an enrolment token stays usable if the caller does not say.
 const DEFAULT_ENROLLMENT_TTL: Duration = Duration::hours(24);
 
+/// An enrolment token that has just been consumed.
+#[derive(Debug, sqlx::FromRow)]
+struct ClaimedToken {
+    id: Uuid,
+    tenant_id: Uuid,
+    machine_name: Option<String>,
+    owner_user_id: Option<Uuid>,
+    region: String,
+}
+
 /// Request for a new enrolment token.
 #[derive(Debug, Deserialize)]
 pub struct CreateEnrollmentToken {
@@ -37,6 +47,12 @@ pub struct CreateEnrollmentToken {
     /// Validity in seconds.
     #[serde(default)]
     pub ttl_secs: Option<i64>,
+    /// Which region the enrolled machine belongs to.
+    ///
+    /// Set by the operator rather than the agent: a machine that could pick
+    /// its own region could pull sessions onto a gateway of its choosing.
+    #[serde(default)]
+    pub region: Option<String>,
 }
 
 /// A newly minted enrolment token. The secret is shown exactly once.
@@ -74,8 +90,9 @@ pub async fn create_enrollment_token(
 
     sqlx::query(
         "INSERT INTO enrollment_tokens
-           (id, tenant_id, token_hash, machine_name, owner_user_id, expires_at, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+           (id, tenant_id, token_hash, machine_name, owner_user_id, expires_at,
+            created_by, region)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, 'default'))",
     )
     .bind(id)
     .bind(caller.tenant.as_uuid())
@@ -84,6 +101,7 @@ pub async fn create_enrollment_token(
     .bind(req.owner_user_id)
     .bind(expires_at)
     .bind(caller.id.as_uuid())
+    .bind(req.region.as_deref())
     .execute(&state.db)
     .await?;
 
@@ -180,17 +198,24 @@ pub async fn enroll(
 
     // Claim the token and read its constraints in one statement: two agents
     // presenting the same token cannot both win.
-    let claimed: Option<(Uuid, Uuid, Option<String>, Option<Uuid>)> = sqlx::query_as(
+    let claimed: Option<ClaimedToken> = sqlx::query_as(
         "UPDATE enrollment_tokens
          SET used_at = now()
          WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now()
-         RETURNING id, tenant_id, machine_name, owner_user_id",
+         RETURNING id, tenant_id, machine_name, owner_user_id, region",
     )
     .bind(tokens::hash_token(&req.token))
     .fetch_optional(&mut *tx)
     .await?;
 
-    let Some((token_id, tenant, pinned_name, owner)) = claimed else {
+    let Some(ClaimedToken {
+        id: token_id,
+        tenant_id: tenant,
+        machine_name: pinned_name,
+        owner_user_id: owner,
+        region,
+    }) = claimed
+    else {
         return Err(ApiError::Unauthorized);
     };
 
@@ -211,8 +236,8 @@ pub async fn enroll(
     sqlx::query(
         "INSERT INTO machines
            (id, tenant_id, name, os, os_version, arch, agent_version,
-            noise_public_key, credential_hash, owner_user_id, capabilities)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            noise_public_key, credential_hash, owner_user_id, capabilities, region)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(machine.as_uuid())
     .bind(tenant)
@@ -229,6 +254,7 @@ pub async fn enroll(
     } else {
         req.capabilities.clone()
     })
+    .bind(&region)
     .execute(&mut *tx)
     .await
     .map_err(|e| match &e {
@@ -392,4 +418,44 @@ pub async fn heartbeat(
     .execute(&state.db)
     .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The gateway an agent should attach its control tunnel to.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct GatewayAssignment {
+    /// The gateway's node id.
+    pub id: Uuid,
+    /// QUIC address to dial.
+    pub quic_addr: String,
+    /// Certificate pin, hex SHA-256 of the DER certificate.
+    pub cert_pin: String,
+}
+
+/// `GET /v1/machines/self/gateway`
+///
+/// An agent cannot be configured with a gateway address: gateways are
+/// infrastructure that gets replaced, and a machine on someone's desk is the
+/// last place to keep that knowledge. It asks instead, authenticated as
+/// itself, and reconnects through the same call when its gateway goes away.
+pub async fn my_gateway(
+    State(state): State<AppState>,
+    machine: AuthMachine,
+) -> ApiResult<Json<GatewayAssignment>> {
+    // Stickiness first: sessions already placed on this machine's gateway
+    // would have to be torn down if the agent wandered to another one.
+    let row = sqlx::query_as::<_, GatewayAssignment>(&format!(
+        "SELECT g.id, g.quic_addr, g.cert_pin
+         FROM machines me
+         JOIN gateways g ON g.load < g.capacity AND {alive}
+         LEFT JOIN machines m ON m.gateway_id = g.id AND m.id = me.id
+         WHERE me.id = $1
+         ORDER BY (g.region <> me.region), (m.id IS NULL), g.load ASC
+         LIMIT 1",
+        alive = super::nodes::alive("g"),
+    ))
+    .bind(machine.id.as_uuid())
+    .fetch_optional(&state.db)
+    .await?;
+    row.map(Json)
+        .ok_or_else(|| ApiError::Conflict("no gateway has capacity right now".into()))
 }

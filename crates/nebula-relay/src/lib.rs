@@ -22,6 +22,8 @@ use std::sync::Arc;
 
 use ndp_signal::{PairKey, RelayHello, RelayHelloAck, TokenError};
 use ndp_transport::{server_endpoint, ServerCredentials, TransportConfig, ALPN_RELAY};
+use std::time::Duration;
+
 use quinn::{Connection, Endpoint, VarInt};
 use tracing::{debug, info, warn};
 
@@ -42,6 +44,12 @@ pub struct Config {
     pub subject_alt_names: Vec<String>,
     /// Refuse new sessions beyond this many concurrent connections.
     pub max_connections: usize,
+    /// Base URL of the manager, when this relay should report liveness.
+    pub manager_url: Option<String>,
+    /// This relay's node credential, `<uuid>.<secret>`.
+    pub node_credential: Option<String>,
+    /// How often liveness is reported.
+    pub heartbeat: Duration,
 }
 
 impl Default for Config {
@@ -54,8 +62,20 @@ impl Default for Config {
             subject_alt_names: Vec::new(),
             // Two connections per session, so this is a thousand sessions.
             max_connections: 2000,
+            manager_url: None,
+            node_credential: None,
+            heartbeat: Duration::from_secs(20),
         }
     }
+}
+
+/// Where and how often this relay reports that it is alive.
+#[derive(Clone)]
+struct Liveness {
+    http: reqwest::Client,
+    url: String,
+    credential: String,
+    every: Duration,
 }
 
 /// A running relay.
@@ -64,6 +84,7 @@ pub struct Relay {
     pair_key: PairKey,
     rendezvous: Arc<Rendezvous>,
     max_connections: usize,
+    liveness: Option<Liveness>,
     /// The certificate fingerprint peers must pin.
     pub fingerprint: String,
 }
@@ -103,8 +124,46 @@ impl Relay {
             pair_key,
             rendezvous: Arc::new(Rendezvous::default()),
             max_connections: config.max_connections,
+            liveness: match (&config.manager_url, &config.node_credential) {
+                (Some(url), Some(credential)) => Some(Liveness {
+                    http: reqwest::Client::builder()
+                        .timeout(Duration::from_secs(10))
+                        .build()?,
+                    url: format!("{}/v1/nodes/self/heartbeat", url.trim_end_matches('/')),
+                    credential: credential.clone(),
+                    every: config.heartbeat,
+                }),
+                _ => None,
+            },
             fingerprint,
         })
+    }
+
+    /// Report liveness to a manager, using a credential obtained after bind.
+    ///
+    /// Registration is inherently a chicken-and-egg: the manager must be told
+    /// the address and certificate pin this relay ended up with, and only
+    /// then can it issue the credential used to report liveness. This lets a
+    /// relay be brought up in that order rather than requiring the credential
+    /// to be provisioned out of band.
+    pub fn with_liveness(
+        mut self,
+        manager_url: &str,
+        credential: &str,
+        every: Duration,
+    ) -> anyhow::Result<Self> {
+        self.liveness = Some(Liveness {
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()?,
+            url: format!(
+                "{}/v1/nodes/self/heartbeat",
+                manager_url.trim_end_matches('/')
+            ),
+            credential: credential.to_string(),
+            every,
+        });
+        Ok(self)
     }
 
     /// The address actually bound, which matters when the port was zero.
@@ -119,6 +178,33 @@ impl Relay {
             fingerprint = %self.fingerprint,
             "relay listening"
         );
+
+        // A relay that has stopped reporting stops being chosen. Sessions
+        // already spliced through it keep running; only new placement moves
+        // away, which is what makes a rolling replacement invisible.
+        let beats = self.liveness.clone().map(|liveness| {
+            let endpoint = self.endpoint.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(liveness.every);
+                loop {
+                    ticker.tick().await;
+                    let load = endpoint.open_connections() as u32;
+                    let sent = liveness
+                        .http
+                        .post(&liveness.url)
+                        .header("Authorization", format!("Node {}", liveness.credential))
+                        .json(&serde_json::json!({ "load": load }))
+                        .send()
+                        .await;
+                    match sent {
+                        Ok(response) if response.status().is_success() => {}
+                        Ok(response) => warn!(status = %response.status(), "liveness refused"),
+                        Err(error) => warn!(%error, "could not report relay liveness"),
+                    }
+                }
+            })
+        });
+
         while let Some(incoming) = self.endpoint.accept().await {
             // Counted before the handshake completes, because the handshake
             // itself is what an attacker would try to flood.
@@ -135,6 +221,10 @@ impl Relay {
                     Err(e) => debug!(error = %e, "handshake failed"),
                 }
             });
+        }
+
+        if let Some(beats) = beats {
+            beats.abort();
         }
     }
 

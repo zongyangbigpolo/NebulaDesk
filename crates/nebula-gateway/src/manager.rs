@@ -220,6 +220,30 @@ impl ManagerClient {
         Err(status_error(response).await)
     }
 
+    /// Report that this gateway is alive, and how loaded it is.
+    ///
+    /// Placement only chooses nodes that have reported recently, so a gateway
+    /// that stops beating stops being handed new machines and sessions. That
+    /// is the intended failure mode: a gateway which cannot reach the manager
+    /// cannot mint tokens either, so it is no longer a working edge.
+    pub async fn heartbeat(&self, load: u32) -> Result<()> {
+        let credential = self
+            .credential
+            .as_deref()
+            .ok_or(ManagerError::NoCredential)?;
+        let response = self
+            .http
+            .post(format!("{}/v1/nodes/self/heartbeat", self.base))
+            .header("Authorization", format!("Node {credential}"))
+            .json(&serde_json::json!({ "load": load }))
+            .send()
+            .await?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        Err(status_error(response).await)
+    }
+
     /// Fetch the manager's published key set.
     pub async fn jwks(&self) -> Result<nebula_common::Jwks> {
         let response = self

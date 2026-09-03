@@ -181,14 +181,16 @@ struct NodeRow {
 async fn pick_gateway(state: &AppState, machine: Uuid) -> ApiResult<NodeRow> {
     // Prefer the gateway the machine's control tunnel is already attached to;
     // fall back to the least loaded one that has headroom.
-    let row = sqlx::query_as::<_, NodeRow>(
+    let row = sqlx::query_as::<_, NodeRow>(&format!(
         "SELECT g.id, g.quic_addr, g.cert_pin, g.region
-         FROM gateways g
-         LEFT JOIN machines m ON m.gateway_id = g.id AND m.id = $1
-         WHERE g.load < g.capacity
-         ORDER BY (m.id IS NULL), g.load ASC
+         FROM machines me
+         JOIN gateways g ON g.load < g.capacity AND {alive}
+         LEFT JOIN machines m ON m.gateway_id = g.id AND m.id = me.id
+         WHERE me.id = $1
+         ORDER BY (m.id IS NULL), (g.region <> me.region), g.load ASC
          LIMIT 1",
-    )
+        alive = super::nodes::alive("g"),
+    ))
     .bind(machine)
     .fetch_optional(&state.db)
     .await?;
@@ -198,13 +200,14 @@ async fn pick_gateway(state: &AppState, machine: Uuid) -> ApiResult<NodeRow> {
 async fn pick_relay(state: &AppState, region: &str) -> ApiResult<NodeRow> {
     // Same region first: a relay in another continent turns a 20 ms session
     // into a 200 ms one, which no amount of encoder tuning recovers.
-    let row = sqlx::query_as::<_, NodeRow>(
-        "SELECT id, quic_addr, cert_pin, region
-         FROM relays
-         WHERE load < capacity_mbps
-         ORDER BY (region <> $1), load ASC
+    let row = sqlx::query_as::<_, NodeRow>(&format!(
+        "SELECT r.id, r.quic_addr, r.cert_pin, r.region
+         FROM relays r
+         WHERE r.load < r.capacity_mbps AND {alive}
+         ORDER BY (r.region <> $1), r.load ASC
          LIMIT 1",
-    )
+        alive = super::nodes::alive("r"),
+    ))
     .bind(region)
     .fetch_optional(&state.db)
     .await?;

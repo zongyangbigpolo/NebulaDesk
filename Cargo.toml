@@ -9,6 +9,7 @@ members = [
     "crates/nebula-manager",
     "crates/nebula-relay",
     "crates/nebula-gateway",
+    "crates/nebula-agent",
 ]
 
 [workspace.package]
@@ -28,6 +29,7 @@ ndp-signal = { path = "crates/ndp-signal" }
 nebula-relay = { path = "crates/nebula-relay" }
 nebula-gateway = { path = "crates/nebula-gateway" }
 nebula-manager = { path = "crates/nebula-manager" }
+nebula-agent = { path = "crates/nebula-agent" }
 nebula-media-core = { path = "crates/nebula-media-core" }
 nebula-media-macos = { path = "crates/nebula-media-macos" }
 nebula-render = { path = "crates/nebula-render" }

@@ -1070,3 +1070,161 @@ fn decode_claims(token: &str) -> Value {
         .expect("the payload should be base64url");
     serde_json::from_slice(&bytes).expect("the payload should be JSON")
 }
+
+/// Register a gateway in a named region and return `(id, credential)`.
+async fn gateway_in(app: &App, region: &str) -> (Uuid, String) {
+    let suffix = Uuid::now_v7().simple().to_string();
+    let body = app
+        .post(
+            "/v1/gateways",
+            Some(BOOTSTRAP),
+            json!({
+                "name": format!("gw-{suffix}"),
+                "public_url": "https://gw.test",
+                "quic_addr": format!("{region}.gw.test:7443"),
+                "cert_pin": "ab".repeat(32),
+                "region": region,
+            }),
+        )
+        .await
+        .expect_status(StatusCode::CREATED)
+        .json();
+    (
+        body["id"].as_str().unwrap().parse().unwrap(),
+        body["credential"].as_str().unwrap().to_string(),
+    )
+}
+
+/// Enrol a machine into a region and return its credential.
+async fn machine_in(app: &App, region: &str) -> String {
+    let name = format!("m{}", Uuid::now_v7().simple());
+    let token = app
+        .post(
+            "/v1/machines/enrollment-tokens",
+            Some(&app.owner_token),
+            json!({ "machine_name": name, "region": region }),
+        )
+        .await
+        .expect_status(StatusCode::CREATED)
+        .json()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    app.post(
+        "/v1/machines/enroll",
+        None,
+        json!({
+            "token": token,
+            "name": name,
+            "os": "MACOS",
+            "os_version": "26.0",
+            "arch": "arm64",
+            "agent_version": "0.1.0",
+            "noise_public_key": hex::encode(rand_key()),
+        }),
+    )
+    .await
+    .expect_status(StatusCode::CREATED)
+    .json()["credential"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Age a node's last report, standing in for a process that has stopped.
+async fn silence_gateway(id: Uuid, seconds: i64) {
+    let pool = sqlx::PgPool::connect(&database_url()).await.unwrap();
+    sqlx::query(
+        "UPDATE gateways SET last_seen_at = now() - make_interval(secs => $2) WHERE id = $1",
+    )
+    .bind(id)
+    .bind(seconds as f64)
+    .execute(&pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_machine_is_sent_to_a_gateway_in_its_own_region() {
+    let app = App::start().await;
+    let region = format!("r{}", Uuid::now_v7().simple());
+    let (elsewhere, _) = gateway_in(&app, &format!("far-{region}")).await;
+    let (home, _) = gateway_in(&app, &region).await;
+
+    let credential = machine_in(&app, &region).await;
+    let assigned = app
+        .get("/v1/machines/self/gateway", None)
+        .with_machine(&credential)
+        .await
+        .expect_status(StatusCode::OK)
+        .json();
+
+    let id: Uuid = assigned["id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(id, home, "a machine must not be sent across the world");
+    assert_ne!(id, elsewhere);
+}
+
+#[tokio::test]
+async fn a_gateway_that_has_stopped_reporting_is_not_handed_out() {
+    let app = App::start().await;
+    let region = format!("r{}", Uuid::now_v7().simple());
+    let (dead, _) = gateway_in(&app, &region).await;
+    silence_gateway(dead, 600).await;
+
+    let credential = machine_in(&app, &region).await;
+
+    // A dead gateway must never be offered, not even as the only one in the
+    // machine's own region: its address would simply never answer, and the
+    // agent has no way to tell that from a network fault. Being sent to a
+    // live gateway elsewhere is the correct outcome; being sent to this one
+    // is not.
+    let response = app
+        .get("/v1/machines/self/gateway", None)
+        .with_machine(&credential)
+        .await;
+    if response.status == StatusCode::OK {
+        let assigned: Uuid = response.json()["id"].as_str().unwrap().parse().unwrap();
+        assert_ne!(assigned, dead, "a silent gateway must not be handed out");
+    } else {
+        assert_eq!(response.status, StatusCode::CONFLICT);
+    }
+
+    // A heartbeat brings it back without re-registration.
+    let (alive, node_credential) = gateway_in(&app, &region).await;
+    silence_gateway(alive, 600).await;
+    app.post("/v1/nodes/self/heartbeat", None, json!({ "load": 3 }))
+        .with_node(&node_credential)
+        .await
+        .expect_status(StatusCode::NO_CONTENT);
+
+    let assigned = app
+        .get("/v1/machines/self/gateway", None)
+        .with_machine(&credential)
+        .await
+        .expect_status(StatusCode::OK)
+        .json();
+    assert_eq!(
+        assigned["id"].as_str().unwrap().parse::<Uuid>().unwrap(),
+        alive
+    );
+}
+
+#[tokio::test]
+async fn only_a_node_may_report_node_liveness() {
+    let app = App::start().await;
+    let (_, machine_credential) = app.machine("beat-impostor").await;
+
+    app.post(
+        "/v1/nodes/self/heartbeat",
+        Some(&app.owner_token),
+        json!({}),
+    )
+    .await
+    .expect_status(StatusCode::UNAUTHORIZED);
+
+    app.post("/v1/nodes/self/heartbeat", None, json!({}))
+        .with_machine(&machine_credential)
+        .await
+        .expect_status(StatusCode::UNAUTHORIZED);
+}

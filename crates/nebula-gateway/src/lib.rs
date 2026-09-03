@@ -169,6 +169,21 @@ impl Gateway {
             "gateway listening"
         );
 
+        // Liveness is reported from here rather than from a supervisor: what
+        // matters to placement is that this process is still accepting, and
+        // nothing else can honestly attest to that.
+        let beating = Arc::clone(self);
+        let beats = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(beating.config.heartbeat);
+            loop {
+                ticker.tick().await;
+                let load = beating.tunnels.len().await as u32;
+                if let Err(error) = beating.manager.heartbeat(load).await {
+                    tracing::warn!(%error, "could not report gateway liveness");
+                }
+            }
+        });
+
         while let Some(incoming) = self.endpoint.accept().await {
             // Counted before the handshake completes, because handshakes are
             // what an attacker floods; counting after would let an unbounded
@@ -189,6 +204,8 @@ impl Gateway {
                 }
             });
         }
+
+        beats.abort();
     }
 
     /// Stop accepting and close every live connection.

@@ -1,26 +1,28 @@
 [package]
-name = "nebula-relay"
+name = "nebula-agent"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "NebulaDesk media relay: pairs two authorised QUIC connections and forwards bytes between them."
+description = "NebulaDesk server machine agent: enrols a machine, holds a control tunnel, and serves sessions."
 
 [dependencies]
-reqwest = { workspace = true }
-serde_json = { workspace = true }
 nebula-common = { workspace = true }
+ndp-crypto = { workspace = true }
+ndp-proto = { workspace = true }
 ndp-signal = { workspace = true }
 ndp-transport = { workspace = true }
 
 quinn = { workspace = true }
 tokio = { workspace = true }
-bytes = { workspace = true }
+reqwest = { workspace = true }
 
 serde = { workspace = true }
+serde_json = { workspace = true }
 uuid = { workspace = true }
 hex = { workspace = true }
+rand = { workspace = true }
 
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -29,9 +31,12 @@ tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 
 [[bin]]
-name = "nebula-relay"
+name = "nebula-agent"
 path = "src/main.rs"
 
 [dev-dependencies]
-ndp-crypto = { workspace = true }
-ndp-proto = { workspace = true }
+tempfile = "3"
+nebula-manager = { workspace = true }
+nebula-gateway = { workspace = true }
+nebula-relay = { workspace = true }
+axum = { workspace = true }
