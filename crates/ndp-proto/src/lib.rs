@@ -52,7 +52,10 @@ pub use control::{ByeReason, ControlMessage, CursorShape, QosReport};
 pub use header::{MsgFlags, MsgHeader, MsgKind, HEADER_LEN, PROTOCOL_VERSION};
 pub use input::{InputEvent, InputKind, KeyCode, Modifiers, MouseButton};
 pub use media::{AudioFrameInfo, VideoFrameInfo};
-pub use transfer::{ClipboardFormat, ClipboardOffer, FileChunkHeader, FileOffer};
+pub use transfer::{
+    ClipboardDataHeader, ClipboardFormat, ClipboardOffer, ClipboardRequest, FileChunkHeader,
+    FileOffer,
+};
 
 /// Errors produced while decoding an NDP message.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

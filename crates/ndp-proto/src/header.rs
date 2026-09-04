@@ -58,6 +58,8 @@ pub enum MsgKind {
     ClipboardOffer = 0x60,
     /// Requested clipboard content.
     ClipboardData = 0x61,
+    /// A request for one format from an offer.
+    ClipboardRequest = 0x62,
 
     // ---- file transfer ----
     /// Metadata announcing a file transfer.
@@ -89,6 +91,7 @@ impl MsgKind {
             0x41 => Self::InputBatch,
             0x60 => Self::ClipboardOffer,
             0x61 => Self::ClipboardData,
+            0x62 => Self::ClipboardRequest,
             0x70 => Self::FileOffer,
             0x71 => Self::FileChunk,
             0x72 => Self::FileAck,

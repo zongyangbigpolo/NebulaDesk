@@ -8,6 +8,7 @@ pub mod audio;
 pub mod capture;
 pub mod input;
 
+use crate::clipboard::{ClipboardAccess, SystemClipboard};
 use crate::media::{AudioSource, InputInjector, Platform, VideoSource};
 
 /// Media backend for macOS.
@@ -25,5 +26,9 @@ impl Platform for MacOs {
 
     fn audio(&self) -> anyhow::Result<Box<dyn AudioSource>> {
         Ok(Box::new(audio::MacAudio::new()))
+    }
+
+    fn clipboard(&self) -> anyhow::Result<Box<dyn ClipboardAccess>> {
+        Ok(Box::new(SystemClipboard::open()?))
     }
 }

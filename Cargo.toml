@@ -70,6 +70,8 @@ zeroize = "1.8"
 # Vendored: audiopus and the pkg-config bindings need a libopus on the
 # machine, which is a build step nobody should have to do on three platforms.
 opus = "0.4"
+arboard = { version = "3.6", default-features = false, features = ["image-data"] }
+png = "0.17"
 
 # --- serialization ---
 serde = { version = "1", features = ["derive"] }

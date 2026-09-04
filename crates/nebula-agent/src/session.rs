@@ -17,6 +17,7 @@ use ndp_transport::{
 };
 use tokio::sync::{mpsc, oneshot};
 
+use crate::clipboard;
 use crate::media::{AudioConfig, EncodedAudio, EncodedFrame, Platform, VideoConfig};
 
 /// How many encoded frames may wait for the network.
@@ -198,6 +199,21 @@ async fn pump(
         None
     };
 
+    // The clipboard runs on its own thread and only when the entitlement
+    // allows it, so a session without the permission never opens the
+    // machine's clipboard at all.
+    let mut clipboard = if request.policy.clipboard {
+        match platform.clipboard() {
+            Ok(board) => Some(clipboard::spawn(board, true)),
+            Err(error) => {
+                tracing::warn!(%error, "no clipboard on this machine; the session will not share one");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut seq: u32 = 0;
     let mut audio_seq: u32 = 0;
     loop {
@@ -254,6 +270,23 @@ async fn pump(
                 }
             }
 
+            action = async {
+                match clipboard.as_mut() {
+                    Some(worker) => worker.outbound.recv().await,
+                    // Nothing to wait on, and returning would spin this
+                    // arm of the select as fast as the runtime allows.
+                    None => std::future::pending().await,
+                }
+            } => {
+                let Some(action) = action else {
+                    clipboard = None;
+                    continue;
+                };
+                if !send_clipboard(&session, &action, &mut seq).await {
+                    break;
+                }
+            }
+
             reason = &mut stop => {
                 // The gateway revoked this session: entitlement withdrawn,
                 // an administrator ending it, or the client having gone.
@@ -269,7 +302,16 @@ async fn pump(
                 let Some(message) = message else { break };
                 let Ok(message) = message else { break };
                 tally.received += message.payload.len() as u64;
-                if !handle(request, &session, &mut video, input.as_deref_mut(), message).await {
+                if !handle(
+                    request,
+                    &session,
+                    &mut video,
+                    input.as_deref_mut(),
+                    clipboard.as_ref(),
+                    message,
+                )
+                .await
+                {
                     break;
                 }
             }
@@ -291,6 +333,7 @@ async fn handle(
     session: &Session,
     video: &mut Box<dyn crate::media::VideoSource>,
     input: Option<&mut dyn crate::media::InputInjector>,
+    clipboard: Option<&clipboard::Worker>,
     message: Incoming,
 ) -> bool {
     match (message.channel, message.header.kind) {
@@ -340,6 +383,20 @@ async fn handle(
             true
         }
 
+        (Channel::Clipboard, kind) => {
+            // Policy is enforced by there being no worker at all when the
+            // entitlement withholds the clipboard, so a peer that sends
+            // anyway is talking to nothing.
+            if let Some(worker) = clipboard {
+                match inbound(kind, &message.payload) {
+                    Ok(Some(message)) => worker.deliver(message),
+                    Ok(None) => {}
+                    Err(error) => tracing::debug!(%error, "malformed clipboard message"),
+                }
+            }
+            true
+        }
+
         (Channel::Control, MsgKind::Bye) => false,
 
         (channel, kind) => {
@@ -347,4 +404,48 @@ async fn handle(
             true
         }
     }
+}
+
+/// Put one clipboard action on the wire.
+async fn send_clipboard(session: &Session, action: &clipboard::Action, seq: &mut u32) -> bool {
+    let (kind, payload) = match action {
+        clipboard::Action::Offer(offer) => (
+            MsgKind::ClipboardOffer,
+            serde_json::to_vec(offer).unwrap_or_default(),
+        ),
+        clipboard::Action::Request(request) => (
+            MsgKind::ClipboardRequest,
+            serde_json::to_vec(request).unwrap_or_default(),
+        ),
+        clipboard::Action::Data(header, bytes) => (MsgKind::ClipboardData, header.payload(bytes)),
+    };
+    let header = MsgHeader::new(kind, *seq, 0);
+    *seq = seq.wrapping_add(1);
+    session
+        .send(Channel::Clipboard, header, &payload)
+        .await
+        .is_ok()
+}
+
+/// Parse one clipboard message from the peer.
+fn inbound(kind: MsgKind, payload: &[u8]) -> anyhow::Result<Option<clipboard::Inbound>> {
+    Ok(match kind {
+        MsgKind::ClipboardOffer => {
+            Some(clipboard::Inbound::Offer(serde_json::from_slice(payload)?))
+        }
+        MsgKind::ClipboardRequest => Some(clipboard::Inbound::Request(serde_json::from_slice(
+            payload,
+        )?)),
+        MsgKind::ClipboardData => {
+            let (header, bytes) = ndp_proto::ClipboardDataHeader::split(payload)?;
+            Some(clipboard::Inbound::Data(header, bytes.to_vec()))
+        }
+        other => {
+            tracing::debug!(
+                ?other,
+                "ignoring an unexpected message on the clipboard channel"
+            );
+            None
+        }
+    })
 }

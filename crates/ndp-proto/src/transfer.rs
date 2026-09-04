@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{read_u32, read_u64, ProtoError, Result};
+use crate::{read_u32, read_u64, read_u8, ProtoError, Result};
 
 /// A clipboard content type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -35,6 +35,97 @@ pub struct ClipboardOffer {
     pub formats: Vec<ClipboardFormat>,
     /// Total size of the largest format, for policy limits.
     pub size_hint: u64,
+}
+
+impl ClipboardFormat {
+    /// Wire discriminant.
+    #[must_use]
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            Self::Text => 1,
+            Self::Html => 2,
+            Self::Png => 3,
+            Self::FileList => 4,
+        }
+    }
+
+    /// Decode a wire discriminant.
+    pub fn from_u8(v: u8) -> Result<Self> {
+        Ok(match v {
+            1 => Self::Text,
+            2 => Self::Html,
+            3 => Self::Png,
+            4 => Self::FileList,
+            other => {
+                return Err(ProtoError::InvalidValue {
+                    field: "clipboard format",
+                    value: other.to_string(),
+                })
+            }
+        })
+    }
+}
+
+/// A request for one format from an offer.
+///
+/// Naming the offer rather than just the format is what keeps a paste
+/// truthful: both sides copy things, sometimes at the same moment, and a
+/// request that only said "text" would be answered with whatever happened to
+/// be on the clipboard by the time it arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardRequest {
+    /// The offer being answered.
+    pub offer_id: u64,
+    /// Which format is wanted.
+    pub format: ClipboardFormat,
+}
+
+/// Serialized size of the header preceding clipboard contents.
+pub const CLIPBOARD_DATA_HEADER_LEN: usize = 12;
+
+/// Binary header prefixing clipboard contents.
+///
+/// Layout (little-endian, 12 bytes): `offer_id(8) format(1) reserved(3)`.
+/// Binary rather than JSON because a pasted screenshot is megabytes and
+/// base64 would add a third of that for nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipboardDataHeader {
+    /// The offer these contents answer.
+    pub offer_id: u64,
+    /// What the bytes are.
+    pub format: ClipboardFormat,
+}
+
+impl ClipboardDataHeader {
+    /// Serialize into the fixed layout.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; CLIPBOARD_DATA_HEADER_LEN] {
+        let mut out = [0u8; CLIPBOARD_DATA_HEADER_LEN];
+        out[0..8].copy_from_slice(&self.offer_id.to_le_bytes());
+        out[8] = self.format.to_u8();
+        out
+    }
+
+    /// Parse the header and return it with the contents that follow.
+    pub fn split(payload: &[u8]) -> Result<(Self, &[u8])> {
+        let mut cursor = payload;
+        let offer_id = read_u64(&mut cursor)?;
+        let format = ClipboardFormat::from_u8(read_u8(&mut cursor)?)?;
+        // Three reserved bytes, read so the contents start where they should.
+        for _ in 0..3 {
+            read_u8(&mut cursor)?;
+        }
+        Ok((Self { offer_id, format }, cursor))
+    }
+
+    /// Build a complete payload from the header and the contents.
+    #[must_use]
+    pub fn payload(&self, contents: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(CLIPBOARD_DATA_HEADER_LEN + contents.len());
+        out.extend_from_slice(&self.to_bytes());
+        out.extend_from_slice(contents);
+        out
+    }
 }
 
 /// Metadata announcing a file transfer.
@@ -209,6 +300,54 @@ mod tests {
 
         let zero = FileAck { window: 0, ..ack };
         assert!(FileAck::decode(&zero.to_bytes()).is_err());
+    }
+
+    #[test]
+    fn clipboard_data_roundtrips_with_its_contents() {
+        let header = ClipboardDataHeader {
+            offer_id: 9,
+            format: ClipboardFormat::Png,
+        };
+        let payload = header.payload(&[0x89, b'P', b'N', b'G']);
+        let (parsed, contents) = ClipboardDataHeader::split(&payload).unwrap();
+        assert_eq!(parsed, header);
+        assert_eq!(contents, [0x89, b'P', b'N', b'G']);
+    }
+
+    #[test]
+    fn clearing_the_clipboard_is_not_an_error() {
+        // Copying nothing is a real thing to do, and it has to be able to
+        // cross: otherwise a cleared clipboard on one side stays stale on
+        // the other.
+        let header = ClipboardDataHeader {
+            offer_id: 0,
+            format: ClipboardFormat::Text,
+        };
+        let payload = header.payload(&[]);
+        let (parsed, contents) = ClipboardDataHeader::split(&payload).unwrap();
+        assert_eq!(parsed.format, ClipboardFormat::Text);
+        assert!(contents.is_empty());
+    }
+
+    #[test]
+    fn a_truncated_clipboard_header_is_refused_rather_than_guessed() {
+        let header = ClipboardDataHeader {
+            offer_id: 1,
+            format: ClipboardFormat::Text,
+        };
+        let payload = header.payload(b"hello");
+        assert!(ClipboardDataHeader::split(&payload[..7]).is_err());
+    }
+
+    #[test]
+    fn an_unknown_format_is_an_error_not_a_guess() {
+        let mut payload = ClipboardDataHeader {
+            offer_id: 1,
+            format: ClipboardFormat::Text,
+        }
+        .payload(b"hi");
+        payload[8] = 99;
+        assert!(ClipboardDataHeader::split(&payload).is_err());
     }
 
     #[test]

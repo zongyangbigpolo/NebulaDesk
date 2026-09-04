@@ -11,6 +11,7 @@
 //! the compositor when a frame is ready. Modelling it as a stream the agent
 //! polls would mean a queue and a thread in between, for nothing.
 
+use crate::clipboard::ClipboardAccess;
 use ndp_proto::InputEvent;
 use tokio::sync::mpsc;
 
@@ -169,6 +170,15 @@ pub trait Platform: Send + Sync + 'static {
     fn audio(&self) -> anyhow::Result<Box<dyn AudioSource>> {
         Ok(Box::new(SilentAudio))
     }
+
+    /// Open this machine's clipboard.
+    ///
+    /// Defaulted to one held in memory: a machine with no desktop session
+    /// has no clipboard to open, and a session that shares one existing only
+    /// inside itself is better than one that refuses to start.
+    fn clipboard(&self) -> anyhow::Result<Box<dyn ClipboardAccess>> {
+        Ok(Box::new(crate::clipboard::MemoryClipboard::default()))
+    }
 }
 
 /// A platform that captures nothing and injects nothing.
@@ -177,8 +187,12 @@ pub trait Platform: Send + Sync + 'static {
 /// policy, stream carriage, teardown — before any platform capture code
 /// exists, and so that a build for a platform whose backend is not finished
 /// still runs and still fails honestly rather than not existing.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct TestPattern;
+#[derive(Default, Clone)]
+pub struct TestPattern {
+    /// The clipboard this platform shares, so a test can watch what a
+    /// session put on it.
+    pub clipboard: crate::clipboard::MemoryClipboard,
+}
 
 impl Platform for TestPattern {
     fn video(&self) -> anyhow::Result<Box<dyn VideoSource>> {
@@ -191,6 +205,10 @@ impl Platform for TestPattern {
 
     fn audio(&self) -> anyhow::Result<Box<dyn AudioSource>> {
         Ok(Box::new(SyntheticAudio::default()))
+    }
+
+    fn clipboard(&self) -> anyhow::Result<Box<dyn ClipboardAccess>> {
+        Ok(Box::new(self.clipboard.clone()))
     }
 }
 

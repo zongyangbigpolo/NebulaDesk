@@ -283,6 +283,20 @@ async fn pump(
         }
     };
 
+    // The same engine the agent runs, mirrored. Both sides watch and both
+    // sides write; what stops that being a loop is in the engine itself.
+    let mut clipboard = if ticket.policy.clipboard {
+        match nebula_agent::clipboard::SystemClipboard::open() {
+            Ok(board) => Some(nebula_agent::clipboard::spawn(board, true)),
+            Err(error) => {
+                tracing::warn!(%error, "no clipboard on this machine; nothing will be shared");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     tracing::info!(session = %ticket.session_id, "connected");
     let mut seq: u32 = 0;
     let mut stats = Stats::new();
@@ -300,6 +314,18 @@ async fn pump(
 
             message = incoming.recv() => {
                 let Some(Ok(message)) = message else { break };
+                if message.channel == Channel::Clipboard {
+                    if let Some(worker) = clipboard.as_ref() {
+                        match inbound_clipboard(message.header.kind, &message.payload) {
+                            Ok(Some(message)) => worker.deliver(message),
+                            Ok(None) => {}
+                            Err(error) => {
+                                tracing::debug!(%error, "malformed clipboard message");
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if message.channel == Channel::Audio {
                     if let Some(playback) = playback.as_mut() {
                         if let Err(error) = playback.play(&message.payload) {
@@ -336,6 +362,23 @@ async fn pump(
                             break;
                         }
                     }
+                }
+            }
+
+            action = async {
+                match clipboard.as_mut() {
+                    Some(worker) => worker.outbound.recv().await,
+                    // Nothing to wait on; returning would spin this arm as
+                    // fast as the runtime allows.
+                    None => std::future::pending().await,
+                }
+            } => {
+                let Some(action) = action else {
+                    clipboard = None;
+                    continue;
+                };
+                if !send_clipboard(&session, &action, &mut seq).await {
+                    break;
                 }
             }
 
@@ -446,6 +489,57 @@ fn coalesce(events: Vec<InputEvent>) -> Vec<InputEvent> {
         out.push(event);
     }
     out
+}
+
+/// Put one clipboard action on the wire.
+async fn send_clipboard(
+    session: &ndp_transport::Session,
+    action: &nebula_agent::clipboard::Action,
+    seq: &mut u32,
+) -> bool {
+    use nebula_agent::clipboard::Action;
+
+    let (kind, payload) = match action {
+        Action::Offer(offer) => (
+            MsgKind::ClipboardOffer,
+            serde_json::to_vec(offer).unwrap_or_default(),
+        ),
+        Action::Request(request) => (
+            MsgKind::ClipboardRequest,
+            serde_json::to_vec(request).unwrap_or_default(),
+        ),
+        Action::Data(header, bytes) => (MsgKind::ClipboardData, header.payload(bytes)),
+    };
+    let header = MsgHeader::new(kind, *seq, 0);
+    *seq = seq.wrapping_add(1);
+    session
+        .send(Channel::Clipboard, header, &payload)
+        .await
+        .is_ok()
+}
+
+/// Parse one clipboard message from the agent.
+fn inbound_clipboard(
+    kind: MsgKind,
+    payload: &[u8],
+) -> anyhow::Result<Option<nebula_agent::clipboard::Inbound>> {
+    use nebula_agent::clipboard::Inbound;
+
+    Ok(match kind {
+        MsgKind::ClipboardOffer => Some(Inbound::Offer(serde_json::from_slice(payload)?)),
+        MsgKind::ClipboardRequest => Some(Inbound::Request(serde_json::from_slice(payload)?)),
+        MsgKind::ClipboardData => {
+            let (header, bytes) = ndp_proto::ClipboardDataHeader::split(payload)?;
+            Some(Inbound::Data(header, bytes.to_vec()))
+        }
+        other => {
+            tracing::debug!(
+                ?other,
+                "ignoring an unexpected message on the clipboard channel"
+            );
+            None
+        }
+    })
 }
 
 #[cfg(test)]

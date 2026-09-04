@@ -212,7 +212,7 @@ async fn an_attached_agent_keeps_reporting_that_it_is_alive() {
     .await
     .unwrap();
     let machine = identity.machine_id;
-    let agent = Agent::new(identity, Arc::new(TestPattern)).unwrap();
+    let agent = Agent::new(identity, Arc::new(TestPattern::default())).unwrap();
     tokio::spawn(async move { agent.run().await });
 
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -289,7 +289,7 @@ async fn the_real_agent_serves_a_real_client() {
         "the identity must be on disk before the agent claims to be enrolled"
     );
 
-    let agent = Agent::new(identity.clone(), Arc::new(TestPattern)).unwrap();
+    let agent = Agent::new(identity.clone(), Arc::new(TestPattern::default())).unwrap();
     let agent_key = agent.public_key();
     tokio::spawn(async move { agent.run().await });
 

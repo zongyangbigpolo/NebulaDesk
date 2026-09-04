@@ -58,6 +58,13 @@ pub struct SessionTicket {
     /// a gateway or relay that lied about anything else still cannot read or
     /// alter a byte of the session.
     pub agent_key: String,
+    /// What this session is permitted to do.
+    ///
+    /// Advisory: the ticket carries the authoritative copy and the agent is
+    /// what enforces it. This is here so the client does not offer a feature
+    /// that would be silently refused.
+    #[serde(default = "nebula_common::SessionPolicy::view_only")]
+    pub policy: nebula_common::SessionPolicy,
 }
 
 #[derive(Serialize)]

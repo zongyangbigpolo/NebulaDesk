@@ -404,9 +404,16 @@ pub struct CreateEntitlement {
     /// `VIEWER`, `CONTROLLER` or `ADMIN`.
     pub role: String,
     /// Permit clipboard synchronisation.
-    #[serde(default)]
+    ///
+    /// Defaults on for the same reason as audio: the role ceiling already
+    /// keeps it away from a viewer, and someone who may drive a machine's
+    /// keyboard can already move text either way by typing it.
+    #[serde(default = "default_true")]
     pub allow_clipboard: bool,
     /// Permit file transfer.
+    ///
+    /// Defaults off, unlike the others. Copying a file is the one thing
+    /// here that leaves something behind, so it is opted into.
     #[serde(default)]
     pub allow_file_transfer: bool,
     /// Permit audio. Defaults on: audio is rarely the sensitive channel.

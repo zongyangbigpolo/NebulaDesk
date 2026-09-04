@@ -51,6 +51,12 @@ pub struct SessionTicket {
     pub relay_pin: String,
     /// The agent's Noise static public key, hex encoded.
     pub agent_key: String,
+    /// What this session is permitted to do.
+    ///
+    /// The ticket carries the authoritative copy and the agent enforces it;
+    /// this is here so the client knows not to offer the user a feature the
+    /// session will silently refuse.
+    pub policy: nebula_common::SessionPolicy,
 }
 
 /// `POST /v1/sessions`
@@ -166,6 +172,7 @@ pub async fn create(
             relay_addr: relay.quic_addr,
             relay_pin: relay.cert_pin,
             agent_key: claims.agent_key,
+            policy,
         }),
     ))
 }

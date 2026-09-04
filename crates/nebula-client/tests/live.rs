@@ -168,7 +168,30 @@ impl Deployment {
     }
 
     /// Enrol an agent and publish its desktop to the owner.
+    /// Publish a desktop and hand back the clipboard the agent shares, so a
+    /// test can act as the person sitting at the machine.
+    async fn publish_a_desktop_with_a_clipboard(
+        &self,
+        name: &str,
+    ) -> (String, nebula_agent::clipboard::MemoryClipboard) {
+        let board = nebula_agent::clipboard::MemoryClipboard::default();
+        let resource = self
+            .publish_a_desktop_on(
+                name,
+                TestPattern {
+                    clipboard: board.clone(),
+                },
+            )
+            .await;
+        (resource, board)
+    }
+
     async fn publish_a_desktop(&self, name: &str) -> String {
+        self.publish_a_desktop_on(name, TestPattern::default())
+            .await
+    }
+
+    async fn publish_a_desktop_on(&self, name: &str, platform: TestPattern) -> String {
         let token = self
             .post(
                 "/v1/machines/enrollment-tokens",
@@ -191,7 +214,7 @@ impl Deployment {
         .expect("the machine should enrol");
         let machine = identity.machine_id;
 
-        let agent = Agent::new(identity, Arc::new(TestPattern)).unwrap();
+        let agent = Agent::new(identity, Arc::new(platform)).unwrap();
         tokio::spawn(async move { agent.run().await });
 
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -404,5 +427,138 @@ async fn a_session_carries_audio_the_client_can_decode() {
     assert!(
         pcm[..frames * 2].iter().any(|s| s.abs() > 0.001),
         "the decoded audio should not be silence"
+    );
+}
+
+/// Copying on the remote machine should make the content available here, and
+/// copying here should put it on the remote machine — without either side
+/// bouncing the other's content back.
+#[tokio::test]
+async fn the_clipboard_crosses_in_both_directions() {
+    use ndp_proto::{ClipboardDataHeader, ClipboardFormat, ClipboardOffer, ClipboardRequest};
+    use nebula_agent::clipboard::Contents;
+
+    let deployment = Deployment::start().await;
+    let name = format!("mac-{}", Uuid::now_v7().simple());
+    let (resource_id, board) = deployment.publish_a_desktop_with_a_clipboard(&name).await;
+
+    let client = ManagerClient::login(
+        &deployment.manager_url,
+        &deployment.slug,
+        "owner@acme.test",
+        PASSWORD,
+    )
+    .await
+    .unwrap();
+
+    let ticket = client.open(&resource_id).await.unwrap();
+    assert!(
+        ticket.policy.clipboard,
+        "a controller's entitlement grants the clipboard"
+    );
+
+    let connected = nebula_client::connect_to_agent(&ticket).await.unwrap();
+    let session = connected.session;
+    let mut incoming = connected.incoming;
+
+    /// Wait for a clipboard message, ignoring the media flowing past.
+    async fn next(
+        incoming: &mut ndp_transport::SessionReceiver,
+    ) -> Result<ndp_transport::Incoming, tokio::time::error::Elapsed> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let message = incoming.recv().await.unwrap().unwrap();
+                if message.channel == Channel::Clipboard {
+                    return message;
+                }
+            }
+        })
+        .await
+    }
+
+    // --- the machine's clipboard reaches the client -----------------------
+    board.put(Contents::text("copied on the machine"));
+
+    let offer = next(&mut incoming)
+        .await
+        .expect("the copy should be offered");
+    assert_eq!(offer.header.kind, MsgKind::ClipboardOffer);
+    let offer: ClipboardOffer = serde_json::from_slice(&offer.payload).unwrap();
+    assert_eq!(offer.formats, vec![ClipboardFormat::Text]);
+
+    session
+        .send(
+            Channel::Clipboard,
+            MsgHeader::new(MsgKind::ClipboardRequest, 0, 0),
+            &serde_json::to_vec(&ClipboardRequest {
+                offer_id: offer.offer_id,
+                format: ClipboardFormat::Text,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let data = next(&mut incoming).await.expect("the request is answered");
+    assert_eq!(data.header.kind, MsgKind::ClipboardData);
+    let (header, bytes) = ClipboardDataHeader::split(&data.payload).unwrap();
+    assert_eq!(header.offer_id, offer.offer_id);
+    assert_eq!(bytes, b"copied on the machine");
+
+    // --- and the client's clipboard reaches the machine -------------------
+    session
+        .send(
+            Channel::Clipboard,
+            MsgHeader::new(MsgKind::ClipboardOffer, 1, 0),
+            &serde_json::to_vec(&ClipboardOffer {
+                offer_id: 1,
+                formats: vec![ClipboardFormat::Text],
+                size_hint: 20,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let request = next(&mut incoming).await.expect("the agent should want it");
+    assert_eq!(request.header.kind, MsgKind::ClipboardRequest);
+    let request: ClipboardRequest = serde_json::from_slice(&request.payload).unwrap();
+    assert_eq!(request.offer_id, 1);
+
+    let header = ClipboardDataHeader {
+        offer_id: 1,
+        format: ClipboardFormat::Text,
+    };
+    session
+        .send(
+            Channel::Clipboard,
+            MsgHeader::new(MsgKind::ClipboardData, 2, 0),
+            &header.payload(b"copied on the client"),
+        )
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while board.peek() != Some(Contents::text("copied on the client")) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the machine's clipboard should end up with what was copied here");
+
+    // The loop that would otherwise never stop: the agent must not turn
+    // around and announce back the content it was just handed.
+    let bounced = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let message = incoming.recv().await.unwrap().unwrap();
+            if message.channel == Channel::Clipboard {
+                return message;
+            }
+        }
+    })
+    .await;
+    assert!(
+        bounced.is_err(),
+        "the agent announced back what the client just sent it"
     );
 }

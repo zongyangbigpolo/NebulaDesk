@@ -31,12 +31,12 @@ pub fn native() -> Arc<dyn Platform> {
             os = std::env::consts::OS,
             "no capture backend for this platform yet; streaming a test pattern"
         );
-        Arc::new(TestPattern)
+        Arc::new(TestPattern::default())
     }
 }
 
 /// Keep the fallback referenced on every platform so it cannot rot.
 #[allow(dead_code)]
 fn _fallback() -> TestPattern {
-    TestPattern
+    TestPattern::default()
 }

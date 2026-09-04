@@ -24,6 +24,9 @@ uuid = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
 opus = { workspace = true }
+arboard = { workspace = true }
+png = { workspace = true }
+blake3 = { workspace = true }
 
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -37,6 +40,7 @@ path = "src/main.rs"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.25"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard"] }
 screencapturekit = "9"
 shiguredo_video_toolbox = "2026.1"
 
