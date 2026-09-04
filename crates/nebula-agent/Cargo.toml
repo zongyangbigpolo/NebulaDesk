@@ -23,6 +23,7 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
+opus = { workspace = true }
 
 anyhow = { workspace = true }
 thiserror = { workspace = true }

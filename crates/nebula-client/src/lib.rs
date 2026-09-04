@@ -9,6 +9,7 @@
 //! HTTP, [`connect`] turns a ticket into an encrypted session, and everything
 //! after that is media.
 
+pub mod audio;
 pub mod connect;
 pub mod input;
 pub mod manager;

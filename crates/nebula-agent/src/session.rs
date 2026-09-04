@@ -17,7 +17,7 @@ use ndp_transport::{
 };
 use tokio::sync::{mpsc, oneshot};
 
-use crate::media::{EncodedFrame, Platform, VideoConfig};
+use crate::media::{AudioConfig, EncodedAudio, EncodedFrame, Platform, VideoConfig};
 
 /// How many encoded frames may wait for the network.
 ///
@@ -28,6 +28,13 @@ const FRAME_QUEUE: usize = 3;
 
 /// How long a frame may sit in the transport before it is abandoned.
 const FRAME_DEADLINE: Duration = Duration::from_millis(120);
+
+/// How many encoded audio packets may wait for the network.
+///
+/// Deeper than video because a gap in sound is more noticeable than a
+/// dropped frame, and still short: eight 20 ms packets is 160 ms, past which
+/// nobody would rather hear the audio than skip to the present.
+const AUDIO_QUEUE: usize = 8;
 
 /// The Noise prologue binding a handshake to one session.
 ///
@@ -162,7 +169,37 @@ async fn pump(
         return tally;
     }
 
+    let audio_config = AudioConfig::default();
+    let audio_info = ndp_proto::AudioFrameInfo {
+        codec: ndp_proto::AudioCodec::Opus,
+        channels: audio_config.channels as u8,
+        frame_ms: 20,
+    };
+
+    // Audio is optional in both directions: the entitlement may withhold it,
+    // and a platform backend may not have it yet. Neither is a reason to
+    // refuse a session, so a failure here is a session without sound.
+    let (audio_tx, mut packets) = mpsc::channel::<EncodedAudio>(AUDIO_QUEUE);
+    let mut audio = if request.policy.audio {
+        match platform.audio() {
+            Ok(mut audio) => match audio.start(audio_config, audio_tx) {
+                Ok(()) => Some(audio),
+                Err(error) => {
+                    tracing::warn!(%error, "audio capture would not start; this session is silent");
+                    None
+                }
+            },
+            Err(error) => {
+                tracing::warn!(%error, "no audio source; this session is silent");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut seq: u32 = 0;
+    let mut audio_seq: u32 = 0;
     loop {
         tokio::select! {
             frame = frames.recv() => {
@@ -184,6 +221,34 @@ async fn pump(
                     }
                     Err(error) => {
                         tracing::debug!(%error, "the session ended while sending video");
+                        break;
+                    }
+                }
+            }
+
+            packet = packets.recv() => {
+                // A closed audio channel is not the end of the session: the
+                // encoder can stop while the picture keeps going, and a
+                // silent remote desktop is still a remote desktop.
+                let Some(packet) = packet else {
+                    packets.close();
+                    continue;
+                };
+                let header = MsgHeader::new(MsgKind::AudioFrame, audio_seq, packet.timestamp_us)
+                    .with_flags(MsgFlags::DISCARDABLE);
+                audio_seq = audio_seq.wrapping_add(1);
+                let payload = audio_info.frame_payload(&packet.data);
+                // Audio rides in datagrams, which cannot be fragmented. A
+                // packet too big for the path is dropped here rather than
+                // failing the send and taking the session down with it.
+                if session.max_audio_record().is_some_and(|max| payload.len() > max) {
+                    tracing::debug!(bytes = payload.len(), "audio packet too large for the path");
+                    continue;
+                }
+                match session.send(Channel::Audio, header, &payload).await {
+                    Ok(()) => tally.sent += payload.len() as u64,
+                    Err(error) => {
+                        tracing::debug!(%error, "the session ended while sending audio");
                         break;
                     }
                 }
@@ -212,6 +277,9 @@ async fn pump(
     }
 
     video.stop();
+    if let Some(audio) = audio.as_mut() {
+        audio.stop();
+    }
     tracing::info!(session = %request.session, sent = tally.sent, received = tally.received, "session ended");
     tally
 }

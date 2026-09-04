@@ -29,6 +29,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 rpassword = "7"
+cpal = "0.18"
+opus = { workspace = true }
 
 winit = "0.30"
 wgpu = "24"
@@ -41,6 +43,7 @@ path = "src/main.rs"
 
 [dev-dependencies]
 tempfile = "3"
+opus = { workspace = true }
 nebula-manager = { workspace = true }
 nebula-gateway = { workspace = true }
 nebula-relay = { workspace = true }

@@ -272,6 +272,17 @@ async fn pump(
         }
     };
 
+    // A session without sound is worth having; a session that refuses to
+    // start because this machine has no output device is not. So playback
+    // failing is a warning, not the end of the connection.
+    let mut playback = match crate::audio::Playback::start(2) {
+        Ok(playback) => Some(playback),
+        Err(error) => {
+            tracing::warn!(%error, "no audio output; this session will be silent");
+            None
+        }
+    };
+
     tracing::info!(session = %ticket.session_id, "connected");
     let mut seq: u32 = 0;
     let mut stats = Stats::new();
@@ -289,6 +300,18 @@ async fn pump(
 
             message = incoming.recv() => {
                 let Some(Ok(message)) = message else { break };
+                if message.channel == Channel::Audio {
+                    if let Some(playback) = playback.as_mut() {
+                        if let Err(error) = playback.play(&message.payload) {
+                            // One bad packet is a glitch; a stream this
+                            // client cannot play at all is a configuration
+                            // problem, and both are better heard about than
+                            // silently absent.
+                            tracing::debug!(%error, "an audio packet could not be played");
+                        }
+                    }
+                    continue;
+                }
                 if message.channel != Channel::Video {
                     continue;
                 }

@@ -428,14 +428,19 @@ async fn the_real_agent_serves_a_real_client() {
     .expect("the end-to-end handshake should complete");
     assert_eq!(greeting, b"agent-ready");
 
-    // The first thing a joining client must receive is something it can
-    // decode on its own.
-    let first = tokio::time::timeout(Duration::from_secs(10), incoming.recv())
-        .await
-        .expect("the agent should send video")
-        .unwrap()
-        .unwrap();
-    assert_eq!(first.channel, Channel::Video);
+    // The first *video* a joining client receives must be something it can
+    // decode on its own. Audio shares the session and may well arrive first,
+    // which is fine: the two channels are independent by design.
+    let first = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let message = incoming.recv().await.unwrap().unwrap();
+            if message.channel == Channel::Video {
+                return message;
+            }
+        }
+    })
+    .await
+    .expect("the agent should send video");
     assert!(
         first.header.flags.contains(MsgFlags::KEYFRAME),
         "a client that just joined has nothing to reference"

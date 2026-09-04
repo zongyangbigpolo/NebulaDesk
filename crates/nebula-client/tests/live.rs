@@ -354,3 +354,55 @@ async fn a_wrong_password_is_refused_in_terms_a_person_can_act_on() {
         "the message should say what went wrong, got: {error}"
     );
 }
+
+/// Audio is carried in datagrams on its own channel, so it can be lost
+/// without holding up the picture — and can also be silently absent without
+/// anything failing. This is the check that it is not.
+#[tokio::test]
+async fn a_session_carries_audio_the_client_can_decode() {
+    let deployment = Deployment::start().await;
+    let name = format!("mac-{}", Uuid::now_v7().simple());
+    let resource_id = deployment.publish_a_desktop(&name).await;
+
+    let client = ManagerClient::login(
+        &deployment.manager_url,
+        &deployment.slug,
+        "owner@acme.test",
+        PASSWORD,
+    )
+    .await
+    .unwrap();
+
+    let ticket = client.open(&resource_id).await.unwrap();
+    let connected = nebula_client::connect_to_agent(&ticket).await.unwrap();
+    let mut incoming = connected.incoming;
+    let packet = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let message = incoming.recv().await.unwrap().unwrap();
+            if message.channel == Channel::Audio {
+                return message;
+            }
+        }
+    })
+    .await
+    .expect("the agent should send audio");
+
+    // Decoding it here rather than checking it is non-empty: bytes on the
+    // audio channel prove carriage, not that anything would come out of a
+    // speaker.
+    let (info, opus) = ndp_proto::AudioFrameInfo::split(&packet.payload)
+        .expect("the payload should describe itself");
+    assert_eq!(info.channels, 2);
+    assert_eq!(info.frame_ms, 20);
+
+    let mut decoder = opus::Decoder::new(48_000, opus::Channels::Stereo).unwrap();
+    let mut pcm = vec![0.0f32; 960 * 2];
+    let frames = decoder
+        .decode_float(opus, &mut pcm, false)
+        .expect("a real decoder should accept what the agent sent");
+    assert_eq!(frames, 960, "a 20 ms packet at 48 kHz is 960 samples");
+    assert!(
+        pcm[..frames * 2].iter().any(|s| s.abs() > 0.001),
+        "the decoded audio should not be silence"
+    );
+}

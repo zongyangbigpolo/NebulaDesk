@@ -72,6 +72,82 @@ pub trait VideoSource: Send + 'static {
     fn stop(&mut self);
 }
 
+/// One encoded packet of audio, ready to put on the wire.
+#[derive(Debug, Clone)]
+pub struct EncodedAudio {
+    /// Capture time in microseconds, on the agent's clock.
+    pub timestamp_us: u64,
+    /// One Opus packet.
+    pub data: Vec<u8>,
+}
+
+/// Where encoded audio packets are delivered.
+///
+/// Bounded like video, and for a sharper reason: audio that arrives late is
+/// worse than audio that never arrives. A listener notices a gap far less
+/// than they notice speech drifting seconds behind the picture.
+pub type AudioSink = mpsc::Sender<EncodedAudio>;
+
+/// What the audio stream is expected to carry.
+#[derive(Debug, Clone, Copy)]
+pub struct AudioConfig {
+    /// Sample rate in hertz.
+    pub sample_rate: u32,
+    /// Channel count.
+    pub channels: u16,
+    /// Target bitrate in bits per second.
+    pub bitrate: u32,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            // Opus is defined at 48 kHz and every platform's system mixer
+            // already runs there, so anything else would mean resampling
+            // twice to end up where this started.
+            sample_rate: 48_000,
+            channels: 2,
+            bitrate: 128_000,
+        }
+    }
+}
+
+impl AudioConfig {
+    /// Samples per channel in one packet.
+    ///
+    /// 20 ms is Opus's default and the point where its rate/latency curve
+    /// stops being worth trading: 10 ms costs noticeably more bitrate for
+    /// 10 ms, and 40 ms is audible as lag in an interactive session.
+    #[must_use]
+    pub fn frame_samples(&self) -> usize {
+        self.sample_rate as usize / 50
+    }
+}
+
+/// A source of encoded audio for one session.
+pub trait AudioSource: Send + 'static {
+    /// Begin capturing and encoding into `sink`.
+    fn start(&mut self, config: AudioConfig, sink: AudioSink) -> anyhow::Result<()>;
+
+    /// Stop capturing and release the device.
+    fn stop(&mut self);
+}
+
+/// An audio source that captures nothing.
+///
+/// Sessions to a machine whose platform backend has no audio yet are still
+/// worth having, so a missing source is silence rather than a failure.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SilentAudio;
+
+impl AudioSource for SilentAudio {
+    fn start(&mut self, _config: AudioConfig, _sink: AudioSink) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn stop(&mut self) {}
+}
+
 /// Somewhere to put the input a client sends.
 pub trait InputInjector: Send + 'static {
     /// Apply one event to the local desktop.
@@ -85,6 +161,14 @@ pub trait Platform: Send + Sync + 'static {
 
     /// Build an input injector for one session.
     fn input(&self) -> anyhow::Result<Box<dyn InputInjector>>;
+
+    /// Build an audio source for one session.
+    ///
+    /// Defaulted because a platform backend is useful long before it has
+    /// audio, and a session with a picture and no sound beats no session.
+    fn audio(&self) -> anyhow::Result<Box<dyn AudioSource>> {
+        Ok(Box::new(SilentAudio))
+    }
 }
 
 /// A platform that captures nothing and injects nothing.
@@ -103,6 +187,10 @@ impl Platform for TestPattern {
 
     fn input(&self) -> anyhow::Result<Box<dyn InputInjector>> {
         Ok(Box::new(DiscardInput))
+    }
+
+    fn audio(&self) -> anyhow::Result<Box<dyn AudioSource>> {
+        Ok(Box::new(SyntheticAudio::default()))
     }
 }
 
@@ -167,6 +255,80 @@ impl Drop for SyntheticVideo {
     }
 }
 
+/// Emits a tone, encoded exactly as a real source would.
+///
+/// A silent test source would prove that the audio path carries nothing,
+/// which is not the thing worth proving. This produces real Opus packets, so
+/// the whole path — encode, datagram, decode, play — is exercised.
+#[derive(Default)]
+pub struct SyntheticAudio {
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl AudioSource for SyntheticAudio {
+    fn start(&mut self, config: AudioConfig, sink: AudioSink) -> anyhow::Result<()> {
+        let channels = match config.channels {
+            1 => opus::Channels::Mono,
+            2 => opus::Channels::Stereo,
+            n => anyhow::bail!("Opus carries one or two channels, not {n}"),
+        };
+        let mut encoder =
+            opus::Encoder::new(config.sample_rate, channels, opus::Application::Audio)?;
+        encoder.set_bitrate(opus::Bitrate::Bits(config.bitrate as i32))?;
+
+        let samples = config.frame_samples();
+        let width = config.channels as usize;
+        let step = std::f32::consts::TAU * 440.0 / config.sample_rate as f32;
+
+        self.task = Some(tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_millis(SYNTHETIC_PACKET_MS));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let started = std::time::Instant::now();
+            let mut pcm = vec![0.0f32; samples * width];
+            let mut packet = vec![0u8; 4000];
+            let mut phase = 0.0f32;
+
+            loop {
+                ticker.tick().await;
+                for frame in pcm.chunks_mut(width) {
+                    // Quiet on purpose: this may end up in somebody's ears.
+                    let value = phase.sin() * 0.05;
+                    frame.fill(value);
+                    phase += step;
+                }
+                let Ok(n) = encoder.encode_float(&pcm, &mut packet) else {
+                    return;
+                };
+                let frame = EncodedAudio {
+                    timestamp_us: started.elapsed().as_micros() as u64,
+                    data: packet[..n].to_vec(),
+                };
+                if sink.try_send(frame).is_err() && sink.is_closed() {
+                    return;
+                }
+            }
+        }));
+        Ok(())
+    }
+
+    fn stop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for SyntheticAudio {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Packet duration of the synthetic source, matching what Opus is configured
+/// for elsewhere.
+const SYNTHETIC_PACKET_MS: u64 = 20;
+
 /// Accepts input and does nothing with it.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DiscardInput;
@@ -181,6 +343,29 @@ impl InputInjector for DiscardInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_synthetic_source_produces_decodable_audio() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let config = AudioConfig::default();
+        let mut audio = SyntheticAudio::default();
+        audio.start(config, tx).unwrap();
+
+        let packet = rx.recv().await.expect("a packet should arrive");
+        assert!(!packet.data.is_empty());
+
+        // The point of the source is that a real decoder accepts it.
+        let mut decoder = opus::Decoder::new(config.sample_rate, opus::Channels::Stereo).unwrap();
+        let mut pcm = vec![0.0f32; config.frame_samples() * 2];
+        let frames = decoder
+            .decode_float(&packet.data, &mut pcm, false)
+            .expect("a real decoder should accept it");
+        assert_eq!(
+            frames,
+            config.frame_samples(),
+            "a 20 ms packet should decode to 20 ms of audio"
+        );
+    }
 
     #[tokio::test]
     async fn the_synthetic_source_starts_with_a_keyframe() {
