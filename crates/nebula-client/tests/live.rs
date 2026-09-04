@@ -239,7 +239,12 @@ impl Deployment {
         self.post(
             &format!("/v1/resources/{resource}/entitlements"),
             Some(&self.owner_token),
-            json!({ "subject_kind": "USER", "subject_id": me["id"], "role": "CONTROLLER" }),
+            json!({
+                "subject_kind": "USER",
+                "subject_id": me["id"],
+                "role": "CONTROLLER",
+                "allow_file_transfer": true,
+            }),
         )
         .await;
 
@@ -560,5 +565,108 @@ async fn the_clipboard_crosses_in_both_directions() {
     assert!(
         bounced.is_err(),
         "the agent announced back what the client just sent it"
+    );
+}
+
+/// A file dropped onto the session should land intact on the other machine.
+#[tokio::test]
+async fn a_file_crosses_the_session_intact() {
+    use ndp_proto::{FileAck, FileChunkHeader, FileOffer};
+
+    // The agent under test runs in this process, so point its downloads at
+    // scratch space rather than the account's real Downloads folder.
+    let downloads = tempfile::tempdir().unwrap();
+    std::env::set_var("NEBULA_DOWNLOADS", downloads.path());
+
+    let deployment = Deployment::start().await;
+    let name = format!("mac-{}", Uuid::now_v7().simple());
+    let resource_id = deployment.publish_a_desktop(&name).await;
+
+    let client = ManagerClient::login(
+        &deployment.manager_url,
+        &deployment.slug,
+        "owner@acme.test",
+        PASSWORD,
+    )
+    .await
+    .unwrap();
+    let ticket = client.open(&resource_id).await.unwrap();
+    assert!(ticket.policy.file_transfer, "the entitlement granted it");
+
+    let connected = nebula_client::connect_to_agent(&ticket).await.unwrap();
+    let session = connected.session;
+    let mut incoming = connected.incoming;
+
+    // Big enough to need several chunks and a window that has to be
+    // reopened, and not a round multiple of either.
+    let contents: Vec<u8> = (0..nebula_agent::files::CHUNK * 5 + 123)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let offer = FileOffer {
+        transfer_id: 1,
+        name: "handover.bin".into(),
+        size: contents.len() as u64,
+        blake3: blake3::hash(&contents).to_hex().to_string(),
+        modified_secs: None,
+    };
+    let mut seq = 0u32;
+    let mut send = |kind: MsgKind, payload: Vec<u8>| {
+        seq += 1;
+        let session = session.clone();
+        async move {
+            session
+                .send(Channel::File, MsgHeader::new(kind, seq, 0), &payload)
+                .await
+                .unwrap();
+        }
+    };
+
+    send(MsgKind::FileOffer, serde_json::to_vec(&offer).unwrap()).await;
+
+    let ack = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let message = incoming.recv().await.unwrap().unwrap();
+            if message.channel == Channel::File {
+                return message;
+            }
+        }
+    })
+    .await
+    .expect("the agent should agree to receive the file");
+    assert_eq!(ack.header.kind, MsgKind::FileAck);
+    let ack = FileAck::decode(&ack.payload).unwrap();
+    assert_eq!(ack.transfer_id, 1);
+    assert!(
+        ack.window > 0,
+        "an accepted file comes with room to send it"
+    );
+
+    for (index, chunk) in contents.chunks(nebula_agent::files::CHUNK).enumerate() {
+        let header = FileChunkHeader {
+            transfer_id: 1,
+            offset: (index * nebula_agent::files::CHUNK) as u64,
+        };
+        let mut payload = header.to_bytes().to_vec();
+        payload.extend_from_slice(chunk);
+        send(MsgKind::FileChunk, payload).await;
+    }
+
+    let landed = downloads.path().join("handover.bin");
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if std::fs::read(&landed).is_ok_and(|got| got == contents) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the file should arrive byte for byte");
+
+    // And never under its final name before it is whole: a half-written
+    // file that looks finished is worse than one that never arrived.
+    assert!(
+        !downloads.path().join("handover.nebulapart").exists(),
+        "the partial file should have been renamed away"
     );
 }

@@ -39,6 +39,10 @@ pub fn run(ticket: SessionTicket, resource_name: &str) -> anyhow::Result<()> {
     let event_loop = EventLoop::with_user_event().build()?;
     let mailbox: Mailbox = Arc::new(Mutex::new(None));
     let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
+    // Dropping a file on the window is the send gesture. It is deliberately
+    // the only one: a session that could reach into this machine's
+    // filesystem on the remote side's say-so would be a different product.
+    let (drop_tx, drop_rx) = tokio::sync::mpsc::unbounded_channel::<std::path::PathBuf>();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -49,9 +53,15 @@ pub fn run(ticket: SessionTicket, resource_name: &str) -> anyhow::Result<()> {
     // Waking the event loop from the network side is what keeps the window
     // redrawing without a spin loop: nothing is drawn until a frame arrives.
     let waker = event_loop.create_proxy();
-    let network = runtime.spawn(pump(ticket, Arc::clone(&mailbox), input_rx, move || {
-        let _ = waker.send_event(());
-    }));
+    let network = runtime.spawn(pump(
+        ticket,
+        Arc::clone(&mailbox),
+        input_rx,
+        drop_rx,
+        move || {
+            let _ = waker.send_event(());
+        },
+    ));
 
     let mut app = App {
         title: format!("{resource_name} — NebulaDesk"),
@@ -59,6 +69,7 @@ pub fn run(ticket: SessionTicket, resource_name: &str) -> anyhow::Result<()> {
         renderer: None,
         mailbox,
         input: input_tx,
+        dropped: drop_tx,
         modifiers: ndp_proto::Modifiers::NONE,
         viewport: Viewport::fit((1.0, 1.0), (1, 1)),
         pointer: None,
@@ -79,6 +90,7 @@ struct App {
     renderer: Option<Renderer>,
     mailbox: Mailbox,
     input: tokio::sync::mpsc::UnboundedSender<InputEvent>,
+    dropped: tokio::sync::mpsc::UnboundedSender<std::path::PathBuf>,
     modifiers: ndp_proto::Modifiers,
     viewport: Viewport,
     pointer: Option<(f32, f32)>,
@@ -237,6 +249,10 @@ impl ApplicationHandler for App {
                 }
             }
 
+            WindowEvent::DroppedFile(path) => {
+                let _ = self.dropped.send(path);
+            }
+
             _ => {}
         }
     }
@@ -247,6 +263,7 @@ async fn pump(
     ticket: SessionTicket,
     mailbox: Mailbox,
     mut input: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
+    mut dropped: tokio::sync::mpsc::UnboundedReceiver<std::path::PathBuf>,
     wake: impl Fn() + Send + 'static,
 ) {
     let connected = match crate::connect_to_agent(&ticket).await {
@@ -297,6 +314,11 @@ async fn pump(
         None
     };
 
+    let mut transfers = ticket
+        .policy
+        .file_transfer
+        .then(|| nebula_agent::files::spawn(nebula_agent::files::default_downloads(), true));
+
     tracing::info!(session = %ticket.session_id, "connected");
     let mut seq: u32 = 0;
     let mut stats = Stats::new();
@@ -321,6 +343,18 @@ async fn pump(
                             Ok(None) => {}
                             Err(error) => {
                                 tracing::debug!(%error, "malformed clipboard message");
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if message.channel == Channel::File {
+                    if let Some(worker) = transfers.as_ref() {
+                        match inbound_file(message.header.kind, &message.payload) {
+                            Ok(Some(message)) => worker.deliver(message),
+                            Ok(None) => {}
+                            Err(error) => {
+                                tracing::debug!(%error, "malformed file transfer message");
                             }
                         }
                     }
@@ -379,6 +413,34 @@ async fn pump(
                 };
                 if !send_clipboard(&session, &action, &mut seq).await {
                     break;
+                }
+            }
+
+            action = async {
+                match transfers.as_mut() {
+                    Some(worker) => worker.outbound.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let Some(action) = action else {
+                    transfers = None;
+                    continue;
+                };
+                if !send_file_action(&session, &action, &mut seq).await {
+                    break;
+                }
+            }
+
+            path = dropped.recv() => {
+                let Some(path) = path else { break };
+                match transfers.as_ref() {
+                    Some(worker) => {
+                        worker.deliver(nebula_agent::files::Inbound::Send(path));
+                    }
+                    None => tracing::info!(
+                        path = %path.display(),
+                        "ignoring a dropped file: this session may not transfer files"
+                    ),
                 }
             }
 
@@ -516,6 +578,56 @@ async fn send_clipboard(
         .send(Channel::Clipboard, header, &payload)
         .await
         .is_ok()
+}
+
+/// Put one file transfer action on the wire.
+async fn send_file_action(
+    session: &ndp_transport::Session,
+    action: &nebula_agent::files::Action,
+    seq: &mut u32,
+) -> bool {
+    use nebula_agent::files::Action;
+    let (kind, payload) = match action {
+        Action::Offer(offer) => (
+            MsgKind::FileOffer,
+            serde_json::to_vec(offer).unwrap_or_default(),
+        ),
+        Action::Chunk(header, data) => {
+            let mut payload = Vec::with_capacity(data.len() + ndp_proto::FILE_CHUNK_HEADER_LEN);
+            payload.extend_from_slice(&header.to_bytes());
+            payload.extend_from_slice(data);
+            (MsgKind::FileChunk, payload)
+        }
+        Action::Ack(ack) => (MsgKind::FileAck, ack.to_bytes().to_vec()),
+    };
+    *seq = seq.wrapping_add(1);
+    session
+        .send(Channel::File, MsgHeader::new(kind, *seq, 0), &payload)
+        .await
+        .is_ok()
+}
+
+/// Parse one file transfer message from the agent.
+fn inbound_file(
+    kind: MsgKind,
+    payload: &[u8],
+) -> anyhow::Result<Option<nebula_agent::files::Inbound>> {
+    use nebula_agent::files::Inbound;
+    Ok(match kind {
+        MsgKind::FileOffer => Some(Inbound::Offer(serde_json::from_slice(payload)?)),
+        MsgKind::FileChunk => {
+            let (header, data) = ndp_proto::FileChunkHeader::split(payload)?;
+            Some(Inbound::Chunk(header, data.to_vec()))
+        }
+        MsgKind::FileAck => Some(Inbound::Ack(ndp_proto::FileAck::decode(payload)?)),
+        other => {
+            tracing::debug!(
+                kind = ?other,
+                "ignoring an unexpected message on the file channel"
+            );
+            None
+        }
+    })
 }
 
 /// Parse one clipboard message from the agent.

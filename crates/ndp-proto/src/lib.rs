@@ -53,8 +53,8 @@ pub use header::{MsgFlags, MsgHeader, MsgKind, HEADER_LEN, PROTOCOL_VERSION};
 pub use input::{InputEvent, InputKind, KeyCode, Modifiers, MouseButton};
 pub use media::{AudioFrameInfo, VideoFrameInfo};
 pub use transfer::{
-    ClipboardDataHeader, ClipboardFormat, ClipboardOffer, ClipboardRequest, FileChunkHeader,
-    FileOffer,
+    ClipboardDataHeader, ClipboardFormat, ClipboardOffer, ClipboardRequest, FileAck,
+    FileChunkHeader, FileOffer, FILE_CHUNK_HEADER_LEN,
 };
 
 /// Errors produced while decoding an NDP message.

@@ -18,6 +18,7 @@ use ndp_transport::{
 use tokio::sync::{mpsc, oneshot};
 
 use crate::clipboard;
+use crate::files;
 use crate::media::{AudioConfig, EncodedAudio, EncodedFrame, Platform, VideoConfig};
 
 /// How many encoded frames may wait for the network.
@@ -214,6 +215,12 @@ async fn pump(
         None
     };
 
+    // File transfer, likewise, exists only where it is permitted.
+    let mut transfers = request
+        .policy
+        .file_transfer
+        .then(|| files::spawn(files::default_downloads(), true));
+
     let mut seq: u32 = 0;
     let mut audio_seq: u32 = 0;
     loop {
@@ -287,6 +294,21 @@ async fn pump(
                 }
             }
 
+            action = async {
+                match transfers.as_mut() {
+                    Some(worker) => worker.outbound.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let Some(action) = action else {
+                    transfers = None;
+                    continue;
+                };
+                if !send_file_action(&session, &action, &mut seq).await {
+                    break;
+                }
+            }
+
             reason = &mut stop => {
                 // The gateway revoked this session: entitlement withdrawn,
                 // an administrator ending it, or the client having gone.
@@ -308,6 +330,7 @@ async fn pump(
                     &mut video,
                     input.as_deref_mut(),
                     clipboard.as_ref(),
+                    transfers.as_ref(),
                     message,
                 )
                 .await
@@ -334,6 +357,7 @@ async fn handle(
     video: &mut Box<dyn crate::media::VideoSource>,
     input: Option<&mut dyn crate::media::InputInjector>,
     clipboard: Option<&clipboard::Worker>,
+    transfers: Option<&files::Worker>,
     message: Incoming,
 ) -> bool {
     match (message.channel, message.header.kind) {
@@ -397,6 +421,17 @@ async fn handle(
             true
         }
 
+        (Channel::File, kind) => {
+            if let Some(worker) = transfers {
+                match inbound_file(kind, &message.payload) {
+                    Ok(Some(message)) => worker.deliver(message),
+                    Ok(None) => {}
+                    Err(error) => tracing::debug!(%error, "malformed file transfer message"),
+                }
+            }
+            true
+        }
+
         (Channel::Control, MsgKind::Bye) => false,
 
         (channel, kind) => {
@@ -444,6 +479,45 @@ fn inbound(kind: MsgKind, payload: &[u8]) -> anyhow::Result<Option<clipboard::In
             tracing::debug!(
                 ?other,
                 "ignoring an unexpected message on the clipboard channel"
+            );
+            None
+        }
+    })
+}
+
+/// Put one file transfer action on the wire.
+async fn send_file_action(session: &Session, action: &files::Action, seq: &mut u32) -> bool {
+    let (kind, payload) = match action {
+        files::Action::Offer(offer) => (
+            MsgKind::FileOffer,
+            serde_json::to_vec(offer).unwrap_or_default(),
+        ),
+        files::Action::Chunk(header, data) => {
+            let mut payload = Vec::with_capacity(data.len() + ndp_proto::FILE_CHUNK_HEADER_LEN);
+            payload.extend_from_slice(&header.to_bytes());
+            payload.extend_from_slice(data);
+            (MsgKind::FileChunk, payload)
+        }
+        files::Action::Ack(ack) => (MsgKind::FileAck, ack.to_bytes().to_vec()),
+    };
+    *seq = seq.wrapping_add(1);
+    let header = MsgHeader::new(kind, *seq, 0);
+    session.send(Channel::File, header, &payload).await.is_ok()
+}
+
+/// Parse one file transfer message from the peer.
+fn inbound_file(kind: MsgKind, payload: &[u8]) -> anyhow::Result<Option<files::Inbound>> {
+    Ok(match kind {
+        MsgKind::FileOffer => Some(files::Inbound::Offer(serde_json::from_slice(payload)?)),
+        MsgKind::FileChunk => {
+            let (header, data) = ndp_proto::FileChunkHeader::split(payload)?;
+            Some(files::Inbound::Chunk(header, data.to_vec()))
+        }
+        MsgKind::FileAck => Some(files::Inbound::Ack(ndp_proto::FileAck::decode(payload)?)),
+        other => {
+            tracing::debug!(
+                kind = ?other,
+                "ignoring an unexpected message on the file channel"
             );
             None
         }

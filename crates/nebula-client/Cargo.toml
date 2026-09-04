@@ -43,6 +43,7 @@ path = "src/main.rs"
 
 [dev-dependencies]
 tempfile = "3"
+blake3 = { workspace = true }
 opus = { workspace = true }
 nebula-manager = { workspace = true }
 nebula-gateway = { workspace = true }
