@@ -84,7 +84,7 @@ async fn pump_uni(from: Connection, to: Connection, counters: Arc<Counters>, ups
             return;
         };
         let counters = counters.clone();
-        tokio::spawn(async move { copy(recv, send, counters, upstream).await });
+        tokio::spawn(async move { copy(recv, send, counters, upstream, true).await });
     }
 }
 
@@ -98,8 +98,10 @@ async fn pump_bi(from: Connection, to: Connection, counters: Arc<Counters>, upst
         };
         let forward = counters.clone();
         let backward = counters.clone();
-        tokio::spawn(async move { copy(from_recv, to_send, forward, upstream).await });
-        tokio::spawn(async move { copy(to_recv, from_send, backward, !upstream).await });
+        // Only the side that opened the stream writes the prefix, so only
+        // the forward direction has an urgency to read.
+        tokio::spawn(async move { copy(from_recv, to_send, forward, upstream, true).await });
+        tokio::spawn(async move { copy(to_recv, from_send, backward, !upstream, false).await });
     }
 }
 
@@ -118,7 +120,37 @@ async fn pump_datagrams(from: Connection, to: Connection, counters: Arc<Counters
     }
 }
 
-async fn copy(mut recv: RecvStream, mut send: SendStream, counters: Arc<Counters>, upstream: bool) {
+/// How many bytes of prefix carry the urgency, and where in them it sits.
+const PREFIX: usize = 4;
+const URGENCY: usize = 2;
+
+async fn copy(
+    mut recv: RecvStream,
+    mut send: SendStream,
+    counters: Arc<Counters>,
+    upstream: bool,
+    prefixed: bool,
+) {
+    // The payload is sealed and the relay has no key for it, so the sender
+    // states in the clear how the stream should be scheduled. Without this
+    // the relay forwards everything at the same standing and undoes, on the
+    // hop it owns, the ordering both endpoints agreed on: a keyframe ends up
+    // sharing the link evenly with the frames that depend on it, arrives
+    // last, and is useless by the time it lands.
+    if prefixed {
+        let mut prefix = [0u8; PREFIX];
+        if recv.read_exact(&mut prefix).await.is_err() {
+            let _ = send.reset(ERROR_CODE);
+            return;
+        }
+        let _ = send.set_priority(i32::from(prefix[URGENCY]));
+        count(&counters, upstream, PREFIX as u64);
+        if send.write_all(&prefix).await.is_err() {
+            let _ = recv.stop(ERROR_CODE);
+            return;
+        }
+    }
+
     loop {
         match recv.read_chunk(CHUNK, true).await {
             Ok(Some(chunk)) => {

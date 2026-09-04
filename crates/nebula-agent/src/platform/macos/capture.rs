@@ -283,7 +283,7 @@ fn pump(
                 let Some(sample) = last.as_ref() else {
                     continue;
                 };
-                if !encode(&mut capture, sample, true, sink, started) {
+                if !encode(&mut capture, sample, true, sink, keyframe, started) {
                     return;
                 }
                 continue;
@@ -313,7 +313,7 @@ fn pump(
 
         let wanted_key = force_key || keyframe.swap(false, Ordering::Relaxed);
         force_key = false;
-        if !encode(&mut capture, &sample, wanted_key, sink, started) {
+        if !encode(&mut capture, &sample, wanted_key, sink, keyframe, started) {
             return;
         }
         last = Some(sample);
@@ -327,6 +327,7 @@ fn encode(
     sample: &CMSampleBuffer,
     force_key_frame: bool,
     sink: &FrameSink,
+    keyframe: &AtomicBool,
     started: Instant,
 ) -> bool {
     // `image_buffer_ptr` is named for CMSampleBufferGetImageBuffer, but the
@@ -361,8 +362,19 @@ fn encode(
                     timestamp_us: started.elapsed().as_micros() as u64,
                     data,
                 };
-                if sink.try_send(encoded).is_err() && sink.is_closed() {
-                    return false;
+                if sink.try_send(encoded).is_err() {
+                    if sink.is_closed() {
+                        return false;
+                    }
+                    // The queue is short on purpose: a frame that cannot be
+                    // sent promptly is better replaced than delivered late.
+                    // But every frame dropped here is a gap in the reference
+                    // chain, and the client can only discover it a round trip
+                    // later and only repair it by asking for a keyframe over
+                    // the same congested link. Repairing it locally instead
+                    // costs one keyframe and no round trip, and it is decided
+                    // where the loss actually happened.
+                    keyframe.store(true, Ordering::Relaxed);
                 }
             }
             Ok(None) => return true,

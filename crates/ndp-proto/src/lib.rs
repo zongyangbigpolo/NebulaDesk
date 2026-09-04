@@ -47,7 +47,7 @@ pub mod transfer;
 pub use caps::{
     AudioCodec, AudioParams, Caps, ColorCaps, DisplayGeometry, FeatureFlags, VideoCodec,
 };
-pub use channel::Channel;
+pub use channel::{Channel, KEYFRAME_PRIORITY};
 pub use control::{ByeReason, ControlMessage, CursorShape, QosReport};
 pub use header::{MsgFlags, MsgHeader, MsgKind, HEADER_LEN, PROTOCOL_VERSION};
 pub use input::{InputEvent, InputKind, KeyCode, Modifiers, MouseButton};

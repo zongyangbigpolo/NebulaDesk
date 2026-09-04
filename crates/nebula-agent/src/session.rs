@@ -232,8 +232,15 @@ async fn pump(
                     .with_flags(flags);
                 seq = seq.wrapping_add(1);
 
-                let deadline = tokio::time::Instant::now() + FRAME_DEADLINE;
-                match session.send_video_frame(header, &frame.data, Some(deadline)).await {
+                // A keyframe is the one frame that must not be abandoned. It
+                // is also the largest, so on a link that cannot carry it
+                // inside the deadline it is the frame that always loses —
+                // and the agent answers a discarded frame by producing
+                // another keyframe, which loses in turn. The result is a
+                // session that never shows a picture at all.
+                let deadline = (!frame.keyframe)
+                    .then(|| tokio::time::Instant::now() + FRAME_DEADLINE);
+                match session.send_video_frame(header, &frame.data, deadline).await {
                     Ok(ndp_transport::FrameOutcome::Sent) => {
                         tally.sent += frame.data.len() as u64;
                     }
@@ -403,6 +410,7 @@ async fn handle(
         }
 
         (Channel::Control, MsgKind::CapsUpdate) => {
+            tracing::debug!(session = %request.session, "the client asked for a keyframe");
             video.request_keyframe();
             true
         }

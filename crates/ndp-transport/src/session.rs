@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use bytes::{BufMut, BytesMut};
 use ndp_crypto::{Initiator, PublicKey, RecordOpener, RecordSealer, Responder};
-use ndp_proto::{Channel, MsgHeader};
+use ndp_proto::{Channel, MsgFlags, MsgHeader, KEYFRAME_PRIORITY};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::Instant;
 use tracing::{debug, trace};
@@ -117,7 +117,9 @@ impl Session {
         let mut recvs = HashMap::new();
         for channel in ORDERED_CHANNELS {
             let (mut send, recv) = conn.open_bi().await?;
-            send.write_all(&wire::channel_prefix(channel)).await?;
+            let _ = send.set_priority(i32::from(channel.priority()));
+            send.write_all(&wire::channel_prefix(channel, channel.priority()))
+                .await?;
             sends.insert(channel, send);
             recvs.insert(channel, recv);
         }
@@ -298,7 +300,7 @@ impl Session {
         let record = self.inner.sealer.seal(channel, header, payload)?;
         if channel.is_unreliable() {
             let mut buf = BytesMut::with_capacity(CHANNEL_PREFIX_LEN + record.len());
-            buf.put_slice(&wire::channel_prefix(channel));
+            buf.put_slice(&wire::channel_prefix(channel, channel.priority()));
             buf.put_slice(&record);
             self.inner.conn.send_datagram(buf.freeze())?;
             return Ok(());
@@ -308,7 +310,9 @@ impl Session {
             write_framed(&mut guard, &record, self.inner.max_record).await?;
             return Ok(());
         }
-        let mut stream = self.open_message_stream(channel).await?;
+        let mut stream = self
+            .open_message_stream(channel, channel.priority())
+            .await?;
         stream.write_all(&record).await?;
         stream.finish().map_err(|_| TransportError::Closed)?;
         Ok(())
@@ -326,7 +330,14 @@ impl Session {
         deadline: Option<Instant>,
     ) -> Result<FrameOutcome> {
         let record = self.inner.sealer.seal(Channel::Video, header, payload)?;
-        let mut stream = self.open_message_stream(Channel::Video).await?;
+        // A keyframe outranks the frames that depend on it. See
+        // `Channel::priority` for why the rest of the ladder looks as it does.
+        let urgency = if header.flags.contains(MsgFlags::KEYFRAME) {
+            KEYFRAME_PRIORITY
+        } else {
+            Channel::Video.priority()
+        };
+        let mut stream = self.open_message_stream(Channel::Video, urgency).await?;
 
         let write = async {
             stream.write_all(&record).await?;
@@ -354,9 +365,19 @@ impl Session {
         }
     }
 
-    async fn open_message_stream(&self, channel: Channel) -> Result<quinn::SendStream> {
+    async fn open_message_stream(
+        &self,
+        channel: Channel,
+        urgency: u8,
+    ) -> Result<quinn::SendStream> {
         let mut stream = self.inner.conn.open_uni().await?;
-        stream.write_all(&wire::channel_prefix(channel)).await?;
+        // Scheduling is per stream, so the standing has to be declared before
+        // anything is written, and written into the prefix as well so the
+        // relay can apply the same decision on the hop it owns.
+        let _ = stream.set_priority(i32::from(urgency));
+        stream
+            .write_all(&wire::channel_prefix(channel, urgency))
+            .await?;
         Ok(stream)
     }
 

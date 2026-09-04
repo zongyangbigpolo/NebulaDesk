@@ -16,7 +16,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ndp_proto::{Channel, InputEvent, InputKind, MouseButton, MsgHeader, MsgKind};
+use ndp_proto::{Channel, InputEvent, InputKind, MouseButton, MsgFlags, MsgHeader, MsgKind};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -281,6 +281,7 @@ async fn pump(
         gateway,
     } = connected;
 
+    let mut order = video::VideoOrder::new();
     let mut decoder = match video::decoder() {
         Ok(decoder) => decoder,
         Err(error) => {
@@ -376,26 +377,42 @@ async fn pump(
                     continue;
                 }
                 stats.frame(message.payload.len());
-                match decoder.decode(&message.payload) {
-                    Ok(Some(picture)) => {
-                        stats.decoded(picture.width, picture.height);
-                        if let Ok(mut slot) = mailbox.lock() {
-                            *slot = Some(picture);
-                        }
-                        wake();
+                let keyframe = message.header.flags.contains(MsgFlags::KEYFRAME);
+                let ready = order.accept(message.header.seq, keyframe, message.payload);
+                if ready.ask_for_keyframe {
+                    let header = MsgHeader::new(MsgKind::CapsUpdate, seq, 0);
+                    seq = seq.wrapping_add(1);
+                    if session.send(Channel::Control, header, b"").await.is_err() {
+                        break;
                     }
-                    Ok(None) => {}
-                    Err(error) => {
-                        // One bad frame is normal after a loss. Ask for a
-                        // keyframe and carry on rather than ending a session
-                        // that is otherwise healthy.
-                        tracing::debug!(%error, "a frame could not be decoded; asking for a keyframe");
-                        let header = MsgHeader::new(MsgKind::CapsUpdate, seq, 0);
-                        seq = seq.wrapping_add(1);
-                        if session.send(Channel::Control, header, b"").await.is_err() {
-                            break;
+                }
+                let mut ended = false;
+                for payload in ready.frames {
+                    match decoder.decode(&payload) {
+                        Ok(Some(picture)) => {
+                            stats.decoded(picture.width, picture.height);
+                            if let Ok(mut slot) = mailbox.lock() {
+                                *slot = Some(picture);
+                            }
+                            wake();
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            // The decoder rejected something the ordering
+                            // could not have caught. Only a keyframe recovers
+                            // from that either.
+                            tracing::debug!(%error, "a frame could not be decoded; asking for a keyframe");
+                            let header = MsgHeader::new(MsgKind::CapsUpdate, seq, 0);
+                            seq = seq.wrapping_add(1);
+                            if session.send(Channel::Control, header, b"").await.is_err() {
+                                ended = true;
+                                break;
+                            }
                         }
                     }
+                }
+                if ended {
+                    break;
                 }
             }
 
@@ -525,7 +542,10 @@ impl Stats {
             kbps = format!("{:.0}", (self.bytes as f64 * 8.0 / 1000.0) / seconds),
             width = self.size.0,
             height = self.size.1,
-            dropped = self.frames - self.decoded,
+            // A frame held back for reordering is counted as it arrives and
+            // decoded in a later interval, so within one interval more can
+            // decode than arrived.
+            dropped = self.frames.saturating_sub(self.decoded),
             "video"
         );
         *self = Self::new();

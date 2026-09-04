@@ -83,7 +83,44 @@ impl Channel {
             Channel::File => "file",
         }
     }
+
+    /// How urgently this channel's streams should be sent, higher first.
+    ///
+    /// A QUIC connection carries every channel at once and, left alone,
+    /// shares the link evenly between whatever streams happen to be open.
+    /// That is the wrong answer for a remote desktop: the frame of video
+    /// nobody will notice is missing gets the same bandwidth as the
+    /// keystroke the user is waiting to see echoed, and a file transfer
+    /// gets as much as both.
+    ///
+    /// So the ordering is by what a person notices soonest. Input first,
+    /// because latency there is the whole feel of the session and the
+    /// messages are a few bytes. Control next, since it carries the
+    /// requests that repair everything else. Then video, with keyframes
+    /// ahead of the frames that depend on them — a keyframe is ten to a
+    /// hundred times larger than its neighbours, and sharing fairly means
+    /// finishing last, long after the frames it was meant to anchor have
+    /// been given up on. Clipboard and file transfer come last: they are
+    /// bulk, and bulk can wait for a gap.
+    ///
+    /// Audio is absent because it rides datagrams, which QUIC schedules
+    /// ahead of stream data already.
+    #[must_use]
+    pub const fn priority(self) -> u8 {
+        match self {
+            Channel::Input => 40,
+            Channel::Control => 30,
+            Channel::Video => 20,
+            Channel::Clipboard => 10,
+            Channel::File => 0,
+            // Never opens a stream; the value is unused.
+            Channel::Audio => 20,
+        }
+    }
 }
+
+/// The priority of a video keyframe, which outranks the frames around it.
+pub const KEYFRAME_PRIORITY: u8 = 25;
 
 #[cfg(test)]
 mod tests {
@@ -126,5 +163,14 @@ mod tests {
             .filter(|c| c.is_unreliable())
             .collect();
         assert_eq!(unreliable, vec![Channel::Audio]);
+    }
+
+    #[test]
+    fn what_a_person_notices_first_is_sent_first() {
+        assert!(Channel::Input.priority() > Channel::Control.priority());
+        assert!(Channel::Control.priority() > KEYFRAME_PRIORITY);
+        assert!(KEYFRAME_PRIORITY > Channel::Video.priority());
+        assert!(Channel::Video.priority() > Channel::Clipboard.priority());
+        assert!(Channel::Clipboard.priority() > Channel::File.priority());
     }
 }

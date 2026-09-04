@@ -1,6 +1,11 @@
 //! Carrier framing.
 //!
-//! Two shapes exist and both start with the 4-byte little-endian channel id:
+//! Two shapes exist and both start with the same 4-byte prefix: a
+//! little-endian `u16` channel id, then a one-byte urgency, then a reserved
+//! byte. The urgency is deliberately in the clear: the relay copies streams
+//! it cannot read, and without it every stream would be forwarded at the same
+//! standing and the scheduling decided at each end would be undone in the
+//! middle.
 //!
 //! * **Per-message carriers** (video frames, file/clipboard transfers,
 //!   datagrams) hold exactly one sealed record; the stream FIN or the datagram
@@ -12,17 +17,18 @@ use ndp_proto::Channel;
 
 use crate::{Result, TransportError};
 
-/// Bytes of channel id at the head of every carrier.
+/// Bytes of channel id and urgency at the head of every carrier.
 pub(crate) const CHANNEL_PREFIX_LEN: usize = 4;
 /// Bytes of length prefix in front of each record on a long-lived carrier.
 pub(crate) const LENGTH_PREFIX_LEN: usize = 4;
 
-pub(crate) fn channel_prefix(channel: Channel) -> [u8; CHANNEL_PREFIX_LEN] {
-    channel.id().to_le_bytes()
+pub(crate) fn channel_prefix(channel: Channel, urgency: u8) -> [u8; CHANNEL_PREFIX_LEN] {
+    let id = (channel.id() as u16).to_le_bytes();
+    [id[0], id[1], urgency, 0]
 }
 
 pub(crate) fn parse_channel(bytes: &[u8; CHANNEL_PREFIX_LEN]) -> Result<Channel> {
-    let id = u32::from_le_bytes(*bytes);
+    let id = u32::from(u16::from_le_bytes([bytes[0], bytes[1]]));
     Channel::from_id(id).map_err(|_| TransportError::UnknownChannel(id))
 }
 
@@ -50,14 +56,26 @@ mod tests {
     #[test]
     fn channel_prefix_roundtrips() {
         for ch in Channel::ALL {
-            assert_eq!(parse_channel(&channel_prefix(ch)).unwrap(), ch);
+            assert_eq!(parse_channel(&channel_prefix(ch, 7)).unwrap(), ch);
         }
+    }
+
+    #[test]
+    fn urgency_travels_beside_the_channel_and_is_readable_without_the_key() {
+        let prefix = channel_prefix(Channel::Video, 25);
+        assert_eq!(ndp_transport_urgency(&prefix), 25);
+        assert_eq!(parse_channel(&prefix).unwrap(), Channel::Video);
+    }
+
+    /// The relay reads urgency straight out of the prefix; this mirrors it.
+    fn ndp_transport_urgency(prefix: &[u8; CHANNEL_PREFIX_LEN]) -> u8 {
+        prefix[2]
     }
 
     #[test]
     fn unknown_channel_prefix_is_rejected() {
         assert!(matches!(
-            parse_channel(&99u32.to_le_bytes()),
+            parse_channel(&[99, 0, 0, 0]),
             Err(TransportError::UnknownChannel(99))
         ));
     }
