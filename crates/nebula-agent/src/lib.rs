@@ -18,7 +18,8 @@ pub mod media;
 pub mod platform;
 pub mod session;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ndp_crypto::StaticKeypair;
@@ -26,7 +27,8 @@ use ndp_signal::{AgentHello, AgentHelloAck, AgentMessage, GatewayMessage};
 use ndp_transport::{
     client_endpoint, connect, CertificateFingerprint, TransportConfig, ALPN_AGENT_GATEWAY,
 };
-use tokio::sync::mpsc;
+use nebula_common::SessionId;
+use tokio::sync::{mpsc, oneshot};
 
 pub use identity::Identity;
 pub use manager::ManagerClient;
@@ -51,6 +53,13 @@ pub struct Agent {
     keys: StaticKeypair,
     manager: ManagerClient,
     platform: Arc<dyn Platform>,
+    /// Sessions currently being served, and how to end each one.
+    ///
+    /// Without this the gateway can ask for a session to stop and be
+    /// ignored, which turns revoking someone's access into a suggestion.
+    /// It is also the only honest answer to a heartbeat asking what this
+    /// machine is doing.
+    sessions: Arc<Mutex<HashMap<SessionId, oneshot::Sender<String>>>>,
 }
 
 impl Agent {
@@ -63,6 +72,7 @@ impl Agent {
             keys,
             manager,
             platform,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -124,13 +134,36 @@ impl Agent {
         )
         .await?;
 
-        let heartbeat = match ndp_signal::read_message::<AgentHelloAck>(&mut recv).await? {
-            AgentHelloAck::Accepted { heartbeat_secs, .. } => Duration::from_secs(heartbeat_secs),
-            AgentHelloAck::Rejected { reason } => {
-                anyhow::bail!("the gateway refused this machine: {reason}")
-            }
-        };
+        let (gateway_id, heartbeat) =
+            match ndp_signal::read_message::<AgentHelloAck>(&mut recv).await? {
+                AgentHelloAck::Accepted {
+                    gateway_id,
+                    heartbeat_secs,
+                } => (gateway_id, Duration::from_secs(heartbeat_secs)),
+                AgentHelloAck::Rejected { reason } => {
+                    anyhow::bail!("the gateway refused this machine: {reason}")
+                }
+            };
         tracing::info!(gateway = %assignment.id, addr = %assignment.quic_addr, "control tunnel attached");
+
+        // The manager decides whether this machine may be offered to anyone,
+        // and it decides that from a clock. The gateway marks the machine as
+        // draining when this tunnel drops, but nothing was telling the
+        // manager the machine is still here, so every machine went offline
+        // once the liveness grace period elapsed and could not be reached
+        // again until it reconnected.
+        let manager = self.manager.clone();
+        let liveness = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(heartbeat);
+            loop {
+                ticker.tick().await;
+                if let Err(error) = manager.heartbeat("ONLINE", Some(gateway_id)).await {
+                    // Losing one heartbeat is survivable; the grace period is
+                    // several intervals wide.
+                    tracing::warn!(%error, "could not report liveness to the manager");
+                }
+            }
+        });
 
         let (outbound, mut queue) = mpsc::channel::<AgentMessage>(TUNNEL_QUEUE);
 
@@ -148,13 +181,14 @@ impl Agent {
         });
 
         let beats = outbound.clone();
+        let live = Arc::clone(&self.sessions);
         let beat_task = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(heartbeat);
             loop {
                 ticker.tick().await;
                 if beats
                     .send(AgentMessage::Heartbeat {
-                        active_sessions: Vec::new(),
+                        active_sessions: active(&live),
                     })
                     .await
                     .is_err()
@@ -167,6 +201,7 @@ impl Agent {
         let result = self.read_tunnel(&mut recv, &outbound).await;
 
         beat_task.abort();
+        liveness.abort();
         writer.abort();
         conn.close(0u32.into(), b"agent detaching");
         result
@@ -192,9 +227,22 @@ impl Agent {
                     let keys = self.keys.clone();
                     let platform = Arc::clone(&self.platform);
                     let reply = outbound.clone();
+                    let registry = Arc::clone(&self.sessions);
+                    let (stop, stopped) = oneshot::channel();
+                    registry
+                        .lock()
+                        .expect("the session registry is not poisoned")
+                        .insert(request.session, stop);
                     tokio::spawn(async move {
                         let session = request.session;
-                        match session::serve(request, keys, platform).await {
+                        let served = session::serve(request, keys, platform, stopped).await;
+                        // However it ended, it is no longer running, and a
+                        // stale entry would make the next heartbeat lie.
+                        registry
+                            .lock()
+                            .expect("the session registry is not poisoned")
+                            .remove(&session);
+                        match served {
                             Ok(tally) => {
                                 let _ = reply
                                     .send(AgentMessage::SessionClosed {
@@ -221,18 +269,41 @@ impl Agent {
 
                 GatewayMessage::StopSession { session, reason } => {
                     tracing::info!(%session, %reason, "the gateway asked to stop a session");
+                    let stop = self
+                        .sessions
+                        .lock()
+                        .expect("the session registry is not poisoned")
+                        .remove(&session);
+                    match stop {
+                        Some(stop) => {
+                            let _ = stop.send(reason);
+                        }
+                        // Already finished, or never started here. Either
+                        // way the gateway's intent is satisfied.
+                        None => tracing::debug!(%session, "no such session is running"),
+                    }
                 }
 
                 GatewayMessage::Ping => {
                     let _ = outbound
                         .send(AgentMessage::Heartbeat {
-                            active_sessions: Vec::new(),
+                            active_sessions: active(&self.sessions),
                         })
                         .await;
                 }
             }
         }
     }
+}
+
+/// The sessions this machine is serving right now.
+fn active(sessions: &Mutex<HashMap<SessionId, oneshot::Sender<String>>>) -> Vec<SessionId> {
+    sessions
+        .lock()
+        .expect("the session registry is not poisoned")
+        .keys()
+        .copied()
+        .collect()
 }
 
 /// Turn a configured `host:port` into an address to dial.

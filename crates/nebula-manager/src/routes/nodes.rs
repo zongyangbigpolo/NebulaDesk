@@ -293,7 +293,22 @@ pub async fn report_session(
     .await?;
 
     if result.rows_affected() == 0 {
-        return Err(ApiError::NotFound("session"));
+        // A session ending produces a report from both ends: the gateway
+        // notices the client go, and the machine reports what it served.
+        // Whichever arrives second finds the row already final. That is the
+        // system working, so treat it as done rather than as a missing
+        // session an operator should investigate.
+        let already_final: Option<(String,)> = sqlx::query_as(&format!(
+            "SELECT state FROM sessions WHERE id = $1 AND {column} = $2"
+        ))
+        .bind(id)
+        .bind(node.id)
+        .fetch_optional(&state.db)
+        .await?;
+        return match already_final {
+            Some((state,)) if state == "CLOSED" || state == "FAILED" => Ok(StatusCode::NO_CONTENT),
+            _ => Err(ApiError::NotFound("session")),
+        };
     }
     Ok(StatusCode::NO_CONTENT)
 }

@@ -25,6 +25,16 @@ pub struct Connected {
     pub session: Session,
     /// Receive side: video, audio, and control from the agent.
     pub incoming: SessionReceiver,
+    /// The signalling connection to the gateway, held open deliberately.
+    ///
+    ///
+    /// The gateway treats this connection closing as the client having gone
+    /// away, and tells the agent to tear the session down. Dropping it after
+    /// the ticket was redeemed would end the session almost as soon as it
+    /// started, so it lives exactly as long as the session does.
+    /// Keep it bound for the life of the session; dropping it early is
+    /// indistinguishable, to the gateway, from the user closing the window.
+    pub gateway: quinn::Connection,
 }
 
 /// Redeem a ticket and come back with an encrypted session.
@@ -41,7 +51,7 @@ pub async fn connect_to_agent(ticket: &SessionTicket) -> anyhow::Result<Connecte
     )
     .map_err(|_| anyhow::anyhow!("the manager named an agent key that is not a public key"))?;
 
-    let accepted = redeem(ticket, &keys, &config).await?;
+    let (accepted, gateway) = redeem(ticket, &keys, &config).await?;
     if accepted.agent_key != ticket.agent_key {
         // The manager and the gateway must agree about who is being reached.
         // They are separate services and a disagreement means one of them is
@@ -88,7 +98,11 @@ pub async fn connect_to_agent(ticket: &SessionTicket) -> anyhow::Result<Connecte
             })?;
     tracing::debug!(greeting = %String::from_utf8_lossy(&greeting), "the agent accepted the session");
 
-    Ok(Connected { session, incoming })
+    Ok(Connected {
+        session,
+        incoming,
+        gateway,
+    })
 }
 
 /// What the gateway hands back when it accepts a ticket.
@@ -105,7 +119,7 @@ async fn redeem(
     ticket: &SessionTicket,
     keys: &StaticKeypair,
     config: &TransportConfig,
-) -> anyhow::Result<Accepted> {
+) -> anyhow::Result<(Accepted, quinn::Connection)> {
     let conn = dial(
         &ticket.gateway_addr,
         &ticket.gateway_pin,
@@ -126,9 +140,6 @@ async fn redeem(
     .await?;
 
     let ack = ndp_signal::read_message::<ClientHelloAck>(&mut recv).await?;
-    // The gateway's answer is complete; holding the connection open would
-    // only keep a socket the rest of this never uses.
-    conn.close(0u32.into(), b"done");
 
     match ack {
         ClientHelloAck::Accepted {
@@ -137,13 +148,16 @@ async fn redeem(
             relay_pin,
             pair_token,
             agent_key,
-        } => Ok(Accepted {
-            session,
-            relay_addr,
-            relay_pin,
-            pair_token,
-            agent_key,
-        }),
+        } => Ok((
+            Accepted {
+                session,
+                relay_addr,
+                relay_pin,
+                pair_token,
+                agent_key,
+            },
+            conn,
+        )),
         ClientHelloAck::Rejected { reason } => {
             anyhow::bail!("the gateway refused this session: {reason}")
         }

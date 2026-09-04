@@ -39,6 +39,10 @@ struct Deployment {
 
 impl Deployment {
     async fn start() -> Self {
+        Self::with_heartbeat(Duration::from_secs(20)).await
+    }
+
+    async fn with_heartbeat(heartbeat: Duration) -> Self {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let db = std::env::var("NEBULA_TEST_DATABASE_URL")
             .unwrap_or_else(|_| "postgres:///nebula_manager_test".into());
@@ -107,6 +111,7 @@ impl Deployment {
             bootstrap_secret: Some(BOOTSTRAP.into()),
             region: region.clone(),
             pair_secret,
+            heartbeat,
             ..GatewayConfig::default()
         })
         .await
@@ -176,6 +181,82 @@ impl Deployment {
         assert!(status.is_success(), "GET {path} -> {status}: {text}");
         serde_json::from_str(&text).unwrap_or(Value::Null)
     }
+}
+
+/// The manager decides whether a machine may be offered from `last_seen_at`,
+/// so an agent that never reports goes offline while it is plainly running,
+/// and stays unreachable until something restarts it.
+#[tokio::test]
+async fn an_attached_agent_keeps_reporting_that_it_is_alive() {
+    let deployment = Deployment::with_heartbeat(Duration::from_secs(1)).await;
+    let name = format!("mac-{}", Uuid::now_v7().simple());
+    let region = deployment.region.clone();
+    let token = deployment
+        .post(
+            "/v1/machines/enrollment-tokens",
+            Some(&deployment.owner_token),
+            json!({ "machine_name": name, "region": region }),
+        )
+        .await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let dir = tempfile::tempdir().unwrap();
+    let identity = enroll(
+        &deployment.manager_url,
+        &token,
+        &name,
+        &dir.path().join("agent.json"),
+    )
+    .await
+    .unwrap();
+    let machine = identity.machine_id;
+    let agent = Agent::new(identity, Arc::new(TestPattern)).unwrap();
+    tokio::spawn(async move { agent.run().await });
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while deployment.gateway.tunnels().is_empty().await {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the agent should attach");
+
+    let seen_at = |deployment: &Deployment| {
+        let token = deployment.owner_token.clone();
+        let url = deployment.manager_url.clone();
+        let http = deployment.http.clone();
+        async move {
+            let machines: Value = http
+                .get(format!("{url}/v1/machines"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            machines
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["id"] == machine.to_string())
+                .expect("the enrolled machine should be listed")["last_seen_at"]
+                .as_str()
+                .expect("an attached machine has been seen")
+                .to_string()
+        }
+    };
+
+    let first = seen_at(&deployment).await;
+    // Several heartbeat intervals, so a single missed one does not fail this.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let later = seen_at(&deployment).await;
+    assert!(
+        later > first,
+        "the agent should keep reporting liveness: {first} then {later}"
+    );
 }
 
 #[tokio::test]

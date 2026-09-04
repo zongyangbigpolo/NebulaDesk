@@ -15,7 +15,7 @@ use ndp_transport::{
     client_endpoint, connect, CertificateFingerprint, Incoming, Session, SessionReceiver,
     TransportConfig, ALPN_RELAY,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::media::{EncodedFrame, Platform, VideoConfig};
 
@@ -52,6 +52,7 @@ pub async fn serve(
     request: SessionRequest,
     keys: StaticKeypair,
     platform: Arc<dyn Platform>,
+    stop: oneshot::Receiver<String>,
 ) -> anyhow::Result<Tally> {
     let expected = PublicKey::from_slice(
         &hex::decode(&request.client_key)
@@ -121,7 +122,7 @@ pub async fn serve(
     }
 
     tracing::info!(session = %request.session, "session established");
-    let tally = pump(&request, session, receiver, platform).await;
+    let tally = pump(&request, session, receiver, platform, stop).await;
     Ok(tally)
 }
 
@@ -131,6 +132,7 @@ async fn pump(
     session: Session,
     mut receiver: SessionReceiver,
     platform: Arc<dyn Platform>,
+    mut stop: oneshot::Receiver<String>,
 ) -> Tally {
     let mut tally = Tally::default();
 
@@ -176,6 +178,17 @@ async fn pump(
                         break;
                     }
                 }
+            }
+
+            reason = &mut stop => {
+                // The gateway revoked this session: entitlement withdrawn,
+                // an administrator ending it, or the client having gone.
+                // Closing with the reason means the client can say why the
+                // window went away instead of showing a network error.
+                let reason = reason.unwrap_or_else(|_| "the session was ended".into());
+                tracing::info!(session = %request.session, %reason, "ending the session");
+                session.close(0x22, reason.as_bytes());
+                break;
             }
 
             message = receiver.recv() => {

@@ -14,6 +14,7 @@
 //! would convert a brief hiccup into permanent latency.
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ndp_proto::{Channel, InputEvent, InputKind, MouseButton, MsgHeader, MsgKind};
 use winit::application::ApplicationHandler;
@@ -258,6 +259,9 @@ async fn pump(
     let crate::Connected {
         session,
         mut incoming,
+        // Bound, not dropped: this is what tells the gateway the client is
+        // still here. Discarding it ends the session immediately.
+        gateway,
     } = connected;
 
     let mut decoder = match video::decoder() {
@@ -270,16 +274,28 @@ async fn pump(
 
     tracing::info!(session = %ticket.session_id, "connected");
     let mut seq: u32 = 0;
+    let mut stats = Stats::new();
+    let mut report = tokio::time::interval(Stats::EVERY);
+    report.tick().await;
 
     loop {
         tokio::select! {
+            _ = report.tick() => {
+                // On a timer rather than per frame: a session receiving
+                // nothing at all is exactly the one worth knowing about, and
+                // it is the one that would never reach a per-frame report.
+                stats.report();
+            }
+
             message = incoming.recv() => {
                 let Some(Ok(message)) = message else { break };
                 if message.channel != Channel::Video {
                     continue;
                 }
+                stats.frame(message.payload.len());
                 match decoder.decode(&message.payload) {
                     Ok(Some(picture)) => {
+                        stats.decoded(picture.width, picture.height);
                         if let Ok(mut slot) = mailbox.lock() {
                             *slot = Some(picture);
                         }
@@ -332,6 +348,60 @@ async fn pump(
         .send(Channel::Control, MsgHeader::new(MsgKind::Bye, seq, 0), b"")
         .await;
     session.close(0, b"closed by the user");
+    // Only now: while this is held the gateway believes the client is still
+    // here, and saying goodbye properly matters more than releasing it early.
+    drop(gateway);
+}
+
+/// A periodic account of what is actually arriving.
+///
+/// Without it, "the window is black" and "no frames are being sent" and "the
+/// frames arrive but do not decode" all look identical from the outside, and
+/// they need completely different fixes.
+struct Stats {
+    since: Instant,
+    frames: u32,
+    decoded: u32,
+    bytes: usize,
+    size: (u32, u32),
+}
+
+impl Stats {
+    /// How often the session reports what it is receiving.
+    pub const EVERY: Duration = Duration::from_secs(5);
+
+    fn new() -> Self {
+        Self {
+            since: Instant::now(),
+            frames: 0,
+            decoded: 0,
+            bytes: 0,
+            size: (0, 0),
+        }
+    }
+
+    fn frame(&mut self, bytes: usize) {
+        self.frames += 1;
+        self.bytes += bytes;
+    }
+
+    fn decoded(&mut self, width: u32, height: u32) {
+        self.decoded += 1;
+        self.size = (width, height);
+    }
+
+    fn report(&mut self) {
+        let seconds = self.since.elapsed().as_secs_f64();
+        tracing::info!(
+            fps = format!("{:.1}", f64::from(self.decoded) / seconds),
+            kbps = format!("{:.0}", (self.bytes as f64 * 8.0 / 1000.0) / seconds),
+            width = self.size.0,
+            height = self.size.1,
+            dropped = self.frames - self.decoded,
+            "video"
+        );
+        *self = Self::new();
+    }
 }
 
 /// Drop pointer moves that a later move in the same batch supersedes.

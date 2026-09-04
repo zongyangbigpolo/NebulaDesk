@@ -934,6 +934,28 @@ async fn a_gateway_reports_session_progress() {
     assert_eq!(listed[0]["state"], "CLOSED");
     // Counters are cumulative; a late, smaller report must not rewind them.
     assert_eq!(listed[0]["bytes_down"], 4096);
+
+    // Both ends of a session report it ending, so the second report always
+    // finds the row already closed. Answering that with "no such session"
+    // would fill an operator's logs with alarming, meaningless errors.
+    app.post(
+        &format!("/v1/sessions/{session}/report"),
+        None,
+        json!({ "state": "CLOSED", "reason": "agent_finished" }),
+    )
+    .with_node(&credential)
+    .await
+    .expect_status(StatusCode::NO_CONTENT);
+
+    // A session that genuinely is not there still says so.
+    app.post(
+        &format!("/v1/sessions/{}/report", Uuid::now_v7()),
+        None,
+        json!({ "state": "CLOSED" }),
+    )
+    .with_node(&credential)
+    .await
+    .expect_status(StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

@@ -139,6 +139,61 @@ impl Relay {
         })
     }
 
+    /// Register with a manager and start reporting liveness.
+    ///
+    /// A relay cannot be provisioned with its credential ahead of time: the
+    /// manager has to be told the address and certificate pin this process
+    /// actually ended up with, and only then can it issue one. Binding first
+    /// and registering second is the only order that works, and doing it here
+    /// means an operator never has to read a fingerprint out of a log and
+    /// post it by hand.
+    ///
+    /// `advertised` is what peers will be told to dial. An empty value means
+    /// whatever address was actually bound, which is the only sensible
+    /// reading when the port was left to the kernel.
+    pub async fn register(
+        self,
+        manager_url: &str,
+        bootstrap_secret: &str,
+        name: &str,
+        advertised: &str,
+        region: &str,
+        heartbeat: Duration,
+    ) -> anyhow::Result<Self> {
+        let advertised = if advertised.is_empty() {
+            self.local_addr()?.to_string()
+        } else {
+            advertised.to_string()
+        };
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+        let response = http
+            .post(format!("{}/v1/relays", manager_url.trim_end_matches('/')))
+            .bearer_auth(bootstrap_secret)
+            .json(&serde_json::json!({
+                "name": name,
+                "quic_addr": advertised,
+                "cert_pin": self.fingerprint,
+                "region": region,
+            }))
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::ensure!(
+            status.is_success(),
+            "the manager refused this relay's registration: {status}: {body}"
+        );
+        let registered: serde_json::Value = serde_json::from_str(&body)?;
+        let credential = registered["credential"].as_str().ok_or_else(|| {
+            anyhow::anyhow!("the manager registered this relay but issued no credential")
+        })?;
+
+        info!(%name, %advertised, "registered with the manager");
+        self.with_liveness(manager_url, credential, heartbeat)
+    }
+
     /// Report liveness to a manager, using a credential obtained after bind.
     ///
     /// Registration is inherently a chicken-and-egg: the manager must be told

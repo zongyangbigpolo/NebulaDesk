@@ -15,7 +15,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ndp_proto::{Channel, MsgFlags};
+use ndp_proto::{Channel, MsgFlags, MsgHeader, MsgKind};
 use nebula_agent::{enroll, Agent, TestPattern};
 use nebula_client::ManagerClient;
 use nebula_gateway::{Config as GatewayConfig, Gateway};
@@ -274,6 +274,67 @@ async fn the_shipped_client_reaches_a_real_agent() {
     .expect("the agent should send video");
     assert!(first.header.flags.contains(MsgFlags::KEYFRAME));
     assert!(!first.payload.is_empty());
+}
+
+/// The gateway learns that a client has gone by watching the signalling
+/// connection close, so a client that redeems its ticket and then drops that
+/// connection has told the gateway it left. The session then dies seconds
+/// after it starts, which looks like a network fault and is not one.
+#[tokio::test]
+async fn a_session_outlives_the_ticket_redemption() {
+    let deployment = Deployment::start().await;
+    let name = format!("mac-{}", Uuid::now_v7().simple());
+    let resource_id = deployment.publish_a_desktop(&name).await;
+
+    let client = ManagerClient::login(
+        &deployment.manager_url,
+        &deployment.slug,
+        "owner@acme.test",
+        PASSWORD,
+    )
+    .await
+    .unwrap();
+    let ticket = client.open(&resource_id).await.unwrap();
+    let connected = nebula_client::connect_to_agent(&ticket).await.unwrap();
+    let nebula_client::Connected {
+        session,
+        mut incoming,
+        gateway,
+    } = connected;
+
+    // Long enough that a teardown triggered by redemption would have landed.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // A round trip, not an arriving frame: frames already queued would keep
+    // arriving for a while after the agent stopped serving, so they prove
+    // nothing about whether the session is still there.
+    session
+        .send(
+            Channel::Control,
+            MsgHeader::new(MsgKind::Ping, 0, 0),
+            b"alive?",
+        )
+        .await
+        .expect("the session must still be open two seconds in");
+
+    let pong = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let message = incoming
+                .recv()
+                .await
+                .expect("the session must not have been torn down")
+                .unwrap();
+            if message.header.kind == MsgKind::Pong {
+                return message;
+            }
+        }
+    })
+    .await;
+    assert!(
+        pong.is_ok(),
+        "the agent should still answer two seconds into a session"
+    );
+    drop(gateway);
 }
 
 #[tokio::test]

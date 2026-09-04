@@ -154,19 +154,24 @@ impl VideoSource for MacVideo {
             .name("nebula-capture".into())
             .spawn(move || {
                 let encoder = match encoder_for(width, height, config.fps, config.bitrate) {
-                    Ok(encoder) => {
-                        let _ = ready.send(Ok(()));
-                        encoder
-                    }
+                    Ok(encoder) => encoder,
                     Err(error) => {
                         let _ = ready.send(Err(error));
                         return;
                     }
                 };
+                // Only now is capture actually running. Reporting success
+                // before this point meant a stream that refused to start
+                // produced a session that connected, showed nothing, and
+                // reported no error anywhere the operator would look.
                 if let Err(error) = stream.start_capture() {
-                    tracing::error!(?error, "ScreenCaptureKit would not start");
+                    let _ = ready.send(Err(anyhow::anyhow!(
+                        "{}: ScreenCaptureKit would not start: {error:?}",
+                        PERMISSION
+                    )));
                     return;
                 }
+                let _ = ready.send(Ok(()));
                 pump(
                     Capture {
                         encoder,
@@ -242,6 +247,9 @@ fn pump(
     let started = Instant::now();
     // The first frame a client sees must be decodable on its own.
     let mut force_key = true;
+    // The most recent frame, kept so a keyframe can be produced without
+    // waiting for the screen to change.
+    let mut last: Option<CMSampleBuffer> = None;
 
     loop {
         // Waking periodically rather than blocking outright is what makes
@@ -252,13 +260,29 @@ fn pump(
         let sample = match incoming.recv_timeout(WAKE) {
             Ok(sample) => sample,
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                if !running.load(Ordering::Relaxed) || sink.is_closed() {
+                    return;
+                }
                 // A screen that is not changing produces no frames, which is
                 // the desired behaviour and not a fault: the client already
                 // shows the last one.
-                if running.load(Ordering::Relaxed) && !sink.is_closed() {
+                //
+                // Except when the client has asked for a keyframe, which it
+                // does when it could not decode something. Waiting for the
+                // screen to move would leave it black for as long as nobody
+                // touches the machine — which, on an idle desktop, is
+                // indefinitely. Re-encoding the last frame costs one
+                // keyframe and ends the blackout immediately.
+                if !keyframe.swap(false, Ordering::Relaxed) {
                     continue;
                 }
-                return;
+                let Some(sample) = last.as_ref() else {
+                    continue;
+                };
+                if !encode(&mut capture, sample, true, sink, started) {
+                    return;
+                }
+                continue;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         };
@@ -283,45 +307,60 @@ fn pump(
             }
         }
 
-        let options = EncodeOptions {
-            force_key_frame: force_key || keyframe.swap(false, Ordering::Relaxed),
-        };
+        let wanted_key = force_key || keyframe.swap(false, Ordering::Relaxed);
         force_key = false;
-
-        let buffer = sample.image_buffer_ptr();
-        if buffer.is_null() {
-            continue;
+        if !encode(&mut capture, &sample, wanted_key, sink, started) {
+            return;
         }
-        // SAFETY: the pointer comes straight from a live CMSampleBuffer that
-        // outlives this call, and the stream was configured with the same
-        // dimensions and pixel format the encoder was built for.
-        if let Err(error) = unsafe { capture.encoder.encode_pixel_buffer(buffer, &options) } {
-            tracing::warn!(?error, "the encoder rejected a frame");
-            continue;
-        }
-        drop(sample);
+        last = Some(sample);
+    }
+}
 
-        loop {
-            match capture.encoder.next_frame() {
-                Ok(Some(frame)) => {
-                    let data = avcc(&frame);
-                    if data.is_empty() {
-                        continue;
-                    }
-                    let encoded = EncodedFrame {
-                        keyframe: frame.keyframe,
-                        timestamp_us: started.elapsed().as_micros() as u64,
-                        data,
-                    };
-                    if sink.try_send(encoded).is_err() && sink.is_closed() {
-                        return;
-                    }
+/// Encode one frame and forward whatever comes out. Returns false when the
+/// session has gone and the loop should end.
+fn encode(
+    capture: &mut Capture,
+    sample: &CMSampleBuffer,
+    force_key_frame: bool,
+    sink: &FrameSink,
+    started: Instant,
+) -> bool {
+    let buffer = sample.image_buffer_ptr();
+    if buffer.is_null() {
+        return true;
+    }
+    // SAFETY: the pointer comes straight from a live CMSampleBuffer that
+    // outlives this call, and the stream was configured with the same
+    // dimensions and pixel format the encoder was built for.
+    if let Err(error) = unsafe {
+        capture
+            .encoder
+            .encode_pixel_buffer(buffer, &EncodeOptions { force_key_frame })
+    } {
+        tracing::warn!(?error, "the encoder rejected a frame");
+        return true;
+    }
+
+    loop {
+        match capture.encoder.next_frame() {
+            Ok(Some(frame)) => {
+                let data = avcc(&frame);
+                if data.is_empty() {
+                    continue;
                 }
-                Ok(None) => break,
-                Err(error) => {
-                    tracing::warn!(?error, "the encoder failed");
-                    return;
+                let encoded = EncodedFrame {
+                    keyframe: frame.keyframe,
+                    timestamp_us: started.elapsed().as_micros() as u64,
+                    data,
+                };
+                if sink.try_send(encoded).is_err() && sink.is_closed() {
+                    return false;
                 }
+            }
+            Ok(None) => return true,
+            Err(error) => {
+                tracing::warn!(?error, "the encoder failed");
+                return false;
             }
         }
     }
