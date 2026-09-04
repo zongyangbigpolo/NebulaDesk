@@ -19,6 +19,12 @@ fn main() -> anyhow::Result<()> {
     use nebula_agent::media::InputInjector;
     use nebula_agent::platform::macos::input::MacInput;
 
+    // Ask macOS to put up its own dialog if the permission is missing. This
+    // is what registers the binary in System Settings → Accessibility, so
+    // there is a row to switch on: the list will not offer a binary it has
+    // never been asked about.
+    prompt_for_accessibility();
+
     let before = pointer();
     println!("pointer starts at {before:?}");
 
@@ -104,5 +110,63 @@ fn display_size() -> (f64, f64) {
             cg::CGDisplayPixelsWide(display) as f64,
             cg::CGDisplayPixelsHigh(display) as f64,
         )
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(non_camel_case_types, non_upper_case_globals)]
+mod ax {
+    pub type CFTypeRef = *const std::ffi::c_void;
+    pub type CFStringRef = *const std::ffi::c_void;
+    pub type CFDictionaryRef = *const std::ffi::c_void;
+    pub type CFAllocatorRef = *const std::ffi::c_void;
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {
+        pub static kAXTrustedCheckOptionPrompt: CFStringRef;
+        pub fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> bool;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        pub static kCFBooleanTrue: CFTypeRef;
+        pub static kCFTypeDictionaryKeyCallBacks: std::ffi::c_void;
+        pub static kCFTypeDictionaryValueCallBacks: std::ffi::c_void;
+        pub fn CFDictionaryCreate(
+            allocator: CFAllocatorRef,
+            keys: *const CFTypeRef,
+            values: *const CFTypeRef,
+            count: isize,
+            key_callbacks: *const std::ffi::c_void,
+            value_callbacks: *const std::ffi::c_void,
+        ) -> CFDictionaryRef;
+        pub fn CFRelease(cf: CFTypeRef);
+    }
+}
+
+/// Ask for Accessibility, showing the system dialog when it is missing.
+#[cfg(target_os = "macos")]
+fn prompt_for_accessibility() {
+    // SAFETY: a one-entry dictionary built from Core Foundation's own
+    // constants, handed straight back to Core Foundation and released.
+    unsafe {
+        let keys = [ax::kAXTrustedCheckOptionPrompt as ax::CFTypeRef];
+        let values = [ax::kCFBooleanTrue];
+        let options = ax::CFDictionaryCreate(
+            std::ptr::null(),
+            keys.as_ptr(),
+            values.as_ptr(),
+            1,
+            std::ptr::addr_of!(ax::kCFTypeDictionaryKeyCallBacks).cast(),
+            std::ptr::addr_of!(ax::kCFTypeDictionaryValueCallBacks).cast(),
+        );
+        let trusted = ax::AXIsProcessTrustedWithOptions(options);
+        ax::CFRelease(options);
+        if !trusted {
+            println!(
+                "macOS should now be showing a dialog. Switch this binary on \
+                 in System Settings, then run the probe again."
+            );
+        }
     }
 }
