@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use screencapturekit::cm::CMSampleBuffer;
+use screencapturekit::cv::CVPixelBuffer;
 use screencapturekit::shareable_content::SCShareableContent;
 use screencapturekit::stream::configuration::pixel_format::PixelFormat as ScPixelFormat;
 use screencapturekit::stream::configuration::SCStreamConfiguration;
@@ -325,17 +326,21 @@ fn encode(
     sink: &FrameSink,
     started: Instant,
 ) -> bool {
-    let buffer = sample.image_buffer_ptr();
-    if buffer.is_null() {
+    // `image_buffer_ptr` is named for CMSampleBufferGetImageBuffer, but the
+    // bridge underneath hands back a +1 reference. Nothing here owns it
+    // otherwise, and every leaked frame is one of the stream's fixed pool of
+    // `QUEUE_DEPTH` surfaces: leak them all and ScreenCaptureKit quietly stops
+    // delivering, which looks exactly like a screen that froze.
+    let Some(buffer) = CVPixelBuffer::from_raw(sample.image_buffer_ptr()) else {
         return true;
-    }
+    };
     // SAFETY: the pointer comes straight from a live CMSampleBuffer that
     // outlives this call, and the stream was configured with the same
     // dimensions and pixel format the encoder was built for.
     if let Err(error) = unsafe {
         capture
             .encoder
-            .encode_pixel_buffer(buffer, &EncodeOptions { force_key_frame })
+            .encode_pixel_buffer(buffer.as_ptr(), &EncodeOptions { force_key_frame })
     } {
         tracing::warn!(?error, "the encoder rejected a frame");
         return true;
@@ -493,5 +498,61 @@ mod tests {
         assert!(!differs_materially(10_000_000, 9_500_000));
         assert!(differs_materially(10_000_000, 5_000_000));
         assert!(differs_materially(10_000_000, 20_000_000));
+    }
+
+    /// Capture must keep going indefinitely, not stop once it has handed out
+    /// as many frames as the stream's surface pool holds.
+    ///
+    /// This is the shape of a real bug: every encoded frame leaked one of the
+    /// `QUEUE_DEPTH` surfaces ScreenCaptureKit recycles, so the stream
+    /// delivered exactly `QUEUE_DEPTH` frames and then went silent with no
+    /// error anywhere. A client saw one still image and nothing after it.
+    ///
+    /// Needs a real display and Screen Recording permission, so it is not part
+    /// of the normal run. On a machine with both:
+    ///
+    /// ```text
+    /// cargo test -p nebula-agent --release -- --ignored capture_outlives
+    /// ```
+    #[test]
+    #[ignore = "needs a display and Screen Recording permission"]
+    fn capture_outlives_the_surface_pool() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(QUEUE_DEPTH as usize);
+        let mut video = MacVideo::new();
+        video
+            .start(
+                VideoConfig {
+                    width: 1280,
+                    height: 720,
+                    fps: 30,
+                    bitrate: 4_000_000,
+                },
+                tx,
+            )
+            .expect("capture should start");
+
+        // Comfortably more than the pool, and enough time that a screen which
+        // simply is not changing still produces them.
+        let wanted = QUEUE_DEPTH as usize * 3;
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let seen = runtime.block_on(async {
+            let mut seen = 0;
+            while seen < wanted {
+                let next =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await;
+                match next {
+                    Ok(Some(_)) => seen += 1,
+                    _ => break,
+                }
+            }
+            seen
+        });
+        video.stop();
+
+        assert!(
+            seen >= wanted,
+            "capture stopped after {seen} frames, wanted at least {wanted}: \
+             the stream's surfaces are being leaked"
+        );
     }
 }
