@@ -144,7 +144,16 @@ async fn pump(
             return tally;
         }
     };
-    let mut input = platform.input().ok();
+    let mut input = match platform.input() {
+        Ok(input) => Some(input),
+        Err(error) => {
+            // Not fatal: watching a machine you cannot control is still
+            // worth something, and it is a legitimate configuration. But it
+            // is never what someone expects by accident.
+            tracing::warn!(%error, "input is unavailable; this session can only watch");
+            None
+        }
+    };
 
     let (frames_tx, mut frames) = mpsc::channel::<EncodedFrame>(FRAME_QUEUE);
     if let Err(error) = video.start(VideoConfig::default(), frames_tx) {

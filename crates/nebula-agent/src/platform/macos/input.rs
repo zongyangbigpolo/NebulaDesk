@@ -36,7 +36,14 @@ pub struct MacInput {
 
 impl MacInput {
     /// Start the injection thread.
+    ///
+    /// Fails when Accessibility has not been granted. Checking is worth the
+    /// call: without it the injector builds, the session runs, every event
+    /// is posted, the window server discards all of them, and nothing
+    /// anywhere says why the remote pointer never moves.
     pub fn new() -> anyhow::Result<Self> {
+        anyhow::ensure!(trusted(), ACCESSIBILITY);
+
         let (events, inbox) = std::sync::mpsc::channel::<InputEvent>();
         let (ready, started) = std::sync::mpsc::channel::<anyhow::Result<()>>();
 
@@ -279,6 +286,22 @@ fn post_scroll(vertical: i32, horizontal: i32, modifiers: Modifiers) {
         CGEventPost(TAP_HID, event);
         CFRelease(event);
     }
+}
+
+/// What to do about a machine that has not been granted Accessibility.
+const ACCESSIBILITY: &str = "cannot inject input. Grant Accessibility to this binary \
+     in System Settings → Privacy & Security → Accessibility. The permission is bound \
+     to the binary, so if it is already listed after a rebuild, remove it and add it again.";
+
+/// Whether this process may post events to the window server.
+fn trusted() -> bool {
+    // SAFETY: a plain query with no arguments and no ownership transfer.
+    unsafe { AXIsProcessTrusted() }
+}
+
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn AXIsProcessTrusted() -> bool;
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]

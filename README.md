@@ -68,30 +68,72 @@ cargo test -p nebula-client --test media -- --ignored
 
 ## Running a deployment locally
 
+One script brings up the manager, relay and gateway, creates a tenant, and
+prints the commands for everything else:
+
 ```sh
-# 1. Control plane. Migrations run at startup.
-DATABASE_URL="postgres:///nebula" \
-NEBULA_BOOTSTRAP_SECRET="$(openssl rand -hex 32)" \
-  cargo run -p nebula-manager
-
-# 2. One pairing secret, shared by every gateway and relay.
-export NEBULA_PAIR_SECRET="$(cargo run -q -p nebula-relay -- gen-secret)"
-
-# 3. Data plane and edge. Both register themselves on first start.
-cargo run -p nebula-relay   -- --listen 0.0.0.0:7444 --manager-url http://localhost:8080
-cargo run -p nebula-gateway -- --listen 0.0.0.0:7443 --manager-url http://localhost:8080
-
-# 4. A machine. The token comes from an administrator.
-cargo run -p nebula-agent -- enroll --manager-url http://localhost:8080 \
-    --token "$TOKEN" --name "studio-mac"
-cargo run -p nebula-agent -- run
-
-# 5. A user connects. They name a resource, never a machine.
-cargo run -p nebula-client -- --manager-url http://localhost:8080 \
-    --tenant acme --email someone@acme.test list
-cargo run -p nebula-client -- --manager-url http://localhost:8080 \
-    --tenant acme --email someone@acme.test connect "studio-mac"
+scripts/dev-stack.sh          # stop it again with: scripts/dev-stack.sh stop
 ```
+
+It binds to loopback by default. To let a second machine reach it, give it
+this machine's address on the network:
+
+```sh
+NEBULA_HOST=192.168.1.20 scripts/dev-stack.sh
+```
+
+Then, on the machine being shared:
+
+```sh
+# The token comes from an administrator; the script prints how to mint one.
+nebula-agent enroll --manager-url http://192.168.1.20:8080 \
+    --token "$TOKEN" --name studio-mac --state ~/.nebula-agent
+nebula-agent run --state ~/.nebula-agent
+```
+
+Publish its desktop and grant yourself access:
+
+```sh
+scripts/publish-desktop.sh studio-mac
+```
+
+And connect. A user names a resource, never a machine:
+
+```sh
+export NEBULA_PASSWORD='correct horse battery staple'
+nebula-client --manager-url http://192.168.1.20:8080 \
+    --tenant acme --email me@acme.test list
+nebula-client --manager-url http://192.168.1.20:8080 \
+    --tenant acme --email me@acme.test connect "studio-mac Desktop"
+```
+
+<details>
+<summary>Starting the services by hand</summary>
+
+```sh
+# Control plane. Migrations run at startup.
+NEBULA_DATABASE_URL="postgres:///nebula" \
+NEBULA_ACCESS_TOKEN_SECRET="$(openssl rand -hex 32)" \
+NEBULA_BOOTSTRAP_TOKEN="$(openssl rand -hex 32)" \
+NEBULA_LISTEN=0.0.0.0:8080 \
+  nebula-manager
+
+# One pairing secret, shared by every gateway and relay.
+export NEBULA_PAIR_SECRET="$(nebula-relay gen-secret)"
+
+# Data plane and edge. Each registers itself with the bootstrap token, after
+# binding: the manager has to be told the address and certificate pin the
+# process actually ended up with.
+nebula-relay   --listen 0.0.0.0:7444 --advertise "$HOST:7444" \
+    --manager-url http://localhost:8080 --bootstrap-secret "$BOOTSTRAP"
+nebula-gateway --listen 0.0.0.0:7443 --advertise "$HOST:7443" \
+    --manager-url http://localhost:8080 --bootstrap-secret "$BOOTSTRAP"
+```
+
+`--advertise` is what peers are told to dial. It has to be an address they can
+reach, which is rarely the one the process bound to.
+
+</details>
 
 ### macOS permissions
 
@@ -100,16 +142,22 @@ Security, both under the agent's own binary:
 
 * **Screen & System Audio Recording** — without it there is nothing to capture,
   and the session fails rather than showing a blank picture.
-* **Accessibility** — without it keyboard and mouse events are discarded.
+* **Accessibility** — without it the agent refuses to offer input at all,
+  rather than posting events the window server silently discards.
 
 Both are tied to the exact binary, so a rebuild invalidates them. If the agent
 is already listed and still refuses, remove the entry and add it again.
 
-To check a machine before enrolling it:
+To check a machine before enrolling it, one probe per permission. Each prints
+what to do when it fails:
 
 ```sh
-cargo run -p nebula-agent --example capture_probe
+cargo run -p nebula-agent --example capture_probe   # Screen Recording
+cargo run -p nebula-agent --example input_probe     # Accessibility
 ```
+
+`capture_probe` prints one frame and then reports no frames arriving. That is
+correct: ScreenCaptureKit delivers only when the screen changes.
 
 ## Status
 
