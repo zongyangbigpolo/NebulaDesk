@@ -43,7 +43,7 @@ resource="$(api -X POST "${MANAGER_URL}/v1/machines/${machine}/resources" \
 me="$(api "${MANAGER_URL}/v1/auth/me" | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')"
 
 api -X POST "${MANAGER_URL}/v1/resources/${resource}/entitlements" \
-  -d "$(printf '{"subject_kind":"USER","subject_id":"%s","role":"CONTROLLER","allow_clipboard":true,"allow_audio":true}' "${me}")" \
+  -d "$(printf '{"subject_kind":"USER","subject_id":"%s","role":"CONTROLLER","allow_clipboard":true,"allow_audio":true,"allow_file_transfer":true}' "${me}")" \
   >/dev/null
 
 echo "published '${resource_name}' (${resource}) on ${machine_name}"

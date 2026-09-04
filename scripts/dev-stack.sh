@@ -3,7 +3,10 @@
 # Bring up a whole NebulaDesk deployment on this machine: manager, relay and
 # gateway, plus a tenant and an owner to sign in as.
 #
-# Everything binds to $NEBULA_HOST, which defaults to the loopback address.
+# Everything is advertised as $NEBULA_HOST, which defaults to the loopback
+# address. Listening happens on every interface when a LAN address is given,
+# so that an agent enrolled against 127.0.0.1 keeps working while a second
+# machine reaches the same stack by its address on the network.
 # Set it to this machine's LAN address when a second machine has to reach it:
 #
 #     NEBULA_HOST=192.168.1.20 scripts/dev-stack.sh
@@ -24,9 +27,16 @@ TENANT="${NEBULA_TENANT:-acme}"
 EMAIL="${NEBULA_EMAIL:-me@acme.test}"
 PASSWORD="${NEBULA_PASSWORD:-correct horse battery staple}"
 MANAGER_URL="http://${HOST}:${MANAGER_PORT}"
+# The address to bind, as opposed to the one to advertise.
+BIND="${HOST}"
+if [[ "${HOST}" != "127.0.0.1" && "${HOST}" != "localhost" ]]; then
+  BIND="0.0.0.0"
+fi
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-bin="${root}/target/debug"
+# Release by default: a debug build's encoder is fast enough for a test on
+# one machine and visibly not fast enough across a network.
+bin="${root}/target/${NEBULA_PROFILE:-release}"
 
 stop() {
   if [[ -f "${STATE}/pids" ]]; then
@@ -72,7 +82,7 @@ wait_for() {
 NEBULA_DATABASE_URL="postgres:///${DB}" \
 NEBULA_ACCESS_TOKEN_SECRET="dev-access-token-secret-0123456789abcdef" \
 NEBULA_BOOTSTRAP_TOKEN="${BOOTSTRAP}" \
-NEBULA_LISTEN="${HOST}:${MANAGER_PORT}" \
+NEBULA_LISTEN="${BIND}:${MANAGER_PORT}" \
 NEBULA_PUBLIC_URL="${MANAGER_URL}" \
   "${bin}/nebula-manager" >"${STATE}/manager.log" 2>&1 &
 echo $! >>"${STATE}/pids"
@@ -86,7 +96,7 @@ fi
 PAIR="$(cat "${STATE}/pair.secret")"
 
 NEBULA_PAIR_SECRET="${PAIR}" "${bin}/nebula-relay" \
-  --listen "${HOST}:${RELAY_PORT}" \
+  --listen "${BIND}:${RELAY_PORT}" \
   --advertise "${HOST}:${RELAY_PORT}" \
   --manager-url "${MANAGER_URL}" \
   --bootstrap-secret "${BOOTSTRAP}" \
@@ -95,7 +105,7 @@ echo $! >>"${STATE}/pids"
 wait_for relay "grep -q 'relay listening' ${STATE}/relay.log"
 
 NEBULA_PAIR_SECRET="${PAIR}" "${bin}/nebula-gateway" \
-  --listen "${HOST}:${GATEWAY_PORT}" \
+  --listen "${BIND}:${GATEWAY_PORT}" \
   --advertise "${HOST}:${GATEWAY_PORT}" \
   --manager-url "${MANAGER_URL}" \
   --bootstrap-secret "${BOOTSTRAP}" \

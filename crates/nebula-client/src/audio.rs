@@ -35,6 +35,9 @@ pub struct Playback {
     decoder: opus::Decoder,
     channels: usize,
     ring: Arc<Mutex<Ring>>,
+    /// Set once anything has been queued, so that the device's complaint
+    /// about being started with nothing to play is not reported as a fault.
+    started: Arc<std::sync::atomic::AtomicBool>,
     scratch: Vec<f32>,
     // Held only to keep the device open: dropping a cpal stream stops it.
     _stream: cpal::Stream,
@@ -62,6 +65,13 @@ impl Playback {
             SAMPLE_RATE as usize * channels * RING_MS / 1000,
         )));
         let playing = Arc::clone(&ring);
+        // Opening a stream before there is any audio to put in it means the
+        // device reports an underrun straight away, every single time. The
+        // callback fills with silence, so nothing was lost and there is
+        // nothing to act on — and a warning that always appears and never
+        // matters is how people learn to stop reading warnings.
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let running = Arc::clone(&started);
         let stream = device.build_output_stream(
             config,
             move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
@@ -73,7 +83,13 @@ impl Playback {
                     Err(_) => out.fill(0.0),
                 }
             },
-            |error| tracing::warn!(%error, "the audio output device reported an error"),
+            move |error| {
+                if running.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(%error, "the audio output device reported an error");
+                } else {
+                    tracing::debug!(%error, "the audio device complained before it had anything to play");
+                }
+            },
             None,
         )?;
         stream.play()?;
@@ -91,6 +107,7 @@ impl Playback {
             decoder,
             channels,
             ring,
+            started,
             // Opus packets top out at 120 ms; sized for the largest one so
             // decoding never needs to grow this.
             scratch: vec![0.0; SAMPLE_RATE as usize * channels * 120 / 1000],
@@ -116,6 +133,8 @@ impl Playback {
         if let Ok(mut ring) = self.ring.lock() {
             ring.push(&self.scratch[..samples]);
         }
+        self.started
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 }

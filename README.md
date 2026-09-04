@@ -162,13 +162,20 @@ correct: ScreenCaptureKit delivers only when the screen changes.
 ## Status
 
 Working end to end: the control plane, the relay, the gateway, an agent that
-captures and encodes a real screen in hardware and injects input, and the
-client that signs a user in, connects, decodes and draws.
+captures and encodes a real screen in hardware, plays out system audio and
+injects input, and the client that signs a user in, connects, decodes, draws
+and plays. The clipboard synchronises both ways, and a file dropped onto the
+client window lands on the remote machine. Every one of those paths has a test
+that drives it through a real gateway, a real relay and a real handshake.
 
-macOS is the platform that is finished. Windows and Linux build and run
-everything except capture, encode and injection, which fall back to a test
-pattern and a discard sink; their backends are next. Audio, clipboard and file
-transfer are specified but not implemented.
+macOS is the platform that is finished. Windows and Linux build and run the
+control plane, the tunnels, policy, the clipboard and file transfer; screen
+capture, encoding and input injection still fall back to a test pattern and a
+discard sink, and their backends are next.
+
+Two things have never been confirmed by a human being: that injected input
+actually moves the remote cursor, and that the window looks right. Both need a
+second machine and the accessibility permission that goes with it.
 
 `legacy/` holds the previous macOS-only implementation, kept for reference
 while the platform backends are ported.
