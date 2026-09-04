@@ -59,6 +59,13 @@ createdb nebula_manager_test
 NEBULA_TEST_DATABASE_URL="postgres:///nebula_manager_test" cargo test --workspace
 ```
 
+Tests that need a real display are ignored by default, because a build machine
+has neither a screen nor permission to record one. On a Mac with both:
+
+```sh
+cargo test -p nebula-client --test media -- --ignored
+```
+
 ## Running a deployment locally
 
 ```sh
@@ -78,13 +85,42 @@ cargo run -p nebula-gateway -- --listen 0.0.0.0:7443 --manager-url http://localh
 cargo run -p nebula-agent -- enroll --manager-url http://localhost:8080 \
     --token "$TOKEN" --name "studio-mac"
 cargo run -p nebula-agent -- run
+
+# 5. A user connects. They name a resource, never a machine.
+cargo run -p nebula-client -- --manager-url http://localhost:8080 \
+    --tenant acme --email someone@acme.test list
+cargo run -p nebula-client -- --manager-url http://localhost:8080 \
+    --tenant acme --email someone@acme.test connect "studio-mac"
+```
+
+### macOS permissions
+
+A machine running the agent needs two grants in System Settings > Privacy &
+Security, both under the agent's own binary:
+
+* **Screen & System Audio Recording** — without it there is nothing to capture,
+  and the session fails rather than showing a blank picture.
+* **Accessibility** — without it keyboard and mouse events are discarded.
+
+Both are tied to the exact binary, so a rebuild invalidates them. If the agent
+is already listed and still refuses, remove the entry and add it again.
+
+To check a machine before enrolling it:
+
+```sh
+cargo run -p nebula-agent --example capture_probe
 ```
 
 ## Status
 
-Working: the control plane, the relay, the gateway, and an agent that serves a
-real session end to end. Capture and encode are a synthetic test pattern; the
-platform backends are next. The client is not written yet.
+Working end to end: the control plane, the relay, the gateway, an agent that
+captures and encodes a real screen in hardware and injects input, and the
+client that signs a user in, connects, decodes and draws.
+
+macOS is the platform that is finished. Windows and Linux build and run
+everything except capture, encode and injection, which fall back to a test
+pattern and a discard sink; their backends are next. Audio, clipboard and file
+transfer are specified but not implemented.
 
 `legacy/` holds the previous macOS-only implementation, kept for reference
 while the platform backends are ported.

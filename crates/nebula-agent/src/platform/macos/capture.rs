@@ -46,6 +46,11 @@ use crate::media::{EncodedFrame, FrameSink, VideoConfig, VideoSource};
 /// already moved on.
 const QUEUE_DEPTH: u32 = 3;
 
+/// How often the encode loop looks up to see whether it should still be
+/// running. Short enough that stopping feels immediate, long enough that an
+/// idle screen costs nothing.
+const WAKE: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// What to tell an operator when the screen cannot be captured.
 ///
 /// Screen Recording is granted to a *binary*, and rebuilding the agent
@@ -174,6 +179,7 @@ impl VideoSource for MacVideo {
                     &sink,
                     &keyframe,
                     &bitrate,
+                    &running,
                 );
                 let _ = stream.stop_capture();
                 running.store(false, Ordering::Relaxed);
@@ -231,13 +237,32 @@ fn pump(
     sink: &FrameSink,
     keyframe: &AtomicBool,
     bitrate: &AtomicU32,
+    running: &AtomicBool,
 ) {
     let started = Instant::now();
     // The first frame a client sees must be decodable on its own.
     let mut force_key = true;
 
-    while let Ok(sample) = incoming.recv() {
-        if sink.is_closed() {
+    loop {
+        // Waking periodically rather than blocking outright is what makes
+        // stopping possible at all. The stream's output handler holds the
+        // sending half of this channel, and the stream itself is owned by
+        // this thread, so the channel cannot close until this loop has
+        // already returned; waiting on it alone deadlocks `stop`.
+        let sample = match incoming.recv_timeout(WAKE) {
+            Ok(sample) => sample,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // A screen that is not changing produces no frames, which is
+                // the desired behaviour and not a fault: the client already
+                // shows the last one.
+                if running.load(Ordering::Relaxed) && !sink.is_closed() {
+                    continue;
+                }
+                return;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+        if sink.is_closed() || !running.load(Ordering::Relaxed) {
             return;
         }
 
