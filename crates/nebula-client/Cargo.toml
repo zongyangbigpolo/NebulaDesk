@@ -1,0 +1,51 @@
+[package]
+name = "nebula-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NebulaDesk workspace app: signs a user in, lists what they may reach, and connects to it."
+
+[dependencies]
+nebula-common = { workspace = true }
+ndp-crypto = { workspace = true }
+ndp-proto = { workspace = true }
+ndp-signal = { workspace = true }
+ndp-transport = { workspace = true }
+nebula-agent = { workspace = true }
+
+quinn = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+hex = { workspace = true }
+
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+rpassword = "7"
+
+winit = "0.30"
+wgpu = "24"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+
+[[bin]]
+name = "nebula-client"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3"
+nebula-manager = { workspace = true }
+nebula-gateway = { workspace = true }
+nebula-relay = { workspace = true }
+ndp-signal = { workspace = true }
+axum = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+shiguredo_video_toolbox = "2026.1"
