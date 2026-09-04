@@ -108,12 +108,16 @@ impl Renderer {
             .await?;
 
         let capabilities = surface.get_capabilities(&adapter);
+        // A non-sRGB surface on purpose. The shader below already emits
+        // gamma-encoded values, because that is what BT.709 video carries; an
+        // sRGB surface would apply the transfer function a second time on
+        // write and wash the whole picture out.
         let format = capabilities
             .formats
             .iter()
             .copied()
-            .find(wgpu::TextureFormat::is_srgb)
-            .unwrap_or(capabilities.formats[0]);
+            .find(|format| !format.is_srgb())
+            .unwrap_or_else(|| capabilities.formats[0].remove_srgb_suffix());
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,

@@ -120,9 +120,12 @@ impl VideoSource for MacVideo {
             .with_pixel_format(ScPixelFormat::YCbCr_420v)
             .with_queue_depth(QUEUE_DEPTH)
             .with_fps(config.fps)
-            // The remote pointer is drawn by the client, which knows where it
-            // put it; compositing the local one too would show two.
-            .with_shows_cursor(false);
+            // Composite the pointer into the stream. The alternative — drawing
+            // it on the client, where it could move with no latency at all —
+            // needs the client to know the remote pointer's shape as well as
+            // its position, and a client that draws nothing shows a session
+            // that appears not to respond to the mouse at all.
+            .with_shows_cursor(true);
 
         // ScreenCaptureKit delivers on its own dispatch queue, so frames
         // cross into Rust here and are handed to a thread that owns the
