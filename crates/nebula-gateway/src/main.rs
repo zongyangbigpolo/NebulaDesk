@@ -27,6 +27,12 @@ struct Cli {
     #[arg(long, env = "NEBULA_MANAGER_URL")]
     manager_url: String,
 
+    /// The manager's public URL, as it appears in the `iss` of a ticket.
+    /// Defaults to `--manager-url`, which is only right when the gateway
+    /// reaches the manager at the same address clients do.
+    #[arg(long, env = "NEBULA_TICKET_ISSUER")]
+    ticket_issuer: Option<String>,
+
     /// Operator bootstrap secret, used once to register.
     #[arg(long, env = "NEBULA_BOOTSTRAP_SECRET")]
     bootstrap_secret: Option<String>,
@@ -73,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
         advertised_addr: cli.advertise,
         name: cli.name,
         manager_url: cli.manager_url,
+        ticket_issuer: cli.ticket_issuer,
         bootstrap_secret: cli.bootstrap_secret,
         node_credential: cli.node_credential,
         region: cli.region,

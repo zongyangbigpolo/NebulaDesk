@@ -54,13 +54,16 @@ impl World {
         let db = std::env::var("NEBULA_TEST_DATABASE_URL")
             .unwrap_or_else(|_| "postgres:///nebula_manager_test".into());
 
-        // Bind first so the manager's issuer matches the URL everyone will
-        // actually use: a ticket names its issuer, and the gateway checks it.
+        // The manager is reached at its bound address but issues tickets under
+        // its public URL, which is how any deployment bigger than one laptop
+        // is arranged. Keeping the two different here means every test in this
+        // file would fail if the gateway went back to assuming they match.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let manager_url = format!("http://{}", listener.local_addr().unwrap());
+        let issuer = "https://manager.public.test".to_owned();
 
         let state = nebula_manager::AppState::bootstrap(nebula_manager::Config {
-            public_url: manager_url.clone(),
+            public_url: issuer.clone(),
             ..nebula_manager::Config::for_test(db)
         })
         .await
@@ -97,6 +100,7 @@ impl World {
                 advertised_addr: String::new(),
                 name: format!("gw-{region}"),
                 manager_url: manager_url.clone(),
+                ticket_issuer: Some(issuer.clone()),
                 bootstrap_secret: Some(BOOTSTRAP.into()),
                 region: region.clone(),
                 pair_secret: pair_secret.clone(),

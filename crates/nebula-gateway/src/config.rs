@@ -23,6 +23,16 @@ pub struct Config {
     /// Base URL of the manager, e.g. `https://manager.example.com`.
     pub manager_url: String,
 
+    /// The `iss` a ticket must carry, which is the manager's *public* URL.
+    ///
+    /// Separate from `manager_url` because the gateway usually reaches the
+    /// manager over a private address while clients are issued tickets naming
+    /// the public one. Conflating the two makes every ticket fail
+    /// verification the moment a deployment stops being a single laptop.
+    /// `None` means "the same as `manager_url`", which is right for local
+    /// development and wrong almost everywhere else.
+    pub ticket_issuer: Option<String>,
+
     /// Operator secret used once at startup to register with the manager.
     /// Omitted when `node_credential` is already provisioned.
     pub bootstrap_secret: Option<String>,
@@ -65,6 +75,7 @@ impl Default for Config {
             advertised_addr: "127.0.0.1:4433".into(),
             name: "gateway-local".into(),
             manager_url: "http://127.0.0.1:8080".into(),
+            ticket_issuer: None,
             bootstrap_secret: None,
             node_credential: None,
             region: "default".into(),

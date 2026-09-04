@@ -128,10 +128,13 @@ impl Gateway {
             }
         };
 
-        let tickets = TicketVerifier::new(
-            ManagerClient::new(&config.manager_url, None)?,
-            config.manager_url.trim_end_matches('/'),
-        );
+        let issuer = config
+            .ticket_issuer
+            .as_deref()
+            .unwrap_or(&config.manager_url)
+            .trim_end_matches('/')
+            .to_owned();
+        let tickets = TicketVerifier::new(ManagerClient::new(&config.manager_url, None)?, issuer);
         tickets.prime().await?;
         tokio::spawn(Arc::clone(&tickets).refresh_forever());
 
