@@ -48,6 +48,11 @@ The protocol and the reasoning behind it are in
 
 Rust 1.89 or newer.
 
+Windows needs the MSVC C++ tools and Windows SDK. Linux also needs native
+GStreamer/PipeWire development libraries. Platform-specific build packages,
+GPU requirements and permission setup are documented in
+[Windows media](docs/windows-media.md) and [Linux media](docs/linux-media.md).
+
 ```sh
 cargo build --workspace
 ```
@@ -180,10 +185,20 @@ a remote gateway and relay, including user-confirmed keyboard and mouse
 control. Sustained performance and recovery under congestion remain work in
 progress; a clean still frame is not evidence of stable interactive streaming.
 
-Windows and Linux native media backends are being implemented. Until those
-changes land, their agent media path is a synthetic placeholder and their
-client cannot decode video. Native compilation and hardware desktop smoke
-tests are separate milestones, not interchangeable claims of support.
+Native Windows and Linux agent/client backends are now wired into the platform
+factories, with no synthetic media or software-codec fallback on those targets:
+
+| Platform | Capture and hardware video | System audio and input |
+| --- | --- | --- |
+| Windows 11 | WGC / D3D11, Media Foundation encoder and D3D11VA decoder | WASAPI loopback, SendInput |
+| Linux Wayland | Portal / PipeWire, GStreamer VA-API encoder and decoder | PipeWire output monitor, RemoteDesktop portal |
+
+These implementations still need real Windows/Linux desktop and GPU runs before
+runtime interoperability can be claimed. Linux requires a suitable compositor
+portal and VA-API driver; Windows requires an interactive session and suitable
+hardware MFTs. Neither supports secure login desktops or provisions virtual
+displays. The current decoded-frame/renderer boundary copies CPU planes rather
+than providing end-to-end GPU zero-copy.
 
 `legacy/` holds the previous macOS-only implementation, kept for reference
 while the platform backends are ported.

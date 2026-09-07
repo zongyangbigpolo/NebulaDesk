@@ -14,7 +14,8 @@ Build packages on Ubuntu:
 
 ```sh
 sudo apt-get install pkg-config libgstreamer1.0-dev \
-  libgstreamer-plugins-base1.0-dev libpipewire-0.3-dev libasound2-dev libopus-dev
+  libgstreamer-plugins-base1.0-dev libpipewire-0.3-dev \
+  libasound2-dev libudev-dev libopus-dev
 ```
 
 Runtime packages (in addition to your installed desktop and portal backend):
@@ -55,7 +56,11 @@ The agent's portal worker owns its own Tokio runtime, so synchronous probes work
 without a caller runtime. Consent times out after 120 seconds. Portal calls and
 input acknowledgements have bounded timeouts. Stopping video closes the portal
 and its dialogs. User revocation ends capture; input failure also revokes the
-session rather than executing a stale queued release later.
+session rather than executing a stale queued release later. Capture startup
+runs off the agent's async executor. If the connection is revoked during the
+synchronous consent wait, the connection closes immediately and the eventual
+source is stopped automatically; an already-open consent dialog can remain
+until cancellation or the 120-second timeout.
 
 Input uses the portal's permission-checked `Notify*` methods (supported on
 GNOME/KDE), not an unprivileged global device or XTest. USB keyboard usages map

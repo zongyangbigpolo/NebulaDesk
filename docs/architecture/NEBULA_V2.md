@@ -302,6 +302,11 @@ pub trait InputInjector { fn inject(&mut self, &InputEvent) -> Result<()>; }
 `GpuHandle` 是平台不透明句柄（`CVPixelBuffer` / `ID3D11Texture2D` / `VADRMPRIMESurface`），
 core 层永不解引用，保证**采集→编码、解码→渲染全程零 CPU 拷贝**。
 
+以上是目标接口与零拷贝设计，不是当前实现的性能保证。当前平台接口位于
+`nebula-agent/src/media.rs` 和 `nebula-client/src/video.rs`，解码后统一复制为拥有
+Y/U/V 平面的 `Picture` 再上传 wgpu。Windows 采集到编码使用 D3D11；Linux 经
+Portal/PipeWire 和 GStreamer VA-API，是否能直接导入 DMA-BUF 取决于驱动协商。
+
 ### 5.2 平台后端矩阵
 
 | 能力 | macOS 26+ | Windows 11 | Linux |
@@ -315,6 +320,12 @@ core 层永不解引用，保证**采集→编码、解码→渲染全程零 CPU
 | 音频播放 | CoreAudio AudioUnit | WASAPI | PipeWire |
 | 输入注入 | `CGEvent`（需辅助功能授权） | `SendInput` | libei / uinput |
 | 剪贴板 | NSPasteboard | Win32 Clipboard | wl-clipboard / X11 |
+
+Windows/Linux 原生桌面后端已接入，但尚未完成对应桌面/GPU 真机互通确认。
+实际依赖、授权方式及限制见 [Windows](../windows-media.md) 和
+[Linux](../linux-media.md)。当前没有虚拟显示驱动或 headless 桌面配置功能；
+Linux 输入使用 GNOME/KDE 的 RemoteDesktop Portal Notify 接口，不绕过 compositor 授权。
+每个连接具有独立媒体授权上下文，只读连接不会创建输入注入器。
 
 ### 5.3 自适应码率
 
