@@ -151,8 +151,8 @@ fn button(button: MouseButton) -> anyhow::Result<i32> {
         MouseButton::Left => 0x110,
         MouseButton::Right => 0x111,
         MouseButton::Middle => 0x112,
-        MouseButton::Back => 0x116,
-        MouseButton::Forward => 0x115,
+        MouseButton::Back => 0x113,
+        MouseButton::Forward => 0x114,
         MouseButton::None => anyhow::bail!("button event has no button"),
     })
 }
@@ -267,6 +267,8 @@ mod tests {
         assert_eq!(evdev(0), None);
         assert_eq!(evdev(0xffff), None);
         assert_eq!(button(MouseButton::Right).unwrap(), 273);
+        assert_eq!(button(MouseButton::Back).unwrap(), 275);
+        assert_eq!(button(MouseButton::Forward).unwrap(), 276);
         assert!(button(MouseButton::None).is_err());
     }
 }
