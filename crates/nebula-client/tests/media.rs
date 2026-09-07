@@ -36,7 +36,9 @@ fn a_captured_screen_decodes_back_into_a_picture() {
             },
             frames_tx,
         )
-        .expect("capture must start; check the platform's desktop, permission and GPU requirements");
+        .expect(
+            "capture must start; check the platform's desktop, permission and GPU requirements",
+        );
 
     let mut decoder = nebula_client::video::decoder().expect("the client must have a decoder");
     let runtime = tokio::runtime::Runtime::new().unwrap();
