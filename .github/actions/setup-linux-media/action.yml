@@ -1,0 +1,12 @@
+name: Linux media build dependencies
+description: Native development libraries for the Linux agent and client
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends \
+          pkg-config libasound2-dev libudev-dev libopus-dev \
+          libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+          libpipewire-0.3-dev
