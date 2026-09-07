@@ -74,3 +74,26 @@ fn desktop_session() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_permission_is_scoped_without_opening_a_desktop() {
+        let factory = Linux::default();
+        assert!(factory.input().is_err());
+        let viewer = factory.session_scope(false).unwrap().unwrap();
+        let controller = factory.session_scope(true).unwrap().unwrap();
+        assert!(viewer.input().is_err());
+        let mut input = controller.input().unwrap();
+        assert!(input
+            .inject(&ndp_proto::InputEvent::mouse_move(
+                0.5,
+                0.5,
+                ndp_proto::Modifiers::NONE
+            ))
+            .is_err());
+        assert!(factory.input().is_err());
+    }
+}
