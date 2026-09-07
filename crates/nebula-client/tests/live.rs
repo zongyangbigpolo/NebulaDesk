@@ -481,6 +481,29 @@ async fn the_clipboard_crosses_in_both_directions() {
         .await
     }
 
+    // The Noise greeting precedes native source/clipboard startup. Wait for
+    // the worker to answer an offer before making a local copy, otherwise its
+    // initial snapshot may correctly treat the copy as pre-session content.
+    session
+        .send(
+            Channel::Clipboard,
+            MsgHeader::new(MsgKind::ClipboardOffer, 0, 0),
+            &serde_json::to_vec(&ClipboardOffer {
+                offer_id: 0,
+                formats: vec![ClipboardFormat::Text],
+                size_hint: 0,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let ready = next(&mut incoming)
+        .await
+        .expect("the clipboard worker should finish its initial snapshot");
+    assert_eq!(ready.header.kind, MsgKind::ClipboardRequest);
+    let ready: ClipboardRequest = serde_json::from_slice(&ready.payload).unwrap();
+    assert_eq!(ready.offer_id, 0);
+
     // --- the machine's clipboard reaches the client -----------------------
     board.put(Contents::text("copied on the machine"));
 
