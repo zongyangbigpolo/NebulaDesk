@@ -12,6 +12,9 @@ use crate::media::{Platform, TestPattern};
 #[cfg(target_os = "macos")]
 pub mod macos;
 
+#[cfg(target_os = "windows")]
+pub mod windows;
+
 /// The backend for the platform this binary was built for.
 ///
 /// A platform without a finished backend falls back to the test pattern
@@ -25,7 +28,11 @@ pub fn native() -> Arc<dyn Platform> {
     {
         Arc::new(macos::MacOs)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        Arc::new(windows::Windows)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         tracing::warn!(
             os = std::env::consts::OS,
