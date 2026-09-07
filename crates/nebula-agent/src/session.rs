@@ -19,7 +19,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::clipboard;
 use crate::files;
-use crate::media::{AudioConfig, EncodedAudio, EncodedFrame, Platform, VideoConfig};
+use crate::media::{
+    AudioConfig, EncodedAudio, EncodedFrame, FrameSink, Platform, VideoConfig, VideoSource,
+};
 
 /// How many encoded frames may wait for the network.
 ///
@@ -154,7 +156,7 @@ async fn pump(
             return tally;
         }
     };
-    let mut video = match platform.video() {
+    let video = match platform.video() {
         Ok(video) => video,
         Err(error) => {
             tracing::error!(%error, "no video source; refusing the session");
@@ -174,11 +176,25 @@ async fn pump(
     };
 
     let (frames_tx, mut frames) = mpsc::channel::<EncodedFrame>(FRAME_QUEUE);
-    if let Err(error) = video.start(VideoConfig::default(), frames_tx) {
-        tracing::error!(%error, "the video source refused to start");
-        session.close(0x21, b"capture failed");
-        return tally;
-    }
+    let mut video = tokio::select! {
+        biased;
+        reason = &mut stop => {
+            let reason = reason.unwrap_or_else(|_| "the session was ended".into());
+            tracing::info!(session = %request.session, %reason, "capture startup cancelled");
+            session.close(0x22, reason.as_bytes());
+            return tally;
+        }
+        started = start_video(video, VideoConfig::default(), frames_tx) => {
+            match started {
+                Ok(video) => video,
+                Err(error) => {
+                    tracing::error!(%error, "the video source refused to start");
+                    session.close(0x21, b"capture failed");
+                    return tally;
+                }
+            }
+        }
+    };
 
     let audio_config = AudioConfig::default();
     let audio_info = ndp_proto::AudioFrameInfo {
@@ -190,7 +206,7 @@ async fn pump(
     // Audio is optional in both directions: the entitlement may withhold it,
     // and a platform backend may not have it yet. Neither is a reason to
     // refuse a session, so a failure here is a session without sound.
-    let (audio_tx, mut packets) = mpsc::channel::<EncodedAudio>(AUDIO_QUEUE);
+    let (audio_tx, packets) = mpsc::channel::<EncodedAudio>(AUDIO_QUEUE);
     let mut audio = if request.policy.audio {
         match platform.audio() {
             Ok(mut audio) => match audio.start(audio_config, audio_tx) {
@@ -208,6 +224,7 @@ async fn pump(
     } else {
         None
     };
+    let mut packets = audio.as_ref().map(|_| packets);
 
     // The clipboard runs on its own thread and only when the entitlement
     // allows it, so a session without the permission never opens the
@@ -256,7 +273,7 @@ async fn pump(
                     Ok(ndp_transport::FrameOutcome::Discarded) => {
                         // The frame never left, so the next one must not
                         // depend on it.
-                        video.request_keyframe();
+                        video.source.request_keyframe();
                     }
                     Err(error) => {
                         tracing::debug!(%error, "the session ended while sending video");
@@ -265,12 +282,12 @@ async fn pump(
                 }
             }
 
-            packet = packets.recv() => {
+            packet = next_audio(&mut packets) => {
                 // A closed audio channel is not the end of the session: the
                 // encoder can stop while the picture keeps going, and a
                 // silent remote desktop is still a remote desktop.
                 let Some(packet) = packet else {
-                    packets.close();
+                    tracing::debug!("audio capture ended; continuing without audio");
                     continue;
                 };
                 let header = MsgHeader::new(MsgKind::AudioFrame, audio_seq, packet.timestamp_us)
@@ -343,7 +360,7 @@ async fn pump(
                 if !handle(
                     request,
                     &session,
-                    &mut video,
+                    &mut video.source,
                     input.as_deref_mut(),
                     clipboard.as_ref(),
                     transfers.as_ref(),
@@ -357,12 +374,38 @@ async fn pump(
         }
     }
 
-    video.stop();
+    drop(video);
     if let Some(audio) = audio.as_mut() {
         audio.stop();
     }
     tracing::info!(session = %request.session, sent = tally.sent, received = tally.received, "session ended");
     tally
+}
+
+struct StartedVideo {
+    source: Box<dyn VideoSource>,
+}
+
+impl Drop for StartedVideo {
+    fn drop(&mut self) {
+        self.source.stop();
+    }
+}
+
+async fn start_video(
+    source: Box<dyn VideoSource>,
+    config: VideoConfig,
+    sink: FrameSink,
+) -> anyhow::Result<StartedVideo> {
+    // Portal consent and native driver setup can block. A dropped JoinHandle
+    // cannot cancel a blocking call, so its result owns a stop guard: even if
+    // the peer leaves during consent, eventual startup is torn down, not leaked.
+    tokio::task::spawn_blocking(move || {
+        let mut video = StartedVideo { source };
+        video.source.start(config, sink)?;
+        Ok(video)
+    })
+    .await?
 }
 
 fn input_for_session(
@@ -374,6 +417,19 @@ fn input_for_session(
     } else {
         Ok(None)
     }
+}
+
+async fn next_audio(packets: &mut Option<mpsc::Receiver<EncodedAudio>>) -> Option<EncodedAudio> {
+    let Some(receiver) = packets.as_mut() else {
+        return std::future::pending().await;
+    };
+    let packet = receiver.recv().await;
+    if packet.is_none() {
+        // A closed receiver is always ready. Disable this select branch after
+        // draining it, instead of waking the media loop continuously.
+        *packets = None;
+    }
+    packet
 }
 
 /// Act on one message from the client. Returns false when the session should
@@ -586,5 +642,76 @@ mod tests {
         let platform = InputProbe::default();
         assert!(input_for_session(&platform, true).is_err());
         assert_eq!(platform.opened.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn closed_audio_is_drained_then_disabled() {
+        let (sender, receiver) = mpsc::channel(2);
+        sender
+            .send(EncodedAudio {
+                timestamp_us: 1,
+                data: vec![1],
+            })
+            .await
+            .unwrap();
+        drop(sender);
+        let mut packets = Some(receiver);
+        assert_eq!(next_audio(&mut packets).await.unwrap().data, [1]);
+        assert!(next_audio(&mut packets).await.is_none());
+        assert!(packets.is_none());
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            next_audio(&mut packets),
+        )
+        .await
+        .is_err());
+    }
+
+    struct WaitingVideo {
+        entered: Option<oneshot::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+        stopped: Option<oneshot::Sender<()>>,
+    }
+
+    impl VideoSource for WaitingVideo {
+        fn start(&mut self, _: VideoConfig, _: FrameSink) -> anyhow::Result<()> {
+            self.entered.take().unwrap().send(()).unwrap();
+            self.release.recv_timeout(Duration::from_secs(2))?;
+            Ok(())
+        }
+
+        fn request_keyframe(&mut self) {}
+        fn set_bitrate(&mut self, _: u32) {}
+
+        fn stop(&mut self) {
+            if let Some(stopped) = self.stopped.take() {
+                let _ = stopped.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn leaving_during_blocking_startup_stops_the_eventual_source() {
+        let (entered, started) = oneshot::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let (stopped, finished) = oneshot::channel();
+        let video = WaitingVideo {
+            entered: Some(entered),
+            release: gate,
+            stopped: Some(stopped),
+        };
+        let (sink, _frames) = mpsc::channel(1);
+        let task = tokio::spawn(start_video(Box::new(video), VideoConfig::default(), sink));
+        tokio::time::timeout(Duration::from_secs(1), started)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), finished)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }
