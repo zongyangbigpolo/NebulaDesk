@@ -59,12 +59,18 @@ createdb nebula_manager_test
 NEBULA_TEST_DATABASE_URL="postgres:///nebula_manager_test" cargo test --workspace
 ```
 
-Tests that need a real display are ignored by default, because a build machine
-has neither a screen nor permission to record one. On a Mac with both:
+Native agent and client builds are checked on Linux, Windows and macOS in CI.
+That does not establish that a runner has a supported GPU, an interactive
+desktop, or permission to capture it. Hardware media tests are ignored by
+default; run them inside the desktop session on each target machine:
 
 ```sh
 cargo test -p nebula-client --test media -- --ignored
 ```
+
+The media probe uses the same native capture and decoder factories as a real
+session. It requires hardware H.264 encoding and decoding, and any desktop
+permission prompts must be accepted locally.
 
 ## Running a deployment locally
 
@@ -156,8 +162,9 @@ cargo run -p nebula-agent --example capture_probe   # Screen Recording
 cargo run -p nebula-agent --example input_probe     # Accessibility
 ```
 
-`capture_probe` prints one frame and then reports no frames arriving. That is
-correct: ScreenCaptureKit delivers only when the screen changes.
+`capture_probe` prints up to 30 captured frames. An idle screen may stop
+producing updates, but a changing screen should keep producing frames. No
+first frame, or a capture pipeline that closes early, is reported as an error.
 
 ## Status
 
@@ -168,14 +175,15 @@ and plays. The clipboard synchronises both ways, and a file dropped onto the
 client window lands on the remote machine. Every one of those paths has a test
 that drives it through a real gateway, a real relay and a real handshake.
 
-macOS is the platform that is finished. Windows and Linux build and run the
-control plane, the tunnels, policy, the clipboard and file transfer; screen
-capture, encoding and input injection still fall back to a test pattern and a
-discard sink, and their backends are next.
+The macOS path has been exercised between two Apple Silicon machines through
+a remote gateway and relay, including user-confirmed keyboard and mouse
+control. Sustained performance and recovery under congestion remain work in
+progress; a clean still frame is not evidence of stable interactive streaming.
 
-Two things have never been confirmed by a human being: that injected input
-actually moves the remote cursor, and that the window looks right. Both need a
-second machine and the accessibility permission that goes with it.
+Windows and Linux native media backends are being implemented. Until those
+changes land, their agent media path is a synthetic placeholder and their
+client cannot decode video. Native compilation and hardware desktop smoke
+tests are separate milestones, not interchangeable claims of support.
 
 `legacy/` holds the previous macOS-only implementation, kept for reference
 while the platform backends are ported.
