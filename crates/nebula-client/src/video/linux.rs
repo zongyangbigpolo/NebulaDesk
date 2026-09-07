@@ -91,8 +91,7 @@ impl DecodePipeline {
              caps=video/x-h264,stream-format=byte-stream,alignment=au \
              ! h264parse \
              ! vah264dec \
-             ! videoconvert \
-             ! video/x-raw,format=I420 \
+             ! video/x-raw,format=NV12 \
              ! appsink name=pictures max-buffers=1 drop=false sync=false wait-on-eos=false enable-last-sample=false"
         )?;
         let input = pipeline
@@ -150,8 +149,8 @@ impl DecodePipeline {
 fn picture(sample: &gst::Sample) -> anyhow::Result<Picture> {
     let info = VideoInfo::from_caps(sample.caps().context("decoded picture has no caps")?)?;
     anyhow::ensure!(
-        info.format() == gstreamer_video::VideoFormat::I420,
-        "VA-API output was not converted to I420"
+        info.format() == gstreamer_video::VideoFormat::Nv12,
+        "VA-API output is not NV12"
     );
     let (width, height) = (info.width(), info.height());
     anyhow::ensure!(
@@ -162,7 +161,7 @@ fn picture(sample: &gst::Sample) -> anyhow::Result<Picture> {
         .buffer()
         .context("decoded picture contains no buffer")?;
     let frame = VideoFrameRef::from_buffer_ref_readable(buffer, &info)?;
-    let plane = |index: usize, width: usize, height: usize| -> anyhow::Result<Vec<u8>> {
+    let plane = |index: usize, width: usize, height: usize| -> anyhow::Result<(&[u8], usize)> {
         let stride =
             usize::try_from(frame.plane_stride()[index]).context("negative video stride")?;
         let data = frame.plane_data(index as u32)?;
@@ -170,14 +169,18 @@ fn picture(sample: &gst::Sample) -> anyhow::Result<Picture> {
             stride >= width && data.len() >= (height - 1) * stride + width,
             "VA-API returned a truncated video plane"
         );
-        Ok(super::pack(data, stride, width, height))
+        Ok((data, stride))
     };
+    let (y, y_stride) = plane(0, width as usize, height as usize)?;
+    let (chroma_width, chroma_height) = (width.div_ceil(2) as usize, height.div_ceil(2) as usize);
+    let (uv, uv_stride) = plane(1, chroma_width * 2, chroma_height)?;
+    let (u, v) = super::split_chroma(uv, uv_stride, chroma_width, chroma_height);
     Ok(Picture {
         width,
         height,
-        y: plane(0, width as usize, height as usize)?,
-        u: plane(1, width.div_ceil(2) as usize, height.div_ceil(2) as usize)?,
-        v: plane(2, width.div_ceil(2) as usize, height.div_ceil(2) as usize)?,
+        y: super::pack(y, y_stride, width as usize, height as usize),
+        u,
+        v,
     })
 }
 
@@ -188,7 +191,7 @@ mod tests {
     #[test]
     fn decoded_planes_remove_padding() {
         gst::init().unwrap();
-        let info = VideoInfo::builder(gstreamer_video::VideoFormat::I420, 6, 4)
+        let info = VideoInfo::builder(gstreamer_video::VideoFormat::Nv12, 6, 4)
             .build()
             .unwrap();
         let buffer = gst::Buffer::from_mut_slice(vec![42; info.size()]);

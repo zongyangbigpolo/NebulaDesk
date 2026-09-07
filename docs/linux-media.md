@@ -84,7 +84,7 @@ The client explicitly selects `vah264dec`; it never autoplugs a software decoder
 It submits one access unit at a time, waits at most two seconds for the decoded
 picture, and destroys decoder state on failure so the existing session loop can
 request an IDR. Streams requiring picture reordering are rejected by timeout.
-Native decoded planes are mapped/copied into the existing owned I420 `Picture`
+Native decoded NV12 planes are mapped and deinterleaved into the existing owned I420 `Picture`
 for wgpu upload. This preserves the renderer interface, **not GPU zero-copy**.
 
 Audio uses a separate native PipeWire connection with `stream.capture.sink=true`:

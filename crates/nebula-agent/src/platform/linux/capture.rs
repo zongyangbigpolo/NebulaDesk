@@ -73,7 +73,7 @@ impl VideoSource for LinuxVideo {
              ! videorate drop-only=true max-rate={} \
              ! vapostproc \
              ! video/x-raw(memory:VAMemory),format=NV12,width={width},height={height} \
-             ! vah264enc name=encoder b-frames=0 ref-frames=1 key-int-max={} bitrate={} \
+             ! vah264enc name=encoder rate-control=cbr b-frames=0 ref-frames=1 key-int-max={} bitrate={} \
              ! h264parse config-interval=-1 \
              ! video/x-h264,stream-format=byte-stream,alignment=au \
              ! appsink name=frames max-buffers=2 drop=false sync=false wait-on-eos=false enable-last-sample=false",
@@ -193,6 +193,7 @@ fn pump(
     let mut recovery = Recovery::default();
     recovery.lost();
     let mut first = true;
+    let mut last_timestamp = None;
     let started = Instant::now();
     while running.load(Ordering::Acquire) && !sink.is_closed() {
         anyhow::ensure!(
@@ -234,12 +235,18 @@ fn pump(
         if !recovery.accept(idr) {
             continue;
         }
+        let timestamp_us = buffer
+            .pts()
+            .context("captured frame has no timestamp")?
+            .useconds();
+        anyhow::ensure!(
+            last_timestamp.is_none_or(|last| timestamp_us >= last),
+            "VA-API capture timestamps moved backwards"
+        );
+        last_timestamp = Some(timestamp_us);
         let frame = EncodedFrame {
             keyframe: idr,
-            timestamp_us: buffer
-                .pts()
-                .context("captured frame has no timestamp")?
-                .useconds(),
+            timestamp_us,
             data,
         };
         match sink.try_send(frame) {
