@@ -20,7 +20,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::clipboard;
 use crate::files;
 use crate::media::{
-    AudioConfig, EncodedAudio, EncodedFrame, FrameSink, Platform, VideoConfig, VideoSource,
+    AudioConfig, AudioSink, AudioSource, EncodedAudio, EncodedFrame, FrameSink, Platform,
+    VideoConfig, VideoSource,
 };
 
 /// How many encoded frames may wait for the network.
@@ -214,25 +215,14 @@ async fn pump(
     // Audio is optional in both directions: the entitlement may withhold it,
     // and a platform backend may not have it yet. Neither is a reason to
     // refuse a session, so a failure here is a session without sound.
-    let (audio_tx, packets) = mpsc::channel::<EncodedAudio>(AUDIO_QUEUE);
-    let mut audio = if request.policy.audio {
-        match platform.audio() {
-            Ok(mut audio) => match audio.start(audio_config, audio_tx) {
-                Ok(()) => Some(audio),
-                Err(error) => {
-                    tracing::warn!(%error, "audio capture would not start; this session is silent");
-                    None
-                }
-            },
-            Err(error) => {
-                tracing::warn!(%error, "no audio source; this session is silent");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let mut packets = audio.as_ref().map(|_| packets);
+    let (audio_tx, audio_rx) = mpsc::channel::<EncodedAudio>(AUDIO_QUEUE);
+    let mut starting_audio = request
+        .policy
+        .audio
+        .then(|| Box::pin(start_audio(platform.clone(), audio_config, audio_tx)));
+    let mut pending_packets = request.policy.audio.then_some(audio_rx);
+    let mut audio = None;
+    let mut packets = None;
 
     // The clipboard runs on its own thread and only when the entitlement
     // allows it, so a session without the permission never opens the
@@ -262,6 +252,28 @@ async fn pump(
     let mut sending: Option<VideoSend> = None;
     loop {
         tokio::select! {
+            started = async {
+                match starting_audio.as_mut() {
+                    Some(starting) => starting.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                starting_audio = None;
+                match started {
+                    Ok(Some(started)) => {
+                        audio = Some(started);
+                        packets = pending_packets.take();
+                    }
+                    Ok(None) => {
+                        pending_packets = None;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "audio capture would not start; this session is silent");
+                        pending_packets = None;
+                    }
+                }
+            }
+
             frame = frames.recv(), if sending.is_none() => {
                 let Some(frame) = frame else { break };
                 let flags = if frame.keyframe { MsgFlags::KEYFRAME } else { MsgFlags::DISCARDABLE };
@@ -401,9 +413,8 @@ async fn pump(
 
     drop(sending);
     drop(video);
-    if let Some(audio) = audio.as_mut() {
-        audio.stop();
-    }
+    drop(starting_audio);
+    drop(audio);
     tracing::info!(session = %request.session, sent = tally.sent, received = tally.received, "session ended");
     tally
 }
@@ -430,6 +441,38 @@ async fn start_video(
         let mut video = StartedVideo { source };
         video.source.start(config, sink)?;
         Ok(video)
+    })
+    .await?
+}
+
+struct StartedAudio {
+    source: Box<dyn AudioSource>,
+}
+
+impl Drop for StartedAudio {
+    fn drop(&mut self) {
+        self.source.stop();
+    }
+}
+
+async fn start_audio(
+    platform: Arc<dyn Platform>,
+    config: AudioConfig,
+    sink: AudioSink,
+) -> anyhow::Result<Option<StartedAudio>> {
+    // Optional native audio setup must not hold up video or control. Like video,
+    // the worker owns its stop guard even if the session leaves during startup.
+    tokio::task::spawn_blocking(move || {
+        let source = match platform.audio() {
+            Ok(source) => source,
+            Err(error) => {
+                tracing::warn!(%error, "no audio source; this session is silent");
+                return Ok(None);
+            }
+        };
+        let mut audio = StartedAudio { source };
+        audio.source.start(config, sink)?;
+        Ok(Some(audio))
     })
     .await?
 }
@@ -645,6 +688,7 @@ mod tests {
         injected: Arc<AtomicUsize>,
         requested: Arc<AtomicUsize>,
         stopped: Arc<AtomicUsize>,
+        audio: std::sync::Mutex<Option<WaitingAudio>>,
     }
 
     impl Platform for PumpProbe {
@@ -658,6 +702,15 @@ mod tests {
 
         fn input(&self) -> anyhow::Result<Box<dyn crate::media::InputInjector>> {
             Ok(Box::new(ProbeInput(self.injected.clone())))
+        }
+
+        fn audio(&self) -> anyhow::Result<Box<dyn AudioSource>> {
+            self.audio
+                .lock()
+                .unwrap()
+                .take()
+                .map(|audio| Box::new(audio) as Box<dyn AudioSource>)
+                .ok_or_else(|| anyhow::anyhow!("no test audio source"))
         }
     }
 
@@ -747,6 +800,7 @@ mod tests {
                 injected: Arc::default(),
                 requested: Arc::default(),
                 stopped: Arc::default(),
+                audio: std::sync::Mutex::new(None),
             });
             let request = SessionRequest {
                 session: nebula_common::SessionId::new(),
@@ -889,6 +943,251 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    struct WaitingAudio {
+        entered: Option<oneshot::Sender<AudioSink>>,
+        release: std::sync::mpsc::Receiver<()>,
+        stopped: Option<oneshot::Sender<()>>,
+        sink: Option<AudioSink>,
+        fail: bool,
+    }
+
+    impl AudioSource for WaitingAudio {
+        fn start(&mut self, _: AudioConfig, sink: AudioSink) -> anyhow::Result<()> {
+            self.sink = Some(sink.clone());
+            let _ = self.entered.take().unwrap().send(sink);
+            self.release.recv_timeout(Duration::from_secs(5))?;
+            anyhow::ensure!(!self.fail, "test audio startup failure");
+            Ok(())
+        }
+
+        fn stop(&mut self) {
+            self.sink = None;
+            if let Some(stopped) = self.stopped.take() {
+                let _ = stopped.send(());
+            }
+        }
+    }
+
+    enum AudioEnd {
+        Revoked,
+        Disconnected,
+        Cancelled,
+        Success,
+        Failure,
+    }
+
+    async fn exercise_blocking_audio(end: AudioEnd) {
+        tokio::time::timeout(Duration::from_secs(4), async {
+            let config = TransportConfig::default();
+            let credentials = ndp_transport::dev_credentials(&[]).unwrap();
+            let server = ndp_transport::server_endpoint(
+                "127.0.0.1:0".parse().unwrap(),
+                &credentials,
+                &[ndp_transport::ALPN_SESSION],
+                &config,
+            )
+            .unwrap();
+            let endpoint = client_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+            let keys = StaticKeypair::generate();
+            let public = keys.public();
+            let listener = server.clone();
+            let accept_config = config.clone();
+            let accepting = tokio::spawn(async move {
+                let conn = listener.accept().await.unwrap().await.unwrap();
+                Session::accept(
+                    conn,
+                    Responder::new(&keys, b"audio pump regression").unwrap(),
+                    |_| Ok(Vec::new()),
+                    &accept_config,
+                )
+                .await
+                .unwrap()
+            });
+            let conn = connect(
+                &endpoint,
+                server.local_addr().unwrap(),
+                "localhost",
+                credentials.fingerprint,
+                ndp_transport::ALPN_SESSION,
+                &config,
+            )
+            .await
+            .unwrap();
+            let (client, mut incoming, _) = Session::initiate(
+                conn,
+                ndp_crypto::Initiator::new(
+                    &StaticKeypair::generate(),
+                    &public,
+                    b"audio pump regression",
+                )
+                .unwrap(),
+                b"ticket",
+                &config,
+            )
+            .await
+            .unwrap();
+            let (agent, receiver) = accepting.await.unwrap();
+            let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
+            let (entered, started) = oneshot::channel();
+            let (release, gate) = std::sync::mpsc::channel();
+            let (audio_stopped, finished) = oneshot::channel();
+            let platform = Arc::new(PumpProbe {
+                sink: sink_tx,
+                injected: Arc::default(),
+                requested: Arc::default(),
+                stopped: Arc::default(),
+                audio: std::sync::Mutex::new(Some(WaitingAudio {
+                    entered: Some(entered),
+                    release: gate,
+                    stopped: Some(audio_stopped),
+                    sink: None,
+                    fail: matches!(end, AudioEnd::Failure),
+                })),
+            });
+            let request = SessionRequest {
+                session: nebula_common::SessionId::new(),
+                resource_id: uuid::Uuid::new_v4(),
+                policy: nebula_common::SessionPolicy {
+                    input: true,
+                    audio: true,
+                    ..nebula_common::SessionPolicy::view_only()
+                },
+                role: nebula_common::SessionRole::Controller,
+                relay_addr: String::new(),
+                relay_pin: String::new(),
+                pair_token: String::new(),
+                client_key: String::new(),
+            };
+            let (stop, stopped) = oneshot::channel();
+            let probe = platform.clone();
+            let running =
+                tokio::spawn(async move { pump(&request, agent, receiver, probe, stopped).await });
+            let sink = sink_rx.recv().await.unwrap();
+            let audio_sink = started.await.unwrap();
+            let frame = EncodedFrame {
+                keyframe: true,
+                timestamp_us: 1,
+                data: b"video during audio startup".to_vec(),
+            };
+            sink.send(frame.clone()).await.unwrap();
+            let video = incoming.recv().await.unwrap().unwrap();
+            assert_eq!(video.header.kind, MsgKind::VideoFrame);
+            assert_eq!(video.payload, frame.data);
+            client
+                .send(
+                    Channel::Input,
+                    MsgHeader::new(MsgKind::InputBatch, 0, 0),
+                    &InputEvent::encode_batch(&[InputEvent::mouse_move(
+                        0.5,
+                        0.5,
+                        ndp_proto::Modifiers::NONE,
+                    )]),
+                )
+                .await
+                .unwrap();
+            client
+                .send(
+                    Channel::Control,
+                    MsgHeader::new(MsgKind::Ping, 7, 9),
+                    b"responsive during audio startup",
+                )
+                .await
+                .unwrap();
+            let pong = incoming.recv().await.unwrap().unwrap();
+            assert_eq!(pong.header.kind, MsgKind::Pong);
+            assert_eq!(pong.payload, b"responsive during audio startup");
+            while platform.injected.load(Ordering::Relaxed) != 1 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(platform.stopped.load(Ordering::Relaxed), 0);
+
+            match end {
+                AudioEnd::Revoked => {
+                    stop.send("revoked during audio startup".into()).unwrap();
+                    running.await.unwrap();
+                }
+                AudioEnd::Disconnected => {
+                    client.close(0, b"leaving during audio startup");
+                    running.await.unwrap();
+                }
+                AudioEnd::Cancelled => {
+                    running.abort();
+                    assert!(running.await.unwrap_err().is_cancelled());
+                }
+                AudioEnd::Success => {
+                    let packet = EncodedAudio {
+                        timestamp_us: 42,
+                        data: vec![1, 2, 3],
+                    };
+                    audio_sink.send(packet.clone()).await.unwrap();
+                    release.send(()).unwrap();
+                    let received = incoming.recv().await.unwrap().unwrap();
+                    assert_eq!(received.header.kind, MsgKind::AudioFrame);
+                    assert_eq!(received.header.timestamp_us, packet.timestamp_us);
+                    assert_eq!(
+                        received.payload,
+                        ndp_proto::AudioFrameInfo {
+                            codec: ndp_proto::AudioCodec::Opus,
+                            channels: AudioConfig::default().channels as u8,
+                            frame_ms: 20,
+                        }
+                        .frame_payload(&packet.data)
+                    );
+                    stop.send("done".into()).unwrap();
+                    running.await.unwrap();
+                    finished.await.unwrap();
+                    assert!(audio_sink.is_closed());
+                    return;
+                }
+                AudioEnd::Failure => {
+                    release.send(()).unwrap();
+                    finished.await.unwrap();
+                    audio_sink.closed().await;
+                    sink.send(frame.clone()).await.unwrap();
+                    let received = incoming.recv().await.unwrap().unwrap();
+                    assert_eq!(received.header.kind, MsgKind::VideoFrame);
+                    assert_eq!(received.payload, frame.data);
+                    stop.send("done".into()).unwrap();
+                    running.await.unwrap();
+                    return;
+                }
+            }
+            assert_eq!(platform.stopped.load(Ordering::Relaxed), 1);
+            assert!(sink.is_closed());
+            assert!(audio_sink.is_closed());
+            // Startup has not been released: the session must already be gone.
+            release.send(()).unwrap();
+            finished.await.unwrap();
+        })
+        .await
+        .expect("blocking audio must not delay media, input, control, or teardown");
+    }
+
+    #[tokio::test]
+    async fn blocking_audio_keeps_video_input_control_and_revocation_responsive() {
+        exercise_blocking_audio(AudioEnd::Revoked).await;
+    }
+
+    #[tokio::test]
+    async fn disconnect_during_audio_startup_stops_the_eventual_source() {
+        exercise_blocking_audio(AudioEnd::Disconnected).await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_pump_during_audio_startup_stops_the_eventual_source() {
+        exercise_blocking_audio(AudioEnd::Cancelled).await;
+    }
+
+    #[tokio::test]
+    async fn successful_audio_startup_delivers_packets() {
+        exercise_blocking_audio(AudioEnd::Success).await;
+    }
+
+    #[tokio::test]
+    async fn failed_audio_startup_stops_source_and_keeps_video_running() {
+        exercise_blocking_audio(AudioEnd::Failure).await;
     }
 
     struct WaitingVideo {

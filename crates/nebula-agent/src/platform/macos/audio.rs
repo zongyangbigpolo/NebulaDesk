@@ -28,7 +28,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use opus::{Application, Channels};
 use screencapturekit::cm::{CMSampleBuffer, CMSampleBufferExt};
@@ -48,14 +48,16 @@ use crate::media::{AudioConfig, AudioSink, AudioSource, EncodedAudio};
 /// under 200 ms.
 const QUEUE_DEPTH: usize = 8;
 
+const WAKE: Duration = Duration::from_millis(100);
+
 /// The smallest video ScreenCaptureKit will agree to produce for a stream
 /// that only wants the audio.
 const DUMMY_PIXELS: u32 = 2;
 
 /// What to tell an operator when the mixer cannot be tapped.
-const PERMISSION: &str = "cannot capture system audio. Grant Screen Recording to this binary \
-     in System Settings > Privacy & Security > Screen & System Audio Recording, then run the \
-     agent again";
+const PERMISSION: &str = "cannot capture system audio. Check Screen & System Audio Recording \
+     permission and the active system audio device; ScreenCaptureKit can also fail after \
+     permission has been granted";
 
 /// Captures the system mixer and encodes it with Opus.
 pub struct MacAudio {
@@ -197,8 +199,14 @@ fn pump(
     let mut pending: Vec<f32> = Vec::with_capacity(per_packet * 2);
     let mut packet = vec![0u8; 4000];
 
-    while running.load(Ordering::Relaxed) {
-        let Ok(pcm) = incoming.recv() else { return };
+    while running.load(Ordering::Relaxed) && !sink.is_closed() {
+        // A silent or failed mixer may never deliver another callback. Stop
+        // must still join this worker without waiting for one.
+        let pcm = match incoming.recv_timeout(WAKE) {
+            Ok(pcm) => pcm,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        };
         pending.extend_from_slice(&pcm);
 
         while pending.len() >= per_packet {
@@ -268,4 +276,61 @@ fn as_floats(bytes: &[u8]) -> Vec<f32> {
         .chunks_exact(4)
         .map(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_silent_audio_pump_exits_when_its_session_has_gone() {
+        let config = AudioConfig::default();
+        let encoder = encoder_for(config).unwrap();
+        let (capture, incoming) = mpsc::sync_channel(QUEUE_DEPTH);
+        let (sink, receiver) = tokio::sync::mpsc::channel(1);
+        drop(receiver);
+        let (finished, done) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            pump(encoder, config, &incoming, &sink, &AtomicBool::new(true));
+            finished.send(()).unwrap();
+        });
+
+        let exited = done.recv_timeout(Duration::from_secs(1));
+        drop(capture);
+        worker.join().unwrap();
+        assert!(exited.is_ok(), "silence must not prevent session teardown");
+    }
+
+    #[test]
+    fn a_silent_audio_pump_observes_stop_without_a_new_sample() {
+        let config = AudioConfig::default();
+        let encoder = encoder_for(config).unwrap();
+        let (capture, incoming) = mpsc::sync_channel(QUEUE_DEPTH);
+        let (sink, mut packets) = tokio::sync::mpsc::channel(1);
+        let running = Arc::new(AtomicBool::new(true));
+        let stopping = running.clone();
+        let (finished, done) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            pump(encoder, config, &incoming, &sink, &running);
+            finished.send(()).unwrap();
+        });
+        capture
+            .send(vec![
+                0.0;
+                config.frame_samples() * usize::from(config.channels)
+            ])
+            .unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let first = runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(1), packets.recv()).await });
+        stopping.store(false, Ordering::Relaxed);
+        let exited = done.recv_timeout(Duration::from_secs(1));
+        drop(capture);
+        worker.join().unwrap();
+        assert!(matches!(first, Ok(Some(_))), "the audio pump must have run");
+        assert!(
+            exited.is_ok(),
+            "stop must not need another capture callback"
+        );
+    }
 }

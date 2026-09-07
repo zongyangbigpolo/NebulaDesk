@@ -159,6 +159,13 @@ Security, both under the agent's own binary:
 Both are tied to the exact binary, so a rebuild invalidates them. If the agent
 is already listed and still refuses, remove the entry and add it again.
 
+Audio starts independently of video and input. A slow or failed system mixer
+must not delay the first picture or session cancellation. Recording permission
+alone does not guarantee audio capture: ScreenCaptureKit can report `-3818`
+(`Stream failed to start audio`) even with permission granted and a default
+output device present. Such a session continues without sound and logs the
+underlying error; reconnect after resolving the host's audio issue.
+
 To check a machine before enrolling it, one probe per permission. Each prints
 what to do when it fails:
 
