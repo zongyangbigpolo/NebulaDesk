@@ -160,7 +160,10 @@ pub trait Platform: Send + Sync + 'static {
     /// Optionally allocate a per-session factory. Capture and input can share
     /// one desktop-portal consent session without sharing it with other peers.
     /// Stateless backends return `None` and keep using the original factory.
-    fn session_scope(&self, _allow_input: bool) -> anyhow::Result<Option<std::sync::Arc<dyn Platform>>> {
+    fn session_scope(
+        &self,
+        _allow_input: bool,
+    ) -> anyhow::Result<Option<std::sync::Arc<dyn Platform>>> {
         Ok(None)
     }
 
