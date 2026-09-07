@@ -13,6 +13,9 @@ Media Foundation encoder. Software encoders are never enumerated. Low-latency
 mode, zero B frames, and keyframe control are required driver capabilities;
 unsupported drivers fail startup explicitly. Encoded slices are also checked
 to reject a driver that emits B frames anyway.
+Startup succeeds only after the first real IDR reaches the bounded frame sink;
+missing capture frames, stalled encoder input/output, and failed IDR recovery
+produce explicit errors rather than leaving a connected black session.
 
 Every IDR carries SPS/PPS followed by four-byte AVCC NAL lengths, matching macOS.
 Raw capture queues and in-flight encoder samples are bounded. A full network

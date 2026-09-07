@@ -73,7 +73,11 @@ mod windows {
     impl VideoDecoder for Decoder {
         fn decode(&mut self, frame: &[u8]) -> anyhow::Result<Option<Picture>> {
             Ok(self.0.decode(frame)?.map(|frame| Picture {
-                width: frame.width, height: frame.height, y: frame.y, u: frame.u, v: frame.v,
+                width: frame.width,
+                height: frame.height,
+                y: frame.y,
+                u: frame.u,
+                v: frame.v,
             }))
         }
     }

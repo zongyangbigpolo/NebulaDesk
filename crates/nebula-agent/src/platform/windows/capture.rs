@@ -85,7 +85,6 @@ impl VideoSource for WindowsVideo {
                         let converter = Converter::new(&d3d, size, width, height, config.fps)?;
                         let mut encoder = Encoder::new(&d3d, width, height, config)?;
                         capture.session.StartCapture().context(CAPTURE_HELP)?;
-                        let _ = ready.send(Ok(()));
                         pump(
                             &capture,
                             &converter,
@@ -96,6 +95,7 @@ impl VideoSource for WindowsVideo {
                             &running,
                             &keyframe,
                             &bitrate,
+                            &ready,
                         )
                     })();
                     if let Err(error) = result {
@@ -553,12 +553,15 @@ fn pump(
     running: &AtomicBool,
     keyframe: &AtomicBool,
     bitrate: &AtomicU32,
+    ready: &mpsc::SyncSender<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
     let mut last_frame = started - Duration::from_secs(1);
     let interval = Duration::from_secs_f64(1.0 / config.fps as f64);
     let mut current_bitrate = config.bitrate;
     let mut delivery = Delivery::default();
+    let mut announced = false;
+    let mut recovery_since = Instant::now();
     // Retain the last real capture so a keyframe request can recover an entirely static desktop.
     let mut latest = None;
     while running.load(Ordering::Acquire) && !sink.is_closed() {
@@ -571,15 +574,34 @@ fn pump(
                 continue;
             }
             match sink.try_send(frame) {
-                Ok(()) => delivery.delivered(),
+                Ok(()) => {
+                    delivery.delivered();
+                    if !announced {
+                        ready
+                            .send(Ok(()))
+                            .context("capture startup caller disappeared")?;
+                        announced = true;
+                    }
+                }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    if delivery.accepts(false) {
+                        recovery_since = Instant::now();
+                    }
                     delivery.dropped();
                     keyframe.store(true, Ordering::Release);
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    ensure!(announced, "capture consumer closed during startup");
+                    return Ok(());
+                }
             }
         }
         let requested = bitrate.load(Ordering::Acquire);
+        if sink.capacity() == 0 {
+            recovery_since = Instant::now();
+        }
+        ensure!(delivery.accepts(false) || recovery_since.elapsed() < Duration::from_secs(5),
+            "hardware encoder did not produce a recovery IDR within five seconds; update the GPU driver");
         if requested != current_bitrate {
             ensure!(requested > 0, "requested Windows encoder bitrate is zero");
             mf::codec_u32(&encoder.codec, &CODECAPI_AVEncCommonMeanBitRate, requested)
@@ -624,6 +646,10 @@ fn pump(
         }
         std::thread::sleep(Duration::from_millis(2));
     }
+    ensure!(
+        announced,
+        "Windows capture ended before producing its first IDR"
+    );
     Ok(())
 }
 
