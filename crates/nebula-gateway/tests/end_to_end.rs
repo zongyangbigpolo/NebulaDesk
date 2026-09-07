@@ -536,15 +536,25 @@ async fn a_user_reaches_a_machine_they_were_never_told_the_address_of() {
     assert_eq!(got.channel, Channel::Input);
     assert_eq!(got.payload, vec![1u8; 32]);
 
-    // The manager should be able to account for what just happened.
-    let sessions = world.get("/v1/sessions", &world.owner_token).await;
-    let mine = sessions
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|s| s["id"].as_str() == Some(session_id.as_str()))
-        .expect("the session should be recorded");
-    assert_eq!(mine["state"], "ACTIVE");
+    // Media delivery is not a barrier for the gateway's separate HTTP report.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let sessions = world.get("/v1/sessions", &world.owner_token).await;
+            let mine = sessions
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["id"].as_str() == Some(session_id.as_str()))
+                .expect("the session should be recorded");
+            if mine["state"] != "PENDING" {
+                assert_eq!(mine["state"], "ACTIVE");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the gateway should report ACTIVE to the manager");
 
     world.gateway.shutdown();
     world.relay.shutdown();
