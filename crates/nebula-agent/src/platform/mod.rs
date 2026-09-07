@@ -15,6 +15,9 @@ pub mod macos;
 #[cfg(target_os = "linux")]
 pub mod linux;
 
+#[cfg(target_os = "windows")]
+pub mod windows;
+
 /// The backend for the platform this binary was built for.
 ///
 /// A platform without a finished backend falls back to the test pattern
@@ -32,7 +35,11 @@ pub fn native() -> Arc<dyn Platform> {
     {
         Arc::new(linux::Linux::default())
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        Arc::new(windows::Windows)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         tracing::warn!(
             os = std::env::consts::OS,

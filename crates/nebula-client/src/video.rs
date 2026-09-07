@@ -49,7 +49,13 @@ pub fn decoder() -> anyhow::Result<Box<dyn VideoDecoder>> {
     {
         Ok(Box::new(linux::VaApi::new()?))
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        Ok(Box::new(windows::Decoder(
+            nebula_agent::platform::windows::decoder::WindowsDecoder::new()?,
+        )))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         anyhow::bail!(
             "hardware video decoding is not implemented on this platform yet; \
@@ -59,11 +65,26 @@ pub fn decoder() -> anyhow::Result<Box<dyn VideoDecoder>> {
     }
 }
 
+#[cfg(target_os = "windows")]
+mod windows {
+    use super::{Picture, VideoDecoder};
+    pub struct Decoder(pub nebula_agent::platform::windows::decoder::WindowsDecoder);
+
+    impl VideoDecoder for Decoder {
+        fn decode(&mut self, frame: &[u8]) -> anyhow::Result<Option<Picture>> {
+            Ok(self.0.decode(frame)?.map(|frame| Picture {
+                width: frame.width, height: frame.height, y: frame.y, u: frame.u, v: frame.v,
+            }))
+        }
+    }
+}
+
 /// Copy a plane out of a decoder's buffer, discarding row padding.
 ///
 /// Decoders align rows to whatever suits their hardware, so a plane's stride
 /// is usually wider than the picture. Uploading the padding would tint the
 /// right-hand edge of the image with whatever happened to be in memory.
+#[cfg(any(not(target_os = "windows"), test))]
 pub(crate) fn pack(src: &[u8], stride: usize, width: usize, height: usize) -> Vec<u8> {
     if stride == width && src.len() >= width * height {
         return src[..width * height].to_vec();
@@ -86,6 +107,7 @@ pub(crate) fn pack(src: &[u8], stride: usize, width: usize, height: usize) -> Ve
 }
 
 /// De-interleave NV12's combined chroma plane into separate U and V.
+#[cfg(any(not(target_os = "windows"), test))]
 pub(crate) fn split_chroma(
     uv: &[u8],
     stride: usize,
