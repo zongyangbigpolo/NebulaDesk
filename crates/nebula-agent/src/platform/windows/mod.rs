@@ -1,7 +1,7 @@
 //! Windows desktop media. All COM media objects live on their owning MTA worker.
 
 mod audio;
-pub mod bitstream;
+mod bitstream;
 mod capture;
 pub mod decoder;
 mod input;
@@ -10,6 +10,7 @@ mod mf;
 use crate::clipboard::{ClipboardAccess, SystemClipboard};
 use crate::media::{AudioSource, InputInjector, Platform, VideoSource};
 
+/// Native Windows desktop capture, hardware media, input, and clipboard backend.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Windows;
 

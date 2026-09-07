@@ -14,11 +14,17 @@ use windows::{
     },
 };
 
+/// An owned, tightly packed progressive 8-bit YUV 4:2:0 picture.
 pub struct Planes {
+    /// Visible luma width in pixels, excluding decoder surface padding.
     pub width: u32,
+    /// Visible luma height in pixels, excluding decoder surface padding.
     pub height: u32,
+    /// Luma plane containing `width * height` samples.
     pub y: Vec<u8>,
+    /// Blue-difference chroma plane at half width and half height.
     pub u: Vec<u8>,
+    /// Red-difference chroma plane at half width and half height.
     pub v: Vec<u8>,
 }
 
@@ -27,12 +33,14 @@ struct Request {
     response: mpsc::SyncSender<anyhow::Result<Option<Planes>>>,
 }
 
+/// Hardware-only H.264 decoding through a dedicated COM/D3D11VA worker.
 pub struct WindowsDecoder {
     requests: Option<mpsc::SyncSender<Request>>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl WindowsDecoder {
+    /// Start the owning worker and require a hardware H.264 VLD/NV12 device.
     pub fn new() -> anyhow::Result<Self> {
         let (requests, incoming) = mpsc::sync_channel::<Request>(1);
         let (ready, started) = mpsc::sync_channel(1);
@@ -76,6 +84,10 @@ impl WindowsDecoder {
         Ok(decoder)
     }
 
+    /// Decode one AVCC access unit, waiting for an SPS/PPS-bearing IDR at startup.
+    ///
+    /// A parameter-set change recreates the native decoder. CPU-only output is
+    /// an error, never a software fallback.
     pub fn decode(&mut self, frame: &[u8]) -> anyhow::Result<Option<Planes>> {
         ensure!(
             frame.len() <= 64 * 1024 * 1024,

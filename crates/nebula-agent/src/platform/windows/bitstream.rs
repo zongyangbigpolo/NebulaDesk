@@ -2,7 +2,8 @@
 
 use anyhow::{bail, ensure};
 
-pub fn annex_b(avcc: &[u8]) -> anyhow::Result<Vec<u8>> {
+/// Validate a four-byte-length AVCC frame and convert its NAL units to Annex B.
+pub(crate) fn annex_b(avcc: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut rest = avcc;
     let mut out = Vec::with_capacity(avcc.len());
     while !rest.is_empty() {
@@ -55,14 +56,16 @@ fn units(bytes: &[u8]) -> anyhow::Result<Vec<&[u8]>> {
     Ok(out)
 }
 
+/// Cached SPS/PPS used to make every encoded IDR independently decodable.
 #[derive(Default)]
-pub struct ParameterSets {
+pub(crate) struct ParameterSets {
     sps: Vec<u8>,
     pps: Vec<u8>,
 }
 
 impl ParameterSets {
-    pub fn absorb(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+    /// Cache parameter sets from an Annex B sequence header or encoded frame.
+    pub(crate) fn absorb(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
         for unit in units(bytes)? {
             match unit[0] & 31 {
                 7 => self.sps = unit.to_vec(),
@@ -74,7 +77,7 @@ impl ParameterSets {
     }
 
     /// Keyframe status comes from an IDR NAL, not a driver's clean-point hint.
-    pub fn frame(&mut self, bytes: &[u8]) -> anyhow::Result<(bool, Vec<u8>)> {
+    pub(crate) fn frame(&mut self, bytes: &[u8]) -> anyhow::Result<(bool, Vec<u8>)> {
         self.absorb(bytes)?;
         let nals = units(bytes)?;
         let idr = nals.iter().any(|unit| unit[0] & 31 == 5);
@@ -116,7 +119,7 @@ fn append(out: &mut Vec<u8>, unit: &[u8]) -> anyhow::Result<()> {
 }
 
 /// Read just the progressive, 8-bit 4:2:0 geometry needed to configure MF.
-pub fn dimensions(sps: &[u8]) -> anyhow::Result<(u32, u32)> {
+pub(crate) fn dimensions(sps: &[u8]) -> anyhow::Result<(u32, u32)> {
     ensure!(
         sps.first().is_some_and(|b| b & 31 == 7),
         "missing H.264 SPS"
