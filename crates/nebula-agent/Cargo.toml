@@ -44,6 +44,14 @@ objc2-app-kit = { version = "0.3", default-features = false, features = ["std", 
 screencapturekit = "9"
 shiguredo_video_toolbox = "2026.1"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.12.3", default-features = false, features = ["tokio"] }
+futures = { workspace = true }
+gstreamer = { version = "0.24", features = ["v1_24"] }
+gstreamer-app = { version = "0.24", features = ["v1_24"] }
+gstreamer-video = { version = "0.24", features = ["v1_24"] }
+arboard = { workspace = true, features = ["wayland-data-control"] }
+
 [dev-dependencies]
 tempfile = "3"
 nebula-manager = { workspace = true }

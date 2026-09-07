@@ -8,6 +8,9 @@
 
 use crate::nal;
 
+#[cfg(target_os = "linux")]
+mod linux;
+
 /// One decoded picture, in planar 4:2:0, owned outright.
 ///
 /// The platform decoders hand back a frame that borrows GPU or decoder-owned
@@ -42,7 +45,11 @@ pub fn decoder() -> anyhow::Result<Box<dyn VideoDecoder>> {
     {
         Ok(Box::new(macos::VideoToolbox::default()))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        Ok(Box::new(linux::VaApi::new()?))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         anyhow::bail!(
             "hardware video decoding is not implemented on this platform yet; \

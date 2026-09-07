@@ -53,3 +53,8 @@ axum = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 shiguredo_video_toolbox = "2026.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gstreamer = { version = "0.24", features = ["v1_24"] }
+gstreamer-app = { version = "0.24", features = ["v1_24"] }
+gstreamer-video = { version = "0.24", features = ["v1_24"] }
