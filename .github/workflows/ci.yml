@@ -2,20 +2,32 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - polo-li-citrix-nebuladesk-rust-rearchitecture
+      - polo-li-citrix-windows-media-backend
+      - polo-li-citrix-linux-media-backend
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
 jobs:
-  # Formatting and lints do not depend on the platform, so paying for them
-  # three times only slows down the answer.
+  # Platform-specific lints also run in the native desktop matrix below.
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-linux-media
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -26,7 +38,7 @@ jobs:
   # The manager owns every placement and authorisation decision, and its tests
   # are the ones that need a database, so they run on their own.
   manager:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       postgres:
         image: postgres:16
@@ -44,9 +56,30 @@ jobs:
       NEBULA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/nebula_manager_test
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-linux-media
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
+
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.os == 'Linux'
+        uses: ./.github/actions/setup-linux-media
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked -p nebula-agent -p nebula-client --all-targets
+      # Desktop/GPU probes remain ignored; these tests need neither a display
+      # nor the production manager database.
+      - run: cargo test --locked -p nebula-agent -p nebula-client --lib
 
   # The transport is where platform differences actually bite: UDP behaviour,
   # socket options and timer resolution all differ.
