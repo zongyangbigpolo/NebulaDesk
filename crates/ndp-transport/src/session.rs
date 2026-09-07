@@ -1,5 +1,5 @@
 //! An end-to-end encrypted, channel-multiplexed session over one QUIC
-//! connection.
+//! connection by default, or a negotiated multipath logical session.
 //!
 //! A session owns the Noise handshake, the mapping from [`Channel`] to QUIC
 //! carrier, and a set of background readers that decrypt inbound records and
@@ -14,9 +14,10 @@ use ndp_crypto::{Initiator, PublicKey, RecordOpener, RecordSealer, Responder};
 use ndp_proto::{Channel, MsgFlags, MsgHeader, KEYFRAME_PRIORITY};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::Instant;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::config::TransportConfig;
+use crate::multipath::{Multipath, PathKind, PathState, PathStats};
 use crate::wire::{self, CHANNEL_PREFIX_LEN, LENGTH_PREFIX_LEN};
 use crate::{Result, TransportError};
 
@@ -58,7 +59,8 @@ const ORDERED_CHANNELS: [Channel; 2] = [Channel::Control, Channel::Input];
 pub struct Incoming {
     /// The channel it arrived on.
     pub channel: Channel,
-    /// The record header, authenticated as associated data.
+    /// The authenticated record header. In multipath mode `seq` is restored
+    /// from the authenticated logical envelope, not the native path counter.
     pub header: MsgHeader,
     /// The decrypted payload.
     pub payload: Vec<u8>,
@@ -78,7 +80,8 @@ pub enum FrameOutcome {
 /// The receiving half of a session.
 #[derive(Debug)]
 pub struct SessionReceiver {
-    rx: mpsc::Receiver<Result<Incoming>>,
+    pub(crate) rx: mpsc::Receiver<Result<Incoming>>,
+    pub(crate) _multipath: Option<Arc<Multipath>>,
 }
 
 impl SessionReceiver {
@@ -92,6 +95,7 @@ impl SessionReceiver {
 #[derive(Clone)]
 pub struct Session {
     inner: Arc<Inner>,
+    multipath: Option<Arc<Multipath>>,
 }
 
 struct Inner {
@@ -101,6 +105,16 @@ struct Inner {
     ordered: HashMap<Channel, Mutex<quinn::SendStream>>,
     max_record: usize,
     peer_static: Option<PublicKey>,
+    readers: Vec<tokio::task::AbortHandle>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.conn.close(0u32.into(), b"session dropped");
+        for reader in &self.readers {
+            reader.abort();
+        }
+    }
 }
 
 impl std::fmt::Debug for Session {
@@ -261,23 +275,32 @@ impl Session {
     ) -> (Self, SessionReceiver) {
         let (tx, rx) = mpsc::channel(INBOUND_QUEUE);
         let max_record = config.max_record;
+        let mut readers = Vec::new();
 
         for (channel, recv) in recvs {
-            tokio::spawn(read_ordered(
-                channel,
-                recv,
+            readers.push(
+                tokio::spawn(read_ordered(
+                    channel,
+                    recv,
+                    opener.clone(),
+                    tx.clone(),
+                    max_record,
+                ))
+                .abort_handle(),
+            );
+        }
+        readers.push(
+            tokio::spawn(accept_streams(
+                conn.clone(),
                 opener.clone(),
                 tx.clone(),
                 max_record,
-            ));
-        }
-        tokio::spawn(accept_streams(
-            conn.clone(),
-            opener.clone(),
-            tx.clone(),
-            max_record,
-        ));
-        tokio::spawn(read_datagrams(conn.clone(), opener, tx, max_record));
+            ))
+            .abort_handle(),
+        );
+        readers.push(
+            tokio::spawn(read_datagrams(conn.clone(), opener, tx, max_record)).abort_handle(),
+        );
 
         let session = Self {
             inner: Arc::new(Inner {
@@ -289,9 +312,126 @@ impl Session {
                     .collect(),
                 max_record,
                 peer_static,
+                readers,
             }),
+            multipath: None,
         };
-        (session, SessionReceiver { rx })
+        (
+            session,
+            SessionReceiver {
+                rx,
+                _multipath: None,
+            },
+        )
+    }
+
+    /// Opt into `multipath/1` after both peers agreed inside authenticated
+    /// handshake payloads. The existing connection is the initial relay path.
+    ///
+    /// Never use this with a legacy peer: all subsequent payloads are enveloped.
+    /// Both paths must support QUIC datagrams for end-to-end probes and ACKs.
+    /// The relay has a bounded startup grace until the first authenticated
+    /// multipath envelope proves the peer installed its readers; direct-path
+    /// blackhole detection does not inherit that grace.
+    /// Existing clones made before this call remain native; do not use them to
+    /// send application messages after conversion.
+    #[must_use]
+    pub fn into_multipath(mut self, receiver: SessionReceiver) -> (Self, SessionReceiver) {
+        if self.multipath.is_some() {
+            return (self, receiver);
+        }
+        let (multipath, receiver) = Multipath::start(self.clone(), receiver);
+        self.multipath = Some(multipath);
+        (self, receiver)
+    }
+
+    /// Attach a fresh, mutually authenticated direct Noise/QUIC connection.
+    ///
+    /// Its proven peer static key must match the relay session. Direct is
+    /// selected only after end-to-end probes demonstrate a sustained advantage.
+    /// At most one direct connection is retained; rejected candidates are closed.
+    pub async fn attach_direct(&self, direct: Session, receiver: SessionReceiver) -> Result<()> {
+        match &self.multipath {
+            Some(multipath) => multipath.attach(direct, receiver),
+            None => {
+                direct.close_native(0, b"multipath not negotiated");
+                Err(TransportError::Config("multipath not negotiated".into()))
+            }
+        }
+    }
+
+    /// Report local direct-interface loss, retiring only the attached direct
+    /// connection through normal path-failure handling.
+    ///
+    /// This synchronous notification also removes a standby direct path. If
+    /// direct was selected, retained reliable records resume on the relay and
+    /// the path epoch changes. If no other path survives, the receiver reports
+    /// terminal failure. Returns [`TransportError::NoDirectPath`] if no direct
+    /// connection is attached. Use [`Self::close`] for logical revocation.
+    pub fn disconnect_direct(&self) -> Result<()> {
+        self.multipath
+            .as_ref()
+            .ok_or(TransportError::NoDirectPath)?
+            .disconnect_direct()
+    }
+
+    /// Subscribe to route changes and peer media-epoch discontinuities.
+    ///
+    /// A new epoch means pending video should be cancelled and the decoder
+    /// reference chain refreshed. It is not a delivery or presentation ACK.
+    #[must_use]
+    pub fn path_changes(&self) -> Option<tokio::sync::watch::Receiver<PathState>> {
+        self.multipath.as_ref().map(|m| m.path_changes())
+    }
+
+    /// QUIC statistics for the currently selected hop (not end-to-end relay RTT).
+    #[must_use]
+    pub fn connection_stats(&self) -> quinn::ConnectionStats {
+        self.active_connection().stats()
+    }
+
+    /// Snapshot retained paths without changing the media epoch or its watch.
+    ///
+    /// A native session is reported as its initial `Relay` path, without an
+    /// end-to-end probe RTT. Retired multipath connections are omitted, and a
+    /// closed session returns an empty vector. Counter deltas should be keyed
+    /// by `path_id`, since a newly attached connection starts fresh counters.
+    #[must_use]
+    pub fn path_stats(&self) -> Vec<PathStats> {
+        if let Some(multipath) = &self.multipath {
+            return multipath.path_stats();
+        }
+        if self.inner.conn.close_reason().is_some() {
+            return Vec::new();
+        }
+        let stats = self.inner.conn.stats();
+        vec![PathStats {
+            kind: PathKind::Relay,
+            path_id: 0,
+            active: true,
+            udp_tx_bytes: stats.udp_tx.bytes,
+            udp_rx_bytes: stats.udp_rx.bytes,
+            end_to_end_rtt: None,
+        }]
+    }
+
+    fn active_connection(&self) -> quinn::Connection {
+        self.multipath
+            .as_ref()
+            .and_then(|m| m.connection())
+            .unwrap_or_else(|| self.inner.conn.clone())
+    }
+
+    pub(crate) fn native_connection(&self) -> quinn::Connection {
+        self.inner.conn.clone()
+    }
+
+    pub(crate) fn native_limit(&self) -> usize {
+        self.inner.max_record
+    }
+
+    pub(crate) fn is_multipath(&self) -> bool {
+        self.multipath.is_some()
     }
 
     /// The peer's cryptographically proven static public key, if the pattern
@@ -304,7 +444,7 @@ impl Session {
     /// The peer's current address. Changes if QUIC migrates the path.
     #[must_use]
     pub fn remote_address(&self) -> std::net::SocketAddr {
-        self.inner.conn.remote_address()
+        self.active_connection().remote_address()
     }
 
     /// Send one message, choosing the carrier that matches the channel.
@@ -312,6 +452,39 @@ impl Session {
     /// Video frames should use [`Session::send_video_frame`] instead so a
     /// stale frame can be abandoned rather than queued behind congestion.
     pub async fn send(&self, channel: Channel, header: MsgHeader, payload: &[u8]) -> Result<()> {
+        if let Some(multipath) = &self.multipath {
+            return multipath.send(channel, header, payload).await;
+        }
+        self.send_native(channel, header, payload).await
+    }
+
+    pub(crate) async fn send_native(
+        &self,
+        channel: Channel,
+        header: MsgHeader,
+        payload: &[u8],
+    ) -> Result<()> {
+        wire::check_len(
+            payload
+                .len()
+                .saturating_add(ndp_proto::HEADER_LEN + ndp_crypto::AEAD_TAG_LEN),
+            self.inner.max_record,
+        )?;
+        if let Some(stream) = self.inner.ordered.get(&channel) {
+            // Allocate the native sequence only after acquiring the writer:
+            // concurrent callers must not put strict-channel records on wire
+            // in a different order from their Noise counters.
+            let mut guard = stream.lock().await;
+            let record = self.inner.sealer.seal(channel, header, payload)?;
+            let mut interrupted = InterruptedOrderedWrite {
+                conn: &self.inner.conn,
+                channel,
+                complete: false,
+            };
+            write_framed(&mut guard, &record, self.inner.max_record).await?;
+            interrupted.complete = true;
+            return Ok(());
+        }
         let record = self.inner.sealer.seal(channel, header, payload)?;
         if channel.is_unreliable() {
             let mut buf = BytesMut::with_capacity(CHANNEL_PREFIX_LEN + record.len());
@@ -320,16 +493,39 @@ impl Session {
             self.inner.conn.send_datagram(buf.freeze())?;
             return Ok(());
         }
-        if let Some(stream) = self.inner.ordered.get(&channel) {
-            let mut guard = stream.lock().await;
-            write_framed(&mut guard, &record, self.inner.max_record).await?;
-            return Ok(());
-        }
-        let mut stream = self
-            .open_message_stream(channel, channel.priority())
+        let mut message = VideoStream {
+            stream: self.inner.conn.open_uni().await?,
+            finished: false,
+        };
+        let _ = message.stream.set_priority(i32::from(channel.priority()));
+        message
+            .stream
+            .write_all(&wire::channel_prefix(channel, channel.priority()))
             .await?;
-        stream.write_all(&record).await?;
-        stream.finish().map_err(|_| TransportError::Closed)?;
+        message.stream.write_all(&record).await?;
+        message
+            .stream
+            .finish()
+            .map_err(|_| TransportError::Closed)?;
+        message.finished = true;
+        Ok(())
+    }
+
+    pub(crate) fn send_datagram_native(&self, header: MsgHeader, payload: &[u8]) -> Result<()> {
+        wire::check_len(
+            payload
+                .len()
+                .saturating_add(ndp_proto::HEADER_LEN + ndp_crypto::AEAD_TAG_LEN),
+            self.inner.max_record,
+        )?;
+        let record = self.inner.sealer.seal(Channel::Audio, header, payload)?;
+        let mut buf = BytesMut::with_capacity(CHANNEL_PREFIX_LEN + record.len());
+        buf.put_slice(&wire::channel_prefix(
+            Channel::Audio,
+            Channel::Audio.priority(),
+        ));
+        buf.put_slice(&record);
+        self.inner.conn.send_datagram(buf.freeze())?;
         Ok(())
     }
 
@@ -346,6 +542,24 @@ impl Session {
         payload: &[u8],
         deadline: Option<Instant>,
     ) -> Result<FrameOutcome> {
+        if let Some(multipath) = &self.multipath {
+            return multipath.send_video(header, payload, deadline).await;
+        }
+        self.send_video_native(header, payload, deadline).await
+    }
+
+    pub(crate) async fn send_video_native(
+        &self,
+        header: MsgHeader,
+        payload: &[u8],
+        deadline: Option<Instant>,
+    ) -> Result<FrameOutcome> {
+        wire::check_len(
+            payload
+                .len()
+                .saturating_add(ndp_proto::HEADER_LEN + ndp_crypto::AEAD_TAG_LEN),
+            self.inner.max_record,
+        )?;
         let record = self.inner.sealer.seal(Channel::Video, header, payload)?;
         // A keyframe outranks the frames that depend on it. See
         // `Channel::priority` for why the rest of the ladder looks as it does.
@@ -386,35 +600,64 @@ impl Session {
         }
     }
 
-    async fn open_message_stream(
-        &self,
-        channel: Channel,
-        urgency: u8,
-    ) -> Result<quinn::SendStream> {
-        let mut stream = self.inner.conn.open_uni().await?;
-        // Scheduling is per stream, so the standing has to be declared before
-        // anything is written, and written into the prefix as well so the
-        // relay can apply the same decision on the hop it owns.
-        let _ = stream.set_priority(i32::from(urgency));
-        stream
-            .write_all(&wire::channel_prefix(channel, urgency))
-            .await?;
-        Ok(stream)
+    /// Close the connection, telling the peer why.
+    ///
+    /// In multipath mode this revokes both paths. The QUIC application-close
+    /// code reserves high bits for a logical-close marker and retains `code`
+    /// in its low 32 bits, distinguishing revocation from a failed direct hop.
+    pub fn close(&self, code: u32, reason: &[u8]) {
+        if let Some(multipath) = &self.multipath {
+            multipath.close(code, reason);
+            return;
+        }
+        self.close_native(code, reason);
     }
 
-    /// Close the connection, telling the peer why.
-    pub fn close(&self, code: u32, reason: &[u8]) {
-        self.inner.conn.close(quinn::VarInt::from_u32(code), reason);
+    pub(crate) fn close_native(&self, code: u32, reason: &[u8]) {
+        self.close_native_code(quinn::VarInt::from_u32(code), reason);
+    }
+
+    pub(crate) fn close_native_code(&self, code: quinn::VarInt, reason: &[u8]) {
+        self.inner.conn.close(code, reason);
+        for reader in &self.inner.readers {
+            reader.abort();
+        }
     }
 
     /// Largest audio record that fits in a datagram on the current path, if
     /// the peer supports datagrams at all.
     #[must_use]
     pub fn max_audio_record(&self) -> Option<usize> {
-        self.inner
-            .conn
-            .max_datagram_size()
-            .map(|n| n.saturating_sub(CHANNEL_PREFIX_LEN))
+        self.active_connection().max_datagram_size().map(|n| {
+            n.saturating_sub(
+                CHANNEL_PREFIX_LEN
+                    + if self.multipath.is_some() {
+                        crate::multipath::ENVELOPE_LEN
+                    } else {
+                        0
+                    },
+            )
+        })
+    }
+}
+
+struct InterruptedOrderedWrite<'a> {
+    conn: &'a quinn::Connection,
+    channel: Channel,
+    complete: bool,
+}
+
+impl Drop for InterruptedOrderedWrite<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            // A cancelled length-prefixed write cannot safely reuse its stream.
+            warn!(
+                channel = self.channel.name(),
+                "closing native path after interrupted ordered record"
+            );
+            self.conn
+                .close(0x11u32.into(), b"interrupted ordered record");
+        }
     }
 }
 
@@ -438,7 +681,7 @@ async fn read_ordered(
             Ok(Some(r)) => r,
             Ok(None) => {
                 debug!(channel = channel.name(), "ordered carrier closed cleanly");
-                return;
+                return fail(&tx, TransportError::Closed).await;
             }
             Err(e) => return fail(&tx, e).await,
         };
@@ -456,8 +699,13 @@ async fn accept_streams(
     tx: mpsc::Sender<Result<Incoming>>,
     max_record: usize,
 ) {
+    let mut readers = tokio::task::JoinSet::new();
     loop {
-        let recv = match conn.accept_uni().await {
+        let recv = match tokio::select! {
+            result = conn.accept_uni(), if readers.len() < INBOUND_QUEUE => result,
+            Some(_) = readers.join_next(), if !readers.is_empty() => continue,
+            _ = tx.closed() => return,
+        } {
             Ok(r) => r,
             Err(quinn::ConnectionError::ApplicationClosed(_))
             | Err(quinn::ConnectionError::LocallyClosed) => return,
@@ -465,7 +713,7 @@ async fn accept_streams(
         };
         // One task per stream: video frames are decrypted concurrently, which
         // is safe because the record layer guards replay state per channel.
-        tokio::spawn(read_message_stream(
+        readers.spawn(read_message_stream(
             recv,
             opener.clone(),
             tx.clone(),
@@ -527,6 +775,16 @@ async fn read_message_stream(
         {
             // A relay can deliver a superseded frame after the replay window
             // has advanced. Reject that frame without closing a healthy session.
+            if let Ok((header, _)) = MsgHeader::split(&record) {
+                if header.flags.contains(MsgFlags::KEYFRAME) {
+                    warn!(
+                        native_seq = seq,
+                        timestamp_us = header.timestamp_us,
+                        bytes = record.len(),
+                        "discarding stale or duplicate native video record marked keyframe"
+                    );
+                }
+            }
             trace!(seq, "discarded stale or duplicate video record");
         }
         Err(error) => fail(&tx, error).await,

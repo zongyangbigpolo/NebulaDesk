@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use ndp_crypto::{PublicKey, Responder, StaticKeypair};
 use ndp_proto::{Channel, InputEvent, MsgFlags, MsgHeader, MsgKind};
+use ndp_signal::direct::{SessionHello, MULTIPATH_GREETING};
 use ndp_signal::{RelayHello, RelayHelloAck, SessionRequest};
 use ndp_transport::{
     client_endpoint, connect, CertificateFingerprint, Incoming, Session, SessionReceiver,
@@ -72,97 +73,173 @@ pub async fn serve(
     request: SessionRequest,
     keys: StaticKeypair,
     platform: Arc<dyn Platform>,
-    stop: oneshot::Receiver<String>,
+    mut stop: oneshot::Receiver<String>,
 ) -> anyhow::Result<Tally> {
     let expected = PublicKey::from_slice(
         &hex::decode(&request.client_key)
             .map_err(|_| anyhow::anyhow!("the client key in the session request is not hex"))?,
     )?;
 
-    let config = TransportConfig::default();
-    let endpoint = client_endpoint("0.0.0.0:0".parse().expect("literal address"))?;
-    let pin = CertificateFingerprint::from_hex(&request.relay_pin).map_err(|_| {
-        anyhow::anyhow!("the relay pin in the session request is not a fingerprint")
-    })?;
-    let conn = connect(
-        &endpoint,
-        request
-            .relay_addr
-            .parse()
-            .map_err(|_| anyhow::anyhow!("the relay address is not a socket address"))?,
-        "localhost",
-        pin,
-        ALPN_RELAY,
-        &config,
-    )
-    .await?;
+    let establish = async {
+        let config = TransportConfig::default();
+        let endpoint = client_endpoint("0.0.0.0:0".parse().expect("literal address"))?;
+        let pin = CertificateFingerprint::from_hex(&request.relay_pin).map_err(|_| {
+            anyhow::anyhow!("the relay pin in the session request is not a fingerprint")
+        })?;
+        let conn = connect(
+            &endpoint,
+            request
+                .relay_addr
+                .parse()
+                .map_err(|_| anyhow::anyhow!("the relay address is not a socket address"))?,
+            "localhost",
+            pin,
+            ALPN_RELAY,
+            &config,
+        )
+        .await?;
 
-    let (mut send, mut recv) = conn.open_bi().await?;
-    ndp_signal::write_message(
-        &mut send,
-        &RelayHello {
-            pair_token: request.pair_token.clone(),
-        },
-    )
-    .await?;
-    match ndp_signal::read_message::<RelayHelloAck>(&mut recv).await? {
-        RelayHelloAck::Spliced => {}
-        RelayHelloAck::Rejected { reason } => {
-            anyhow::bail!("the relay refused this session: {reason}")
-        }
-    }
-
-    let responder = Responder::new(&keys, &prologue(request.session))?;
-    let (session, receiver) = Session::accept(
-        conn,
-        responder,
-        |ticket| {
-            // The agent cannot check the ticket's signature: it holds no
-            // manager keys, and giving it some would put a verification
-            // dependency on the machine least able to keep one current. The
-            // ticket is only evidence that the peer got this far.
-            if ticket.is_empty() {
-                return Err("no ticket was presented".into());
+        let (mut send, mut recv) = conn.open_bi().await?;
+        ndp_signal::write_message(
+            &mut send,
+            &RelayHello {
+                pair_token: request.pair_token.clone(),
+            },
+        )
+        .await?;
+        match ndp_signal::read_message::<RelayHelloAck>(&mut recv).await? {
+            RelayHelloAck::Spliced => {}
+            RelayHelloAck::Rejected { reason } => {
+                anyhow::bail!("the relay refused this session: {reason}")
             }
-            Ok(b"agent-ready".to_vec())
-        },
-        &config,
-    )
-    .await?;
-
-    // This is the check that makes a compromised gateway or relay unable to
-    // insert itself: only the holder of the private key the gateway named can
-    // have completed the handshake.
-    match session.peer_static() {
-        Some(key) if key.as_bytes() == expected.as_bytes() => {}
-        _ => {
-            session.close(0x20, b"unexpected peer");
-            anyhow::bail!("the peer is not the client this session was set up for");
         }
-    }
+
+        let responder = Responder::new(&keys, &prologue(request.session))?;
+        let mut multipath = false;
+        let (session, receiver) = Session::accept(
+            conn,
+            responder,
+            |ticket| {
+                // The agent cannot check the ticket's signature: it holds no
+                // manager keys, and giving it some would put a verification
+                // dependency on the machine least able to keep one current. The
+                // ticket is only evidence that the peer got this far.
+                multipath = session_multipath(ticket)?;
+                Ok(if multipath {
+                    MULTIPATH_GREETING
+                } else {
+                    b"agent-ready"
+                }
+                .to_vec())
+            },
+            &config,
+        )
+        .await?;
+
+        // This is the check that makes a compromised gateway or relay unable to
+        // insert itself: only the holder of the private key the gateway named can
+        // have completed the handshake.
+        match session.peer_static() {
+            Some(key) if key.as_bytes() == expected.as_bytes() => {}
+            _ => {
+                session.close(0x20, b"unexpected peer");
+                anyhow::bail!("the peer is not the client this session was set up for");
+            }
+        }
+        Ok::<_, anyhow::Error>((session, receiver, multipath))
+    };
+    let (session, receiver, multipath) = tokio::select! {
+        biased;
+        reason = &mut stop => {
+            tracing::info!(session = %request.session, reason = ?reason, "session establishment cancelled");
+            return Ok(Tally::default());
+        }
+        result = tokio::time::timeout(Duration::from_secs(20), establish) => result??,
+    };
+    let (session, receiver) = if multipath {
+        session.into_multipath(receiver)
+    } else {
+        (session, receiver)
+    };
+    let _lifetime = SessionLifetime(session.clone());
+    let _direct = multipath.then(|| {
+        crate::direct::DirectService::spawn(request.session, keys, expected, session.clone())
+    });
 
     tracing::info!(session = %request.session, "session established");
     let tally = pump(&request, session, receiver, platform, stop).await;
     Ok(tally)
 }
 
+struct SessionLifetime(Session);
+
+fn session_multipath(ticket: &[u8]) -> Result<bool, String> {
+    if ticket.first() == Some(&b'{') {
+        let hello: SessionHello =
+            serde_json::from_slice(ticket).map_err(|_| "malformed session hello".to_string())?;
+        if hello.ticket.is_empty() {
+            return Err("no ticket was presented".into());
+        }
+        Ok(hello.multipath)
+    } else if ticket.is_empty() {
+        Err("no ticket was presented".into())
+    } else {
+        Ok(false)
+    }
+}
+
+impl Drop for SessionLifetime {
+    fn drop(&mut self) {
+        self.0.close(0, b"agent session ended");
+    }
+}
+
 /// Move media until one side goes away.
 async fn pump(
     request: &SessionRequest,
     session: Session,
-    mut receiver: SessionReceiver,
+    receiver: SessionReceiver,
     platform: Arc<dyn Platform>,
     mut stop: oneshot::Receiver<String>,
 ) -> Tally {
     let mut tally = Tally::default();
+    let mut media = Box::pin(pump_media(
+        request,
+        session.clone(),
+        receiver,
+        platform,
+        &mut tally,
+    ));
+    tokio::select! {
+        biased;
+        reason = &mut stop => {
+            let reason = reason.unwrap_or_else(|_| "the session was ended".into());
+            tracing::info!(session = %request.session, %reason, "ending the session");
+            // Reliable writes can await credit indefinitely while probes stay
+            // healthy. Revoke the transport before cancelling any native cleanup.
+            session.close(0x22, reason.as_bytes());
+        }
+        () = &mut media => {}
+    }
+    drop(media);
+    tracing::info!(session = %request.session, sent = tally.sent, received = tally.received, "session ended");
+    tally
+}
 
+async fn pump_media(
+    request: &SessionRequest,
+    session: Session,
+    mut receiver: SessionReceiver,
+    platform: Arc<dyn Platform>,
+    tally: &mut Tally,
+) {
     let platform = match platform.session_scope(request.policy.input) {
         Ok(Some(scoped)) => scoped,
         Ok(None) => platform,
         Err(error) => {
             tracing::error!(%error, "could not create the session's media scope");
             session.close(0x21, b"media scope failed");
-            return tally;
+            return;
         }
     };
     let video = match platform.video() {
@@ -170,7 +247,7 @@ async fn pump(
         Err(error) => {
             tracing::error!(%error, "no video source; refusing the session");
             session.close(0x21, b"no video source");
-            return tally;
+            return;
         }
     };
     let mut input = match input_for_session(platform.as_ref(), request.policy.input) {
@@ -185,23 +262,12 @@ async fn pump(
     };
 
     let (frames_tx, mut frames) = mpsc::channel::<EncodedFrame>(FRAME_QUEUE);
-    let mut video = tokio::select! {
-        biased;
-        reason = &mut stop => {
-            let reason = reason.unwrap_or_else(|_| "the session was ended".into());
-            tracing::info!(session = %request.session, %reason, "capture startup cancelled");
-            session.close(0x22, reason.as_bytes());
-            return tally;
-        }
-        started = start_video(video, VideoConfig::default(), frames_tx) => {
-            match started {
-                Ok(video) => video,
-                Err(error) => {
-                    tracing::error!(%error, "the video source refused to start");
-                    session.close(0x21, b"capture failed");
-                    return tally;
-                }
-            }
+    let mut video = match start_video(video, VideoConfig::default(), frames_tx).await {
+        Ok(video) => video,
+        Err(error) => {
+            tracing::error!(%error, "the video source refused to start");
+            session.close(0x21, b"capture failed");
+            return;
         }
     };
 
@@ -250,8 +316,28 @@ async fn pump(
     // Keep a single send alive across select iterations. Awaiting it inside
     // the frame arm would stop input and revocation behind a congested IDR.
     let mut sending: Option<VideoSend> = None;
+    let mut path_changes = session.path_changes();
     loop {
         tokio::select! {
+            changed = async {
+                match path_changes.as_mut() {
+                    Some(changes) => changes.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if changed.is_err() {
+                    path_changes = None;
+                    continue;
+                }
+                if let Some(changes) = &path_changes {
+                    let path = *changes.borrow();
+                    tracing::info!(session = %request.session, ?path, "session media path changed");
+                }
+                sending = None;
+                while frames.try_recv().is_ok() {}
+                video.source.request_keyframe();
+            }
+
             started = async {
                 match starting_audio.as_mut() {
                     Some(starting) => starting.await,
@@ -276,6 +362,12 @@ async fn pump(
 
             frame = frames.recv(), if sending.is_none() => {
                 let Some(frame) = frame else { break };
+                tracing::trace!(
+                    timestamp_us = frame.timestamp_us,
+                    keyframe = frame.keyframe,
+                    bytes = frame.data.len(),
+                    "video source frame"
+                );
                 let flags = if frame.keyframe { MsgFlags::KEYFRAME } else { MsgFlags::DISCARDABLE };
                 let header = MsgHeader::new(MsgKind::VideoFrame, seq, frame.timestamp_us)
                     .with_flags(flags);
@@ -379,17 +471,6 @@ async fn pump(
                 }
             }
 
-            reason = &mut stop => {
-                // The gateway revoked this session: entitlement withdrawn,
-                // an administrator ending it, or the client having gone.
-                // Closing with the reason means the client can say why the
-                // window went away instead of showing a network error.
-                let reason = reason.unwrap_or_else(|_| "the session was ended".into());
-                tracing::info!(session = %request.session, %reason, "ending the session");
-                session.close(0x22, reason.as_bytes());
-                break;
-            }
-
             message = receiver.recv() => {
                 let Some(message) = message else { break };
                 let Ok(message) = message else { break };
@@ -415,8 +496,6 @@ async fn pump(
     drop(video);
     drop(starting_audio);
     drop(audio);
-    tracing::info!(session = %request.session, sent = tally.sent, received = tally.received, "session ended");
-    tally
 }
 
 struct StartedVideo {
@@ -681,6 +760,17 @@ fn inbound_file(kind: MsgKind, payload: &[u8]) -> anyhow::Result<Option<files::I
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multipath_is_negotiated_without_reinterpreting_legacy_sessions() {
+        assert!(!session_multipath(b"legacy-ticket").unwrap());
+        assert!(session_multipath(br#"{"ticket":"signed-ticket","multipath":true}"#).unwrap());
+        assert!(!session_multipath(br#"{"ticket":"signed-ticket","multipath":false}"#).unwrap());
+        assert!(session_multipath(b"").is_err());
+        assert!(session_multipath(br#"{"ticket":"","multipath":true}"#).is_err());
+        assert!(session_multipath(br#"{"ticket":true,"multipath":true}"#).is_err());
+        assert!(session_multipath(b"{").is_err());
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct PumpProbe {
@@ -689,6 +779,7 @@ mod tests {
         requested: Arc<AtomicUsize>,
         stopped: Arc<AtomicUsize>,
         audio: std::sync::Mutex<Option<WaitingAudio>>,
+        close_before_stop: Option<quinn::Connection>,
     }
 
     impl Platform for PumpProbe {
@@ -697,6 +788,7 @@ mod tests {
                 sink: self.sink.clone(),
                 requested: self.requested.clone(),
                 stopped: self.stopped.clone(),
+                close_before_stop: self.close_before_stop.clone(),
             }))
         }
 
@@ -718,6 +810,7 @@ mod tests {
         sink: mpsc::UnboundedSender<FrameSink>,
         requested: Arc<AtomicUsize>,
         stopped: Arc<AtomicUsize>,
+        close_before_stop: Option<quinn::Connection>,
     }
 
     impl VideoSource for ProbeVideo {
@@ -730,6 +823,12 @@ mod tests {
         }
         fn set_bitrate(&mut self, _: u32) {}
         fn stop(&mut self) {
+            if let Some(conn) = &self.close_before_stop {
+                assert!(
+                    conn.close_reason().is_some(),
+                    "close transport before stopping capture"
+                );
+            }
             self.stopped.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -801,6 +900,7 @@ mod tests {
                 requested: Arc::default(),
                 stopped: Arc::default(),
                 audio: std::sync::Mutex::new(None),
+                close_before_stop: None,
             });
             let request = SessionRequest {
                 session: nebula_common::SessionId::new(),
@@ -890,6 +990,209 @@ mod tests {
         })
         .await
         .expect("loopback pump test timed out");
+    }
+
+    #[tokio::test]
+    async fn revocation_interrupts_blocked_reliable_pong_and_preserves_tally() {
+        tokio::time::timeout(Duration::from_secs(6), async {
+            let config = TransportConfig::default();
+            let credentials = ndp_transport::dev_credentials(&[]).unwrap();
+            let server = ndp_transport::server_endpoint(
+                "127.0.0.1:0".parse().unwrap(),
+                &credentials,
+                &[ndp_transport::ALPN_SESSION],
+                &config,
+            )
+            .unwrap();
+            let endpoint = client_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+            let keys = StaticKeypair::generate();
+            let public = keys.public();
+            let listener = server.clone();
+            let accept_config = config.clone();
+            let accepting = tokio::spawn(async move {
+                let conn = listener.accept().await.unwrap().await.unwrap();
+                let (session, receiver) = Session::accept(
+                    conn.clone(),
+                    Responder::new(&keys, b"blocked pong regression").unwrap(),
+                    |_| Ok(Vec::new()),
+                    &accept_config,
+                )
+                .await
+                .unwrap();
+                (session, receiver, conn)
+            });
+            let client_conn = connect(
+                &endpoint,
+                server.local_addr().unwrap(),
+                "localhost",
+                credentials.fingerprint,
+                ndp_transport::ALPN_SESSION,
+                &config,
+            )
+            .await
+            .unwrap();
+            let (client, incoming, _) = Session::initiate(
+                client_conn.clone(),
+                ndp_crypto::Initiator::new(
+                    &StaticKeypair::generate(),
+                    &public,
+                    b"blocked pong regression",
+                )
+                .unwrap(),
+                b"ticket",
+                &config,
+            )
+            .await
+            .unwrap();
+            let (client, mut incoming) = client.into_multipath(incoming);
+            let (agent, receiver, agent_conn) = accepting.await.unwrap();
+            let (agent, receiver) = agent.into_multipath(receiver);
+            let monitor = agent.clone();
+            let _cleanup = SessionLifetime(agent.clone());
+            let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
+            let (entered, started) = oneshot::channel();
+            let (release, gate) = std::sync::mpsc::channel();
+            let (audio_stopped, finished) = oneshot::channel();
+            let platform = Arc::new(PumpProbe {
+                sink: sink_tx,
+                injected: Arc::default(),
+                requested: Arc::default(),
+                stopped: Arc::default(),
+                audio: std::sync::Mutex::new(Some(WaitingAudio {
+                    entered: Some(entered),
+                    release: gate,
+                    stopped: Some(audio_stopped),
+                    sink: None,
+                    fail: false,
+                })),
+                close_before_stop: Some(agent_conn.clone()),
+            });
+            let request = SessionRequest {
+                session: nebula_common::SessionId::new(),
+                resource_id: uuid::Uuid::new_v4(),
+                policy: nebula_common::SessionPolicy {
+                    audio: true,
+                    ..nebula_common::SessionPolicy::view_only()
+                },
+                role: nebula_common::SessionRole::Viewer,
+                relay_addr: String::new(),
+                relay_pin: String::new(),
+                pair_token: String::new(),
+                client_key: String::new(),
+            };
+            let (stop, stopped) = oneshot::channel();
+            let probe = platform.clone();
+            let mut tasks = tokio::task::JoinSet::new();
+            tasks.spawn(async move { pump(&request, agent, receiver, probe, stopped).await });
+            let sink = sink_rx.recv().await.unwrap();
+            let frame = EncodedFrame {
+                keyframe: true,
+                timestamp_us: 1,
+                data: b"counted video".to_vec(),
+            };
+            sink.send(frame.clone()).await.unwrap();
+            let video = incoming.recv().await.unwrap().unwrap();
+            assert_eq!(video.header.kind, MsgKind::VideoFrame);
+            let audio_sink = started.await.unwrap();
+            release.send(()).unwrap();
+            audio_sink
+                .send(EncodedAudio {
+                    timestamp_us: 2,
+                    data: vec![1, 2, 3],
+                })
+                .await
+                .unwrap();
+            let audio = incoming.recv().await.unwrap().unwrap();
+            assert_eq!(audio.header.kind, MsgKind::AudioFrame);
+            let media_bytes = (video.payload.len() + audio.payload.len()) as u64;
+
+            // Retain but stop draining the application receiver. The encrypted
+            // path's probes keep running while reliable Pong credit runs out.
+            let sent = Arc::new(AtomicUsize::new(0));
+            let progress = sent.clone();
+            let sender = client.clone();
+            let mut flooding = tokio::task::JoinSet::new();
+            flooding.spawn(async move {
+                for _ in 0..512 {
+                    sender
+                        .send(
+                            Channel::Control,
+                            MsgHeader::new(MsgKind::Ping, 0, 0),
+                            b"flood",
+                        )
+                        .await?;
+                    progress.fetch_add(1, Ordering::Relaxed);
+                    sender
+                        .send(
+                            Channel::Control,
+                            MsgHeader::new(MsgKind::CapsUpdate, 0, 0),
+                            b"",
+                        )
+                        .await?;
+                }
+                Ok::<_, ndp_transport::TransportError>(())
+            });
+            while sent.load(Ordering::Relaxed) < 128 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), flooding.join_next())
+                    .await
+                    .is_err()
+            );
+            // The pump can no longer drain capture either: it is inside the
+            // awaited Pong handler, not waiting at its ordinary select loop.
+            for _ in 0..FRAME_QUEUE {
+                sink.send(frame.clone()).await.unwrap();
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), sink.send(frame.clone()),)
+                    .await
+                    .is_err()
+            );
+            let handled = platform.requested.load(Ordering::Relaxed);
+            assert!(handled > 0);
+            let before = monitor.path_stats()[0].udp_rx_bytes;
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            let stats = monitor.path_stats();
+            assert_eq!(stats.len(), 1);
+            assert!(stats[0].end_to_end_rtt.is_some());
+            assert!(stats[0].udp_rx_bytes > before, "probes must remain live");
+            assert_eq!(platform.requested.load(Ordering::Relaxed), handled);
+            assert!(agent_conn.close_reason().is_none());
+
+            stop.send("gateway revoked blocked session".into()).unwrap();
+            let tally = tokio::time::timeout(Duration::from_millis(300), tasks.join_next())
+                .await
+                .expect("gateway revocation must interrupt a blocked reliable Pong")
+                .unwrap()
+                .unwrap();
+            assert_eq!(tally.sent, media_bytes);
+            assert!(tally.received >= (handled * b"flood".len()) as u64);
+            assert_eq!(platform.stopped.load(Ordering::Relaxed), 1);
+            finished.await.unwrap();
+            assert!(sink.is_closed());
+            assert!(audio_sink.is_closed());
+            client_conn.closed().await;
+            let terminal = loop {
+                match incoming.recv().await {
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => break error,
+                    None => panic!("logical receiver omitted the revocation error"),
+                }
+            };
+            let ndp_transport::TransportError::Connection(
+                quinn::ConnectionError::ApplicationClosed(closed),
+            ) = terminal
+            else {
+                panic!("revocation must retain the application's close reason: {terminal:?}");
+            };
+            assert_eq!(closed.error_code.into_inner() & 0xffff_ffff, 0x22);
+            assert_eq!(closed.reason.as_ref(), b"gateway revoked blocked session");
+            flooding.abort_all();
+        })
+        .await
+        .expect("encrypted multipath revocation regression timed out");
     }
 
     #[derive(Default)]
@@ -1045,6 +1348,7 @@ mod tests {
                     sink: None,
                     fail: matches!(end, AudioEnd::Failure),
                 })),
+                close_before_stop: None,
             });
             let request = SessionRequest {
                 session: nebula_common::SessionId::new(),

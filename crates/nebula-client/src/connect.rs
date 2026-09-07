@@ -11,10 +11,11 @@
 //! fail the handshake rather than succeed at eavesdropping.
 
 use ndp_crypto::{Initiator, PublicKey, StaticKeypair};
+use ndp_signal::direct::{SessionHello, MULTIPATH_GREETING};
 use ndp_signal::{ClientHello, ClientHelloAck, RelayHello, RelayHelloAck};
 use ndp_transport::{
-    client_endpoint, connect, CertificateFingerprint, Session, SessionReceiver, TransportConfig,
-    ALPN_RELAY, ALPN_SESSION,
+    client_endpoint, connect, CertificateFingerprint, Session, TransportConfig, ALPN_RELAY,
+    ALPN_SESSION,
 };
 
 use crate::manager::SessionTicket;
@@ -24,7 +25,7 @@ pub struct Connected {
     /// Send side: input, control, and acknowledgements.
     pub session: Session,
     /// Receive side: video, audio, and control from the agent.
-    pub incoming: SessionReceiver,
+    pub incoming: crate::ConnectedReceiver,
     /// The signalling connection to the gateway, held open deliberately.
     ///
     ///
@@ -90,13 +91,31 @@ pub async fn connect_to_agent(ticket: &SessionTicket) -> anyhow::Result<Connecte
         &agent_key,
         &nebula_agent::session::prologue(accepted.session),
     )?;
-    let (session, incoming, greeting) =
-        Session::initiate(conn, initiator, ticket.ticket.as_bytes(), &config)
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!("the agent would not complete the handshake: {error}")
-            })?;
+    let hello = serde_json::to_vec(&SessionHello {
+        ticket: ticket.ticket.clone(),
+        multipath: true,
+    })?;
+    let (session, incoming, greeting) = Session::initiate(conn, initiator, &hello, &config)
+        .await
+        .map_err(|error| {
+        anyhow::anyhow!("the agent would not complete the handshake: {error}")
+    })?;
     tracing::debug!(greeting = %String::from_utf8_lossy(&greeting), "the agent accepted the session");
+    let multipath = greeting == MULTIPATH_GREETING;
+    let (session, incoming) = if multipath {
+        session.into_multipath(incoming)
+    } else {
+        tracing::info!("agent uses a legacy single relay path");
+        (session, incoming)
+    };
+    let incoming = crate::ConnectedReceiver::new(
+        incoming,
+        session.clone(),
+        keys,
+        agent_key,
+        accepted.session,
+        multipath,
+    );
 
     Ok(Connected {
         session,

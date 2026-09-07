@@ -9,6 +9,7 @@ description = "Signalling messages and relay pairing tokens shared by the Nebula
 
 [dependencies]
 nebula-common = { workspace = true }
+ndp-proto = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

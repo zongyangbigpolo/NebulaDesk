@@ -468,7 +468,7 @@ async fn the_clipboard_crosses_in_both_directions() {
 
     /// Wait for a clipboard message, ignoring the media flowing past.
     async fn next(
-        incoming: &mut ndp_transport::SessionReceiver,
+        incoming: &mut nebula_client::ConnectedReceiver,
     ) -> Result<ndp_transport::Incoming, tokio::time::error::Elapsed> {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {

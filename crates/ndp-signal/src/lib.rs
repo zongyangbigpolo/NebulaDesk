@@ -10,6 +10,7 @@
 
 #![warn(missing_docs)]
 
+pub mod direct;
 pub mod framing;
 pub mod messages;
 pub mod pairing;
@@ -24,6 +25,9 @@ pub use pairing::{generate_secret, PairKey, PairToken, Side, TokenError};
 /// A signalling failure.
 #[derive(Debug, thiserror::Error)]
 pub enum SignalError {
+    /// An authenticated direct offer had invalid identity or addressing.
+    #[error("invalid direct-path offer: {0}")]
+    InvalidDirect(&'static str),
     /// The message did not fit the size limit.
     #[error("signalling message of {0} bytes exceeds the limit")]
     TooLarge(usize),

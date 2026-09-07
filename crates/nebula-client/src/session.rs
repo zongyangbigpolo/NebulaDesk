@@ -30,6 +30,12 @@ use crate::video::{self, Picture};
 /// The newest picture, waiting to be drawn.
 type Mailbox = Arc<Mutex<Option<Picture>>>;
 
+enum SessionEvent {
+    Frame,
+    Path(ndp_transport::PathKind),
+    Ended,
+}
+
 /// Connect, open a window, and run until the user closes it.
 ///
 /// This takes over the calling thread: both macOS and Windows require the
@@ -58,8 +64,8 @@ pub fn run(ticket: SessionTicket, resource_name: &str) -> anyhow::Result<()> {
         Arc::clone(&mailbox),
         input_rx,
         drop_rx,
-        move || {
-            let _ = waker.send_event(());
+        move |event| {
+            let _ = waker.send_event(event);
         },
     ));
 
@@ -73,6 +79,7 @@ pub fn run(ticket: SessionTicket, resource_name: &str) -> anyhow::Result<()> {
         modifiers: ndp_proto::Modifiers::NONE,
         viewport: Viewport::fit((1.0, 1.0), (1, 1)),
         pointer: None,
+        status: "Connecting",
     };
     event_loop.run_app(&mut app)?;
 
@@ -94,6 +101,7 @@ struct App {
     modifiers: ndp_proto::Modifiers,
     viewport: Viewport,
     pointer: Option<(f32, f32)>,
+    status: &'static str,
 }
 
 impl App {
@@ -115,7 +123,7 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<SessionEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             // Resuming happens more than once on mobile-style lifecycles;
@@ -123,7 +131,7 @@ impl ApplicationHandler for App {
             return;
         }
         let attributes = Window::default_attributes()
-            .with_title(&self.title)
+            .with_title(format!("{} [{}]", self.title, self.status))
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
@@ -145,10 +153,24 @@ impl ApplicationHandler for App {
         self.window = Some(window);
     }
 
-    fn user_event(&mut self, _: &ActiveEventLoop, (): ()) {
-        // A frame arrived.
+    fn user_event(&mut self, _: &ActiveEventLoop, event: SessionEvent) {
+        match event {
+            SessionEvent::Frame => {
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+                return;
+            }
+            SessionEvent::Path(path) => {
+                self.status = match path {
+                    ndp_transport::PathKind::Relay => "Relay",
+                    ndp_transport::PathKind::Direct => "Direct",
+                };
+            }
+            SessionEvent::Ended => self.status = "Disconnected",
+        }
         if let Some(window) = &self.window {
-            window.request_redraw();
+            window.set_title(format!("{} [{}]", self.title, self.status).as_str());
         }
     }
 
@@ -264,12 +286,13 @@ async fn pump(
     mailbox: Mailbox,
     mut input: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
     mut dropped: tokio::sync::mpsc::UnboundedReceiver<std::path::PathBuf>,
-    wake: impl Fn() + Send + 'static,
+    wake: impl Fn(SessionEvent) + Send + 'static,
 ) {
     let connected = match crate::connect_to_agent(&ticket).await {
         Ok(connected) => connected,
         Err(error) => {
             tracing::error!(%error, "could not connect to the resource");
+            wake(SessionEvent::Ended);
             return;
         }
     };
@@ -286,6 +309,7 @@ async fn pump(
         Ok(decoder) => decoder,
         Err(error) => {
             tracing::error!(%error, "no video decoder");
+            wake(SessionEvent::Ended);
             return;
         }
     };
@@ -325,10 +349,39 @@ async fn pump(
     let mut stats = Stats::new();
     let mut report = tokio::time::interval(Stats::EVERY);
     report.tick().await;
+    let mut path_changes = session.path_changes();
+    wake(SessionEvent::Path(
+        path_changes
+            .as_ref()
+            .map(|changes| changes.borrow().kind)
+            .unwrap_or(ndp_transport::PathKind::Relay),
+    ));
 
     loop {
         let recovery_at = order.recovery_deadline();
         tokio::select! {
+            changed = async {
+                match path_changes.as_mut() {
+                    Some(changes) => changes.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if changed.is_err() {
+                    path_changes = None;
+                    continue;
+                }
+                if let Some(changes) = &path_changes {
+                    let path = *changes.borrow();
+                    tracing::info!(session = %ticket.session_id, ?path, "session media path changed");
+                    wake(SessionEvent::Path(path.kind));
+                }
+                if order.decode_failed().ask_for_keyframe
+                    && !request_keyframe(&session, &mut seq).await
+                {
+                    break;
+                }
+            }
+
             _ = async {
                 match recovery_at {
                     Some(at) => tokio::time::sleep_until(at.into()).await,
@@ -347,6 +400,7 @@ async fn pump(
                 // nothing at all is exactly the one worth knowing about, and
                 // it is the one that would never reach a per-frame report.
                 stats.report();
+                tracing::debug!(paths = ?session.path_stats(), "session path counters");
             }
 
             message = incoming.recv() => {
@@ -408,7 +462,7 @@ async fn pump(
                     if let Ok(mut slot) = mailbox.lock() {
                         *slot = Some(picture);
                     }
-                    wake();
+                    wake(SessionEvent::Frame);
                 });
                 if ask && !request_keyframe(&session, &mut seq).await {
                     break;
@@ -488,6 +542,7 @@ async fn pump(
     }
 
     tracing::info!("the session ended");
+    wake(SessionEvent::Ended);
     let _ = session
         .send(Channel::Control, MsgHeader::new(MsgKind::Bye, seq, 0), b"")
         .await;

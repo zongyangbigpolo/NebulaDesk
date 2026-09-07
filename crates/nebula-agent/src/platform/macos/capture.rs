@@ -239,6 +239,34 @@ struct Capture {
     bitrate: u32,
 }
 
+struct CaptureFrames<T> {
+    last: Option<T>,
+    force_key: bool,
+}
+
+impl<T> CaptureFrames<T> {
+    fn new() -> Self {
+        Self {
+            last: None,
+            force_key: true,
+        }
+    }
+
+    fn select(&mut self, frame: Option<T>, requested: &AtomicBool) -> Option<(&T, bool)> {
+        let changed = frame.is_some();
+        if let Some(frame) = frame {
+            self.last = Some(frame);
+        }
+        let frame = self.last.as_ref()?;
+        if !changed && !self.force_key && !requested.load(Ordering::Relaxed) {
+            return None;
+        }
+        let key = requested.swap(false, Ordering::Relaxed) || self.force_key;
+        self.force_key = false;
+        Some((frame, key))
+    }
+}
+
 /// Encode captured frames until capture stops or the client goes away.
 fn pump(
     mut capture: Capture,
@@ -249,11 +277,7 @@ fn pump(
     running: &AtomicBool,
 ) {
     let started = Instant::now();
-    // The first frame a client sees must be decodable on its own.
-    let mut force_key = true;
-    // The most recent frame, kept so a keyframe can be produced without
-    // waiting for the screen to change.
-    let mut last: Option<CMSampleBuffer> = None;
+    let mut frames = CaptureFrames::new();
 
     loop {
         // Waking periodically rather than blocking outright is what makes
@@ -262,32 +286,8 @@ fn pump(
         // this thread, so the channel cannot close until this loop has
         // already returned; waiting on it alone deadlocks `stop`.
         let sample = match incoming.recv_timeout(WAKE) {
-            Ok(sample) => sample,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if !running.load(Ordering::Relaxed) || sink.is_closed() {
-                    return;
-                }
-                // A screen that is not changing produces no frames, which is
-                // the desired behaviour and not a fault: the client already
-                // shows the last one.
-                //
-                // Except when the client has asked for a keyframe, which it
-                // does when it could not decode something. Waiting for the
-                // screen to move would leave it black for as long as nobody
-                // touches the machine — which, on an idle desktop, is
-                // indefinitely. Re-encoding the last frame costs one
-                // keyframe and ends the blackout immediately.
-                if !keyframe.swap(false, Ordering::Relaxed) {
-                    continue;
-                }
-                let Some(sample) = last.as_ref() else {
-                    continue;
-                };
-                if !encode(&mut capture, sample, true, sink, keyframe, started) {
-                    return;
-                }
-                continue;
-            }
+            Ok(sample) => Some(sample),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         };
         if sink.is_closed() || !running.load(Ordering::Relaxed) {
@@ -305,51 +305,38 @@ fn pump(
                     // A fresh session has no reference frames, so the first
                     // frame out of it must be a keyframe or the client
                     // decodes garbage.
-                    force_key = true;
+                    frames.force_key = true;
                 }
                 Err(error) => tracing::warn!(%error, "could not change the encoder's bitrate"),
             }
         }
 
-        let wanted_key = force_key || keyframe.swap(false, Ordering::Relaxed);
-        force_key = false;
-        if !encode(&mut capture, &sample, wanted_key, sink, keyframe, started) {
+        // Idle ScreenCaptureKit notifications may have no image buffer. They
+        // must neither replace the last usable image nor consume an IDR request.
+        // The bridge returns a +1 reference; this owner balances it exactly once.
+        let buffer = sample.and_then(|sample| CVPixelBuffer::from_raw(sample.image_buffer_ptr()));
+        if let Some((buffer, force_key_frame)) = frames.select(buffer, keyframe) {
+            // SAFETY: the cached owner keeps this same-format capture surface
+            // alive until VideoToolbox has retained it for asynchronous encoding.
+            if let Err(error) = unsafe {
+                capture
+                    .encoder
+                    .encode_pixel_buffer(buffer.as_ptr(), &EncodeOptions { force_key_frame })
+            } {
+                tracing::warn!(?error, "the encoder rejected a frame");
+                keyframe.store(true, Ordering::Relaxed);
+            }
+        }
+        // Encoding is asynchronous: a cached IDR may complete after submission
+        // even when the desktop supplies no further usable capture samples.
+        if !drain(&mut capture, sink, keyframe, started) {
             return;
         }
-        last = Some(sample);
     }
 }
 
-/// Encode one frame and forward whatever comes out. Returns false when the
-/// session has gone and the loop should end.
-fn encode(
-    capture: &mut Capture,
-    sample: &CMSampleBuffer,
-    force_key_frame: bool,
-    sink: &FrameSink,
-    keyframe: &AtomicBool,
-    started: Instant,
-) -> bool {
-    // `image_buffer_ptr` is named for CMSampleBufferGetImageBuffer, but the
-    // bridge underneath hands back a +1 reference. Nothing here owns it
-    // otherwise, and every leaked frame is one of the stream's fixed pool of
-    // `QUEUE_DEPTH` surfaces: leak them all and ScreenCaptureKit quietly stops
-    // delivering, which looks exactly like a screen that froze.
-    let Some(buffer) = CVPixelBuffer::from_raw(sample.image_buffer_ptr()) else {
-        return true;
-    };
-    // SAFETY: the pointer comes straight from a live CMSampleBuffer that
-    // outlives this call, and the stream was configured with the same
-    // dimensions and pixel format the encoder was built for.
-    if let Err(error) = unsafe {
-        capture
-            .encoder
-            .encode_pixel_buffer(buffer.as_ptr(), &EncodeOptions { force_key_frame })
-    } {
-        tracing::warn!(?error, "the encoder rejected a frame");
-        return true;
-    }
-
+/// Forward completed output, including completion during a static desktop.
+fn drain(capture: &mut Capture, sink: &FrameSink, keyframe: &AtomicBool, started: Instant) -> bool {
     loop {
         match capture.encoder.next_frame() {
             Ok(Some(frame)) => {
@@ -513,6 +500,50 @@ mod tests {
         assert!(!differs_materially(10_000_000, 9_500_000));
         assert!(differs_materially(10_000_000, 5_000_000));
         assert!(differs_materially(10_000_000, 20_000_000));
+    }
+
+    #[test]
+    fn idle_notifications_keep_the_last_image_and_replay_requested_idr() {
+        let request = AtomicBool::new(false);
+        let mut frames = CaptureFrames::new();
+        assert_eq!(frames.select(Some(7), &request), Some((&7, true)));
+        assert_eq!(frames.select(None, &request), None);
+        request.store(true, Ordering::Relaxed);
+        assert_eq!(frames.select(None, &request), Some((&7, true)));
+        assert!(!request.load(Ordering::Relaxed));
+        assert_eq!(frames.select(None, &request), None);
+        assert_eq!(frames.select(Some(8), &request), Some((&8, false)));
+    }
+
+    #[test]
+    fn a_request_before_the_first_image_is_not_consumed() {
+        let request = AtomicBool::new(true);
+        let mut frames = CaptureFrames::new();
+        assert_eq!(frames.select(None, &request), None);
+        assert!(request.load(Ordering::Relaxed));
+        assert_eq!(frames.select(Some(7), &request), Some((&7, true)));
+        assert!(!request.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn replacing_or_dropping_the_cache_releases_each_owned_image_once() {
+        use std::sync::atomic::AtomicUsize;
+        struct Image(Arc<AtomicUsize>);
+        impl Drop for Image {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let request = AtomicBool::new(false);
+        let mut frames = CaptureFrames::new();
+        frames.select(Some(Image(Arc::clone(&dropped))), &request);
+        frames.select(None, &request);
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+        frames.select(Some(Image(Arc::clone(&dropped))), &request);
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        drop(frames);
+        assert_eq!(dropped.load(Ordering::Relaxed), 2);
     }
 
     /// Capture must keep going indefinitely, not stop once it has handed out

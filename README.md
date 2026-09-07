@@ -25,21 +25,51 @@ flowchart LR
     G --> M[nebula-manager]
     C <-->|encrypted media| R[nebula-relay]
     A <-->|encrypted media| R
+    C <-.->|preferred authenticated direct path| A
 ```
 
-Three decisions shape everything else:
+Four decisions shape everything else:
 
 **The agent dials out.** A machine on a desk behind a home router is reachable
 because it holds a connection to a gateway, not because someone forwarded a
 port to it.
 
-**One QUIC connection, many streams.** Video, audio, input and control share a
+**One logical session, many QUIC streams.** Video, audio, input and control share a
 path without blocking each other, and a frame that is already too late is
 cancelled rather than delivered.
 
 **Noise IK between the endpoints.** The client encrypts to the machine's static
 key. A gateway or relay that is fully compromised can drop a session but cannot
 read or forge one.
+
+**Prefer a proven faster direct path; keep a relay fallback.** After gateway
+authorisation and the initial encrypted relay handshake, compatible peers
+exchange bounded local-interface candidates and probe a separately authenticated
+direct QUIC connection. The session selects direct only when its measured path
+RTT is better. The relay stays warm, carrying small liveness probes rather than
+duplicated media, so a failed direct path can fall back without reopening the
+resource or restarting capture. The client title shows the actual `Relay` or
+`Direct` route. Gateway signalling remains connected for revocation and session
+lifetime; it is not part of the media path.
+
+Direct negotiation currently covers reachable IPv4 and unscoped IPv6 host
+addresses, not STUN/NAT hole punching. Blocked or slower candidates leave the
+relay session running. Older peers retain the single-relay protocol.
+
+For a controlled routing check against an authorised resource, the headless
+probe can close just its direct connection and require a relay round trip and
+post-switch keyframe without opening another logical session:
+
+```sh
+# NEBULA_PASSWORD supplies the account password; use an exact resource UUID.
+cargo run --release -p nebula-client --example path_probe -- \
+  --manager-url "$NEBULA_MANAGER_URL" --tenant "$NEBULA_TENANT" \
+  --email "$NEBULA_EMAIL" --resource-id "$RESOURCE_ID" \
+  --seconds 60 --disconnect-direct-after 15
+```
+
+The probe reports authenticated received records and per-path transport
+counters. It does not decode video or establish physical presentation latency.
 
 The protocol and the reasoning behind it are in
 [`docs/architecture/NEBULA_V2.md`](docs/architecture/NEBULA_V2.md).
@@ -158,6 +188,14 @@ Security, both under the agent's own binary:
 
 Both are tied to the exact binary, so a rebuild invalidates them. If the agent
 is already listed and still refuses, remove the entry and add it again.
+
+Direct connections also need **Local Network** access on both Macs. A CLI
+launched by an IDE or terminal may inherit that application's privacy identity.
+Successful system `ssh`/`nc` traffic does not prove that Nebula has the same
+permission. If macOS reports `Local network prohibited`, allow the responsible
+application under Privacy & Security > Local Network and relaunch it if needed,
+or launch the CLI from Terminal and grant Terminal access. Do not disable the
+firewall or change network routes to work around a privacy denial.
 
 Audio starts independently of video and input. A slow or failed system mixer
 must not delay the first picture or session cancellation. Recording permission

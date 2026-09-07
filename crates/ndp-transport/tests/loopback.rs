@@ -212,6 +212,36 @@ async fn input_events_arrive_in_order() {
 }
 
 #[tokio::test]
+async fn concurrent_ordered_senders_preserve_native_noise_counter_order() {
+    let mut p = pair().await;
+    let mut senders = Vec::new();
+    for value in 0..64u8 {
+        let client = p.client.clone();
+        senders.push(tokio::spawn(async move {
+            client
+                .send(
+                    Channel::Input,
+                    MsgHeader::new(MsgKind::InputEvent, 0, 0),
+                    &[value],
+                )
+                .await
+                .unwrap();
+        }));
+    }
+    for sender in senders {
+        sender.await.unwrap();
+    }
+    let mut values = Vec::new();
+    for sequence in 0..64 {
+        let message = expect(&mut p.agent_rx).await;
+        assert_eq!(message.header.seq, sequence);
+        values.push(message.payload[0]);
+    }
+    values.sort_unstable();
+    assert_eq!(values, (0..64).collect::<Vec<_>>());
+}
+
+#[tokio::test]
 async fn video_frames_ride_one_stream_each() {
     let mut p = pair().await;
     // Frames large enough to span many packets, so any framing bug shows up.

@@ -11,6 +11,7 @@
 
 pub mod audio;
 pub mod connect;
+mod direct;
 pub mod input;
 pub mod manager;
 pub mod nal;
@@ -19,4 +20,5 @@ pub mod session;
 pub mod video;
 
 pub use connect::{connect_to_agent, Connected};
+pub use direct::ConnectedReceiver;
 pub use manager::{ManagerClient, Resource, SessionTicket};

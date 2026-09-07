@@ -75,6 +75,19 @@ pub struct PathCandidate {
     pub priority: u32,
 }
 
+/// Authenticated metadata for the session-scoped direct QUIC listener.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectPathBinding {
+    /// Direct negotiation schema version.
+    pub version: u8,
+    /// Logical session UUID; the receiver must match its authorised session.
+    pub session: String,
+    /// Listener UUID, also bound into the direct Noise prologue.
+    pub listener: String,
+    /// SHA-256 fingerprint of the listener's TLS certificate.
+    pub certificate_pin: String,
+}
+
 /// How a [`PathCandidate`] was discovered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -157,6 +170,9 @@ pub enum ControlMessage {
     PathCandidates {
         /// Candidates offered by the sender.
         candidates: Vec<PathCandidate>,
+        /// Present for mutually authenticated direct QUIC negotiation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        direct_binding: Option<DirectPathBinding>,
     },
 }
 

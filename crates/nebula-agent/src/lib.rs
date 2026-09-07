@@ -13,6 +13,7 @@
 #![warn(missing_docs)]
 
 pub mod clipboard;
+mod direct;
 pub mod files;
 pub mod identity;
 pub mod manager;

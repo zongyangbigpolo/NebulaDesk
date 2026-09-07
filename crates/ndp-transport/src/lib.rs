@@ -39,12 +39,14 @@
 
 mod config;
 mod endpoint;
+mod multipath;
 mod session;
 mod tls;
 mod wire;
 
 pub use config::{TransportConfig, ALPN_AGENT_GATEWAY, ALPN_RELAY, ALPN_SESSION};
 pub use endpoint::{client_endpoint, connect, server_endpoint, ServerCredentials};
+pub use multipath::{PathKind, PathState, PathStats};
 pub use session::{FrameOutcome, Incoming, Session, SessionReceiver};
 pub use tls::{client_config, dev_credentials, CertificateFingerprint};
 
@@ -120,6 +122,14 @@ pub enum TransportError {
     /// Endpoint or certificate setup failed.
     #[error("configuration: {0}")]
     Config(String),
+
+    /// An authenticated peer violated the negotiated multipath protocol.
+    #[error("multipath protocol: {0}")]
+    MultipathProtocol(&'static str),
+
+    /// A local direct-interface loss was reported without an attached direct path.
+    #[error("no direct path attached")]
+    NoDirectPath,
 
     /// Local socket I/O failed.
     #[error("io: {0}")]

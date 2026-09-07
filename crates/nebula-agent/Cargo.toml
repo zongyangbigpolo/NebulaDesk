@@ -33,6 +33,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
+if-addrs = "0.15"
 
 [[bin]]
 name = "nebula-agent"
