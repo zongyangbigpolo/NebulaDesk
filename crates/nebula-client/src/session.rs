@@ -350,7 +350,14 @@ async fn pump(
             }
 
             message = incoming.recv() => {
-                let Some(Ok(message)) = message else { break };
+                let message = match message {
+                    Some(Ok(message)) => message,
+                    Some(Err(error)) => {
+                        tracing::warn!(%error, "the session transport failed");
+                        break;
+                    }
+                    None => break,
+                };
                 if message.channel == Channel::Clipboard {
                     if let Some(worker) = clipboard.as_ref() {
                         match inbound_clipboard(message.header.kind, &message.payload) {

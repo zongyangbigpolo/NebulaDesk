@@ -179,3 +179,118 @@ async fn video_deadline_includes_a_blocked_channel_prefix() {
     .await
     .expect("the prefix write must be covered by the deadline");
 }
+
+async fn receive_raw_record(
+    peer: &RawPeer,
+    channel: Channel,
+    record: &[u8],
+    tx: &mpsc::Sender<Result<Incoming>>,
+) {
+    let mut send = peer.agent.inner.conn.open_uni().await.unwrap();
+    send.write_all(&wire::channel_prefix(channel, channel.priority()))
+        .await
+        .unwrap();
+    send.write_all(record).await.unwrap();
+    send.finish().unwrap();
+    read_message_stream(
+        peer.peer.accept_uni().await.unwrap(),
+        peer.opener.clone(),
+        tx.clone(),
+        TransportConfig::default().max_record,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn video_older_than_the_replay_window_does_not_end_the_session() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let peer = raw_peer().await;
+        let header = MsgHeader::new(MsgKind::VideoFrame, 0, 0);
+        let sealer = &peer.agent.inner.sealer;
+        let old = sealer.seal(Channel::Video, header, b"late").unwrap();
+        for _ in 0..64 {
+            sealer.seal(Channel::Video, header, b"overtaken").unwrap();
+        }
+        let latest = sealer.seal(Channel::Video, header, b"latest").unwrap();
+        let (tx, mut incoming) = mpsc::channel(8);
+        receive_raw_record(&peer, Channel::Video, &latest, &tx).await;
+        assert_eq!(incoming.recv().await.unwrap().unwrap().header.seq, 65);
+
+        for rejected in [&old, &latest] {
+            receive_raw_record(&peer, Channel::Video, rejected, &tx).await;
+            assert!(
+                matches!(incoming.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+                "a stale or duplicate video must be discarded, not delivered or fatal"
+            );
+        }
+        let recovery = sealer
+            .seal(
+                Channel::Video,
+                header.with_flags(MsgFlags::KEYFRAME),
+                b"recovery",
+            )
+            .unwrap();
+        receive_raw_record(&peer, Channel::Video, &recovery, &tx).await;
+        let frame = incoming.recv().await.unwrap().unwrap();
+        assert_eq!(frame.header.seq, 66);
+        assert_eq!(frame.payload, b"recovery");
+    })
+    .await
+    .expect("late-video regression timed out");
+}
+
+#[tokio::test]
+async fn video_authentication_failures_are_still_fatal() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let peer = raw_peer().await;
+        let mut record = peer
+            .agent
+            .inner
+            .sealer
+            .seal(
+                Channel::Video,
+                MsgHeader::new(MsgKind::VideoFrame, 0, 0),
+                b"tampered",
+            )
+            .unwrap();
+        *record.last_mut().unwrap() ^= 1;
+        let (tx, mut incoming) = mpsc::channel(1);
+        receive_raw_record(&peer, Channel::Video, &record, &tx).await;
+        assert!(matches!(
+            incoming.recv().await.unwrap(),
+            Err(TransportError::Crypto(
+                ndp_crypto::CryptoError::Decrypt { .. }
+            ))
+        ));
+    })
+    .await
+    .expect("authentication regression timed out");
+}
+
+#[tokio::test]
+async fn reliable_message_replays_remain_errors() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for channel in [Channel::Clipboard, Channel::File] {
+            let peer = raw_peer().await;
+            let header = MsgHeader::new(MsgKind::FileChunk, 0, 0);
+            let sealer = &peer.agent.inner.sealer;
+            let old = sealer.seal(channel, header, b"old").unwrap();
+            for _ in 0..64 {
+                sealer.seal(channel, header, b"ahead").unwrap();
+            }
+            let latest = sealer.seal(channel, header, b"latest").unwrap();
+            let (tx, mut incoming) = mpsc::channel(2);
+            receive_raw_record(&peer, channel, &latest, &tx).await;
+            incoming.recv().await.unwrap().unwrap();
+            receive_raw_record(&peer, channel, &old, &tx).await;
+            assert!(matches!(
+                incoming.recv().await.unwrap(),
+                Err(TransportError::Crypto(
+                    ndp_crypto::CryptoError::Replay { .. }
+                ))
+            ));
+        }
+    })
+    .await
+    .expect("reliable replay regression timed out");
+}

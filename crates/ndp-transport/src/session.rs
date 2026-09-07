@@ -521,8 +521,16 @@ async fn read_message_stream(
         Err(e) => return fail(&tx, e.into()).await,
     };
 
-    if let Err(e) = open_and_send(channel, &record, &opener, &tx).await {
-        fail(&tx, e).await;
+    match open_and_send(channel, &record, &opener, &tx).await {
+        Err(TransportError::Crypto(ndp_crypto::CryptoError::Replay { seq, .. }))
+            if channel == Channel::Video =>
+        {
+            // A relay can deliver a superseded frame after the replay window
+            // has advanced. Reject that frame without closing a healthy session.
+            trace!(seq, "discarded stale or duplicate video record");
+        }
+        Err(error) => fail(&tx, error).await,
+        Ok(_) => {}
     }
 }
 
