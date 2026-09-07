@@ -79,7 +79,7 @@ jobs:
       - run: cargo clippy --locked -p nebula-agent -p nebula-client --all-targets
       # Desktop/GPU probes remain ignored; these tests need neither a display
       # nor the production manager database.
-      - run: cargo test --locked -p nebula-agent -p nebula-client --lib
+      - run: cargo test --locked -p nebula-agent -p nebula-client --lib --test stream_stability
 
   # The transport is where platform differences actually bite: UDP behaviour,
   # socket options and timer resolution all differ.
