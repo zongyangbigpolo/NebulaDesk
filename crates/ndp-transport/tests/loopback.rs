@@ -42,7 +42,17 @@ async fn pair_with<F>(ticket: &[u8], authorize: F) -> ndp_transport::Result<Pair
 where
     F: FnOnce(&[u8]) -> std::result::Result<Vec<u8>, String> + Send + 'static,
 {
-    let cfg = TransportConfig::default();
+    pair_configured(ticket, authorize, TransportConfig::default()).await
+}
+
+async fn pair_configured<F>(
+    ticket: &[u8],
+    authorize: F,
+    cfg: TransportConfig,
+) -> ndp_transport::Result<Pair>
+where
+    F: FnOnce(&[u8]) -> std::result::Result<Vec<u8>, String> + Send + 'static,
+{
     let creds = dev_credentials(&[]).unwrap();
     let pin = creds.fingerprint;
     let agent_kp = StaticKeypair::generate();
@@ -78,6 +88,67 @@ where
         agent_rx,
         _endpoints: (endpoint, server),
     })
+}
+
+#[tokio::test]
+async fn interleaved_channels_do_not_create_video_sequence_gaps() {
+    let mut p = pair().await;
+    for seq in 0..4 {
+        for (channel, kind) in [
+            (Channel::Video, MsgKind::VideoFrame),
+            (Channel::Clipboard, MsgKind::ClipboardOffer),
+            (Channel::File, MsgKind::FileChunk),
+            (Channel::Control, MsgKind::Ping),
+        ] {
+            // Application sequence values are deliberately unrelated: the
+            // authenticated record layer owns independent channel counters.
+            let header = MsgHeader::new(kind, 100 + seq * 17, 0);
+            if channel == Channel::Video {
+                p.agent
+                    .send_video_frame(header, &[seq as u8], None)
+                    .await
+                    .unwrap();
+            } else {
+                p.agent.send(channel, header, &[seq as u8]).await.unwrap();
+            }
+        }
+    }
+    let mut video = Vec::new();
+    for _ in 0..16 {
+        let got = expect(&mut p.client_rx).await;
+        assert_eq!(got.header.seq, u32::from(got.payload[0]));
+        if got.channel == Channel::Video {
+            video.push(got.header.seq);
+        }
+    }
+    video.sort_unstable();
+    assert_eq!(video, [0, 1, 2, 3]);
+}
+
+#[tokio::test]
+async fn video_deadline_includes_waiting_for_stream_credit() {
+    let p = pair_configured(
+        TICKET,
+        |_| Ok(AGENT_HELLO.to_vec()),
+        TransportConfig {
+            max_concurrent_uni: 0,
+            ..TransportConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        p.agent.send_video_frame(
+            MsgHeader::new(MsgKind::VideoFrame, 0, 0),
+            b"synthetic frame",
+            Some(tokio::time::Instant::now() + Duration::from_millis(20)),
+        ),
+    )
+    .await
+    .expect("a blocked stream open must respect the frame deadline")
+    .unwrap();
+    assert_eq!(result, ndp_transport::FrameOutcome::Discarded);
 }
 
 async fn expect(rx: &mut SessionReceiver) -> Incoming {

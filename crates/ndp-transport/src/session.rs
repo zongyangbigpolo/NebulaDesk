@@ -32,6 +32,21 @@ const INBOUND_QUEUE: usize = 256;
 /// queue. Purely informational: the peer drops the partial frame.
 const CODE_STALE_FRAME: u32 = 0x10;
 
+/// Dropping a quinn writer normally finishes it, which would expose a
+/// truncated encrypted record. An interrupted video send must reset instead.
+struct VideoStream {
+    stream: quinn::SendStream,
+    finished: bool,
+}
+
+impl Drop for VideoStream {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.stream.reset(quinn::VarInt::from_u32(CODE_STALE_FRAME));
+        }
+    }
+}
+
 /// Channels that ride a single long-lived ordered stream.
 ///
 /// Everything else opens a carrier per message, which is why only these two
@@ -323,6 +338,8 @@ impl Session {
     /// This is the reason video gets a stream per frame: under congestion the
     /// stream is reset and the bytes never leave, so the next frame starts
     /// from a clean queue instead of trailing a second of stale video.
+    /// The deadline includes waiting for stream credit and writing the prefix.
+    /// Cancelling this future resets any unfinished stream as well.
     pub async fn send_video_frame(
         &self,
         header: MsgHeader,
@@ -337,27 +354,31 @@ impl Session {
         } else {
             Channel::Video.priority()
         };
-        let mut stream = self.open_message_stream(Channel::Video, urgency).await?;
-
         let write = async {
-            stream.write_all(&record).await?;
+            let mut video = VideoStream {
+                stream: self.inner.conn.open_uni().await?,
+                finished: false,
+            };
+            let _ = video.stream.set_priority(i32::from(urgency));
+            video
+                .stream
+                .write_all(&wire::channel_prefix(Channel::Video, urgency))
+                .await?;
+            video.stream.write_all(&record).await?;
+            video.stream.finish().map_err(|_| TransportError::Closed)?;
+            video.finished = true;
             Ok::<_, TransportError>(())
         };
 
         match deadline {
             None => {
                 write.await?;
-                stream.finish().map_err(|_| TransportError::Closed)?;
                 Ok(FrameOutcome::Sent)
             }
             Some(at) => match tokio::time::timeout_at(at, write).await {
-                Ok(Ok(())) => {
-                    stream.finish().map_err(|_| TransportError::Closed)?;
-                    Ok(FrameOutcome::Sent)
-                }
+                Ok(Ok(())) => Ok(FrameOutcome::Sent),
                 Ok(Err(e)) => Err(e),
                 Err(_) => {
-                    let _ = stream.reset(quinn::VarInt::from_u32(CODE_STALE_FRAME));
                     trace!("video frame discarded: send deadline passed");
                     Ok(FrameOutcome::Discarded)
                 }
@@ -608,3 +629,6 @@ async fn read_framed(stream: &mut quinn::RecvStream, limit: usize) -> Result<Opt
     })?;
     Ok(Some(buf))
 }
+
+#[cfg(test)]
+mod tests;

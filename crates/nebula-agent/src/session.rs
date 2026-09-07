@@ -40,6 +40,14 @@ const FRAME_DEADLINE: Duration = Duration::from_millis(120);
 /// nobody would rather hear the audio than skip to the present.
 const AUDIO_QUEUE: usize = 8;
 
+type VideoSend = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = ndp_transport::Result<(ndp_transport::FrameOutcome, usize)>,
+            > + Send,
+    >,
+>;
+
 /// The Noise prologue binding a handshake to one session.
 ///
 /// Both sides derive it from a session id they were told separately, so a
@@ -249,9 +257,12 @@ async fn pump(
 
     let mut seq: u32 = 0;
     let mut audio_seq: u32 = 0;
+    // Keep a single send alive across select iterations. Awaiting it inside
+    // the frame arm would stop input and revocation behind a congested IDR.
+    let mut sending: Option<VideoSend> = None;
     loop {
         tokio::select! {
-            frame = frames.recv() => {
+            frame = frames.recv(), if sending.is_none() => {
                 let Some(frame) = frame else { break };
                 let flags = if frame.keyframe { MsgFlags::KEYFRAME } else { MsgFlags::DISCARDABLE };
                 let header = MsgHeader::new(MsgKind::VideoFrame, seq, frame.timestamp_us)
@@ -266,11 +277,25 @@ async fn pump(
                 // session that never shows a picture at all.
                 let deadline = (!frame.keyframe)
                     .then(|| tokio::time::Instant::now() + FRAME_DEADLINE);
-                match session.send_video_frame(header, &frame.data, deadline).await {
-                    Ok(ndp_transport::FrameOutcome::Sent) => {
-                        tally.sent += frame.data.len() as u64;
+                let sender = session.clone();
+                sending = Some(Box::pin(async move {
+                    let outcome = sender.send_video_frame(header, &frame.data, deadline).await?;
+                    Ok((outcome, frame.data.len()))
+                }));
+            }
+
+            result = async {
+                match sending.as_mut() {
+                    Some(send) => send.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                sending = None;
+                match result {
+                    Ok((ndp_transport::FrameOutcome::Sent, bytes)) => {
+                        tally.sent += bytes as u64;
                     }
-                    Ok(ndp_transport::FrameOutcome::Discarded) => {
+                    Ok((ndp_transport::FrameOutcome::Discarded, _)) => {
                         // The frame never left, so the next one must not
                         // depend on it.
                         video.source.request_keyframe();
@@ -374,6 +399,7 @@ async fn pump(
         }
     }
 
+    drop(sending);
     drop(video);
     if let Some(audio) = audio.as_mut() {
         audio.stop();
@@ -613,6 +639,204 @@ fn inbound_file(kind: MsgKind, payload: &[u8]) -> anyhow::Result<Option<files::I
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct PumpProbe {
+        sink: mpsc::UnboundedSender<FrameSink>,
+        injected: Arc<AtomicUsize>,
+        requested: Arc<AtomicUsize>,
+        stopped: Arc<AtomicUsize>,
+    }
+
+    impl Platform for PumpProbe {
+        fn video(&self) -> anyhow::Result<Box<dyn VideoSource>> {
+            Ok(Box::new(ProbeVideo {
+                sink: self.sink.clone(),
+                requested: self.requested.clone(),
+                stopped: self.stopped.clone(),
+            }))
+        }
+
+        fn input(&self) -> anyhow::Result<Box<dyn crate::media::InputInjector>> {
+            Ok(Box::new(ProbeInput(self.injected.clone())))
+        }
+    }
+
+    struct ProbeVideo {
+        sink: mpsc::UnboundedSender<FrameSink>,
+        requested: Arc<AtomicUsize>,
+        stopped: Arc<AtomicUsize>,
+    }
+
+    impl VideoSource for ProbeVideo {
+        fn start(&mut self, _: VideoConfig, sink: FrameSink) -> anyhow::Result<()> {
+            self.sink.send(sink)?;
+            Ok(())
+        }
+        fn request_keyframe(&mut self) {
+            self.requested.fetch_add(1, Ordering::Relaxed);
+        }
+        fn set_bitrate(&mut self, _: u32) {}
+        fn stop(&mut self) {
+            self.stopped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct ProbeInput(Arc<AtomicUsize>);
+
+    impl crate::media::InputInjector for ProbeInput {
+        fn inject(&mut self, _: &InputEvent) -> anyhow::Result<()> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn congested_keyframe_keeps_input_control_and_revocation_responsive() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let config = TransportConfig {
+                max_concurrent_uni: 0,
+                ..TransportConfig::default()
+            };
+            let credentials = ndp_transport::dev_credentials(&[]).unwrap();
+            let server = ndp_transport::server_endpoint(
+                "127.0.0.1:0".parse().unwrap(),
+                &credentials,
+                &[ndp_transport::ALPN_SESSION],
+                &config,
+            )
+            .unwrap();
+            let endpoint = client_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+            let keys = StaticKeypair::generate();
+            let public = keys.public();
+            let listener = server.clone();
+            let accept_config = config.clone();
+            let accepting = tokio::spawn(async move {
+                let conn = listener.accept().await.unwrap().await.unwrap();
+                Session::accept(
+                    conn,
+                    Responder::new(&keys, b"pump regression").unwrap(),
+                    |_| Ok(Vec::new()),
+                    &accept_config,
+                )
+                .await
+                .unwrap()
+            });
+            let conn = connect(
+                &endpoint,
+                server.local_addr().unwrap(),
+                "localhost",
+                credentials.fingerprint,
+                ndp_transport::ALPN_SESSION,
+                &config,
+            )
+            .await
+            .unwrap();
+            let (client, mut incoming, _) = Session::initiate(
+                conn,
+                ndp_crypto::Initiator::new(&StaticKeypair::generate(), &public, b"pump regression")
+                    .unwrap(),
+                b"ticket",
+                &config,
+            )
+            .await
+            .unwrap();
+            let (agent, receiver) = accepting.await.unwrap();
+            let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
+            let platform = Arc::new(PumpProbe {
+                sink: sink_tx,
+                injected: Arc::default(),
+                requested: Arc::default(),
+                stopped: Arc::default(),
+            });
+            let request = SessionRequest {
+                session: nebula_common::SessionId::new(),
+                resource_id: uuid::Uuid::new_v4(),
+                policy: nebula_common::SessionPolicy {
+                    input: true,
+                    ..nebula_common::SessionPolicy::view_only()
+                },
+                role: nebula_common::SessionRole::Controller,
+                relay_addr: String::new(),
+                relay_pin: String::new(),
+                pair_token: String::new(),
+                client_key: String::new(),
+            };
+            let (stop, stopped) = oneshot::channel();
+            let probe = platform.clone();
+            let running =
+                tokio::spawn(async move { pump(&request, agent, receiver, probe, stopped).await });
+            let sink = sink_rx.recv().await.unwrap();
+            let frame = EncodedFrame {
+                keyframe: true,
+                timestamp_us: 1,
+                data: b"codec independent".to_vec(),
+            };
+            for _ in 0..=FRAME_QUEUE {
+                sink.send(frame.clone()).await.unwrap();
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), sink.send(frame))
+                    .await
+                    .is_err(),
+                "only one send may be in flight in addition to the bounded source queue"
+            );
+            for _ in 0..3 {
+                client
+                    .send(
+                        Channel::Input,
+                        MsgHeader::new(MsgKind::InputBatch, 0, 0),
+                        &InputEvent::encode_batch(&[InputEvent::mouse_move(
+                            0.5,
+                            0.5,
+                            ndp_proto::Modifiers::NONE,
+                        )]),
+                    )
+                    .await
+                    .unwrap();
+            }
+            client
+                .send(
+                    Channel::Control,
+                    MsgHeader::new(MsgKind::CapsUpdate, 0, 0),
+                    b"",
+                )
+                .await
+                .unwrap();
+            client
+                .send(
+                    Channel::Control,
+                    MsgHeader::new(MsgKind::Ping, 0, 0),
+                    b"responsive",
+                )
+                .await
+                .unwrap();
+            let pong = tokio::time::timeout(Duration::from_secs(1), incoming.recv())
+                .await
+                .expect("blocked video must not block control")
+                .unwrap()
+                .unwrap();
+            assert_eq!(pong.header.kind, MsgKind::Pong);
+            assert_eq!(pong.payload, b"responsive");
+            assert_eq!(platform.requested.load(Ordering::Relaxed), 1);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while platform.injected.load(Ordering::Relaxed) != 3 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("blocked video must not block input");
+            stop.send("revoked".into()).unwrap();
+            let tally = tokio::time::timeout(Duration::from_secs(1), running)
+                .await
+                .expect("blocked keyframe must not delay revocation")
+                .unwrap();
+            assert_eq!(tally.sent, 0);
+            assert_eq!(platform.stopped.load(Ordering::Relaxed), 1);
+            assert!(sink.is_closed());
+        })
+        .await
+        .expect("loopback pump test timed out");
+    }
 
     #[derive(Default)]
     struct InputProbe {

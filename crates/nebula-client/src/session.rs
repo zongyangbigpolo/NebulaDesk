@@ -327,7 +327,21 @@ async fn pump(
     report.tick().await;
 
     loop {
+        let recovery_at = order.recovery_deadline();
         tokio::select! {
+            _ = async {
+                match recovery_at {
+                    Some(at) => tokio::time::sleep_until(at.into()).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if order.recover().ask_for_keyframe
+                    && !request_keyframe(&session, &mut seq).await
+                {
+                    break;
+                }
+            }
+
             _ = report.tick() => {
                 // On a timer rather than per frame: a session receiving
                 // nothing at all is exactly the one worth knowing about, and
@@ -379,39 +393,17 @@ async fn pump(
                 stats.frame(message.payload.len());
                 let keyframe = message.header.flags.contains(MsgFlags::KEYFRAME);
                 let ready = order.accept(message.header.seq, keyframe, message.payload);
-                if ready.ask_for_keyframe {
-                    let header = MsgHeader::new(MsgKind::CapsUpdate, seq, 0);
-                    seq = seq.wrapping_add(1);
-                    if session.send(Channel::Control, header, b"").await.is_err() {
-                        break;
-                    }
+                if ready.ask_for_keyframe && !request_keyframe(&session, &mut seq).await {
+                    break;
                 }
-                let mut ended = false;
-                for payload in ready.frames {
-                    match decoder.decode(&payload) {
-                        Ok(Some(picture)) => {
-                            stats.decoded(picture.width, picture.height);
-                            if let Ok(mut slot) = mailbox.lock() {
-                                *slot = Some(picture);
-                            }
-                            wake();
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            // The decoder rejected something the ordering
-                            // could not have caught. Only a keyframe recovers
-                            // from that either.
-                            tracing::debug!(%error, "a frame could not be decoded; asking for a keyframe");
-                            let header = MsgHeader::new(MsgKind::CapsUpdate, seq, 0);
-                            seq = seq.wrapping_add(1);
-                            if session.send(Channel::Control, header, b"").await.is_err() {
-                                ended = true;
-                                break;
-                            }
-                        }
+                let ask = decode_frames(decoder.as_mut(), &mut order, ready.frames, |picture| {
+                    stats.decoded(picture.width, picture.height);
+                    if let Ok(mut slot) = mailbox.lock() {
+                        *slot = Some(picture);
                     }
-                }
-                if ended {
+                    wake();
+                });
+                if ask && !request_keyframe(&session, &mut seq).await {
                     break;
                 }
             }
@@ -496,6 +488,33 @@ async fn pump(
     // Only now: while this is held the gateway believes the client is still
     // here, and saying goodbye properly matters more than releasing it early.
     drop(gateway);
+}
+
+async fn request_keyframe(session: &ndp_transport::Session, seq: &mut u32) -> bool {
+    let header = MsgHeader::new(MsgKind::CapsUpdate, *seq, 0);
+    *seq = seq.wrapping_add(1);
+    session.send(Channel::Control, header, b"").await.is_ok()
+}
+
+/// Stop the entire ready run at the first decode failure: every following
+/// delta may reference it, even if it was already released by the reorderer.
+fn decode_frames(
+    decoder: &mut dyn video::VideoDecoder,
+    order: &mut video::VideoOrder,
+    frames: Vec<Vec<u8>>,
+    mut display: impl FnMut(Picture),
+) -> bool {
+    for payload in frames {
+        match decoder.decode(&payload) {
+            Ok(Some(picture)) => display(picture),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!(%error, "a frame could not be decoded; waiting for a keyframe");
+                return order.decode_failed().ask_for_keyframe;
+            }
+        }
+    }
+    false
 }
 
 /// A periodic account of what is actually arriving.
@@ -678,6 +697,42 @@ fn inbound_clipboard(
 mod tests {
     use super::*;
     use ndp_proto::Modifiers;
+
+    #[test]
+    fn decoder_failure_stops_the_ready_run_and_rate_limits_recovery() {
+        struct RejectingDecoder(usize);
+        impl video::VideoDecoder for RejectingDecoder {
+            fn decode(&mut self, _: &[u8]) -> anyhow::Result<Option<Picture>> {
+                self.0 += 1;
+                anyhow::bail!("synthetic decoder failure")
+            }
+        }
+        let mut decoder = RejectingDecoder(0);
+        let mut order = video::VideoOrder::new();
+        order.accept(0, true, vec![0]);
+        order.accept(2, false, vec![2]);
+        let ready = order.accept(1, false, vec![1]);
+        assert_eq!(ready.frames.len(), 2);
+        assert!(decode_frames(
+            &mut decoder,
+            &mut order,
+            ready.frames,
+            |_| panic!("failed frames must not display"),
+        ));
+        assert_eq!(decoder.0, 1, "a dependent frame must not reach the decoder");
+        let ready = order.accept(3, false, vec![3]);
+        assert!(ready.frames.is_empty());
+        assert!(!ready.ask_for_keyframe);
+        let ready = order.accept(4, true, vec![4]);
+        assert!(!decode_frames(
+            &mut decoder,
+            &mut order,
+            ready.frames,
+            |_| panic!("failed frames must not display"),
+        ));
+        assert_eq!(decoder.0, 2);
+        assert!(order.recovery_deadline().is_some());
+    }
 
     fn moved(x: f32, y: f32) -> InputEvent {
         InputEvent::mouse_move(x, y, Modifiers::NONE)

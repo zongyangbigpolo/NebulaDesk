@@ -269,11 +269,11 @@ pub struct Ready {
 
 /// How many out-of-order frames to hold before giving up on the missing one.
 ///
-/// Reordering observed on a real link runs to about four frames. Eight is
-/// room to spare without committing to much latency: at sixty frames a second
-/// the whole buffer is worth a little over a tenth of a second, and it only
-/// ever fills when a frame is genuinely gone.
+/// This is a memory bound, not a clock: a quiet desktop may never fill it.
 const REORDER_WINDOW: usize = 16;
+
+/// A missing reference must time out even when no more frames arrive.
+const REORDER_WAIT: std::time::Duration = std::time::Duration::from_millis(120);
 
 /// How long to wait before asking for a keyframe again.
 const ASK_AGAIN: std::time::Duration = std::time::Duration::from_millis(500);
@@ -322,12 +322,14 @@ pub struct VideoOrder {
     ///
     /// Asking on every frame that arrives during an outage is a burst of
     /// control messages heavy enough, at sixty a second, to take the session
-    /// down. Asking exactly once is worse in a different way: the request can
-    /// be lost, or arrive while the agent is mid-frame and be answered by a
-    /// keyframe that is itself discarded, and then nothing ever asks again
-    /// and the session sits in front of a frozen picture. So it repeats, at a
-    /// rate that repairs promptly and costs nothing.
+    /// down. Control is reliable, but a request can arrive while the encoder
+    /// is mid-frame or its resulting keyframe can be dropped at capture.
+    /// Asking once would then leave a frozen picture forever. Retain this
+    /// timestamp even across anchors so repeated decoder errors cannot flood
+    /// the control stream either.
     asked: Option<std::time::Instant>,
+    /// When the current missing reference first held up decoding.
+    gap_since: Option<std::time::Instant>,
 }
 
 impl VideoOrder {
@@ -339,6 +341,16 @@ impl VideoOrder {
 
     /// Take one arriving frame and return whatever is now ready to decode.
     pub fn accept(&mut self, seq: u32, keyframe: bool, payload: Vec<u8>) -> Ready {
+        self.accept_at(seq, keyframe, payload, std::time::Instant::now())
+    }
+
+    fn accept_at(
+        &mut self,
+        seq: u32,
+        keyframe: bool,
+        payload: Vec<u8>,
+        now: std::time::Instant,
+    ) -> Ready {
         let Some(next) = self.next else {
             // Nothing here can be decoded yet, but the frames arriving
             // alongside a keyframe that is still in flight are the ones the
@@ -347,12 +359,21 @@ impl VideoOrder {
                 self.orphans
                     .retain(|&held, _| distance(held, seq) <= REORDER_WINDOW as u32);
                 self.orphans.insert(seq, payload);
-                return self.ask();
+                if self.orphans.len() > REORDER_WINDOW {
+                    let farthest = self
+                        .orphans
+                        .keys()
+                        .copied()
+                        .max_by_key(|&held| distance(held, seq))
+                        .expect("the buffer is full");
+                    self.orphans.remove(&farthest);
+                }
+                return self.ask(now);
             }
             self.anchor(seq);
             self.pending.insert(self.position, payload);
             self.promote(seq);
-            return self.drain();
+            return self.drain(now);
         };
 
         let ahead = seq.wrapping_sub(next);
@@ -364,31 +385,31 @@ impl VideoOrder {
         // A keyframe depends on nothing, so it can be decoded straight away
         // and anything still waiting in front of it is no longer needed.
         if keyframe {
-            self.pending.clear();
             self.position += u64::from(ahead);
+            self.pending
+                .retain(|&position, _| position >= self.position);
             self.next = Some(seq);
-            self.asked = None;
+            self.gap_since = None;
             self.pending.insert(self.position, payload);
-            return self.drain();
+            return self.drain(now);
         }
 
         self.pending
             .insert(self.position + u64::from(ahead), payload);
+        let ready = self.drain(now);
         if self.pending.len() > REORDER_WINDOW {
             // The frame being waited on is not coming. Everything held behind
             // it references it, directly or through its neighbours.
-            self.pending.clear();
-            self.next = None;
-            return self.ask();
+            return self.reset(now);
         }
-        self.drain()
+        ready
     }
 
     /// Start decoding from `seq`, discarding anything held before it.
     fn anchor(&mut self, seq: u32) {
         self.pending.clear();
         self.next = Some(seq);
-        self.asked = None;
+        self.gap_since = None;
     }
 
     /// Move the frames held while unanchored into place behind a keyframe.
@@ -407,19 +428,69 @@ impl VideoOrder {
     }
 
     /// Release the run of frames starting at the one wanted next.
-    fn drain(&mut self) -> Ready {
+    fn drain(&mut self, now: std::time::Instant) -> Ready {
         let mut ready = Ready::default();
         while let Some(payload) = self.pending.remove(&self.position) {
             ready.frames.push(payload);
             self.position += 1;
             self.next = Some(self.next.unwrap_or_default().wrapping_add(1));
         }
+        if self.pending.is_empty() {
+            self.gap_since = None;
+        } else if !ready.frames.is_empty() || self.gap_since.is_none() {
+            self.gap_since = Some(now);
+        }
         ready
     }
 
+    /// Next recovery wakeup, independent of whether another frame arrives.
+    /// Healthy idle streams need no timer; unanchored streams retry at a
+    /// bounded rate, including when no initial keyframe has arrived at all.
+    pub fn recovery_deadline(&self) -> Option<std::time::Instant> {
+        if self.next.is_none() {
+            Some(
+                self.asked
+                    .map(|at| at + ASK_AGAIN)
+                    .unwrap_or_else(std::time::Instant::now),
+            )
+        } else {
+            self.gap_since.map(|at| at + REORDER_WAIT)
+        }
+    }
+
+    /// Process an expired recovery timer.
+    pub fn recover(&mut self) -> Ready {
+        self.recover_at(std::time::Instant::now())
+    }
+
+    fn recover_at(&mut self, now: std::time::Instant) -> Ready {
+        if self.next.is_none() {
+            return self.ask(now);
+        }
+        if self
+            .gap_since
+            .is_some_and(|at| now.duration_since(at) >= REORDER_WAIT)
+        {
+            return self.reset(now);
+        }
+        Ready::default()
+    }
+
+    /// A decoder error invalidates the reference chain just like a lost frame.
+    pub fn decode_failed(&mut self) -> Ready {
+        self.reset(std::time::Instant::now())
+    }
+
+    fn reset(&mut self, now: std::time::Instant) -> Ready {
+        self.pending.clear();
+        self.orphans.clear();
+        self.next = None;
+        self.gap_since = None;
+        self.ask(now)
+    }
+
     /// Ask for a keyframe, unless one was asked for a moment ago.
-    fn ask(&mut self) -> Ready {
-        let now = std::time::Instant::now();
+    fn ask(&mut self, now: std::time::Instant) -> Ready {
         if self
             .asked
             .is_some_and(|at| now.duration_since(at) < ASK_AGAIN)
@@ -617,6 +688,104 @@ mod tests {
         assert!(released(&order.accept(2, false, frame(2))).is_empty());
         assert_eq!(released(&order.accept(3, true, frame(3))), [3]);
         assert_eq!(released(&order.accept(4, false, frame(4))), [4]);
+    }
+
+    #[test]
+    fn an_anchored_keyframe_keeps_successors_that_arrived_first() {
+        for base in [0, u32::MAX - 3] {
+            let mut order = VideoOrder::new();
+            order.accept(base, true, frame(base));
+            for offset in [2, 5, 4] {
+                let seq = base.wrapping_add(offset);
+                assert!(order.accept(seq, false, frame(seq)).frames.is_empty());
+            }
+            let key = base.wrapping_add(3);
+            assert_eq!(
+                released(&order.accept(key, true, frame(key))),
+                [key, key.wrapping_add(1), key.wrapping_add(2)]
+            );
+            assert!(order.pending.is_empty());
+        }
+    }
+
+    #[test]
+    fn recovery_retries_without_arrivals_and_stops_when_healthy() {
+        let now = std::time::Instant::now();
+        let mut order = VideoOrder::new();
+        assert!(order.recovery_deadline().is_some());
+        assert!(order.recover_at(now).ask_for_keyframe);
+        assert_eq!(order.recovery_deadline(), Some(now + ASK_AGAIN));
+        assert!(!order.recover_at(now + ASK_AGAIN / 2).ask_for_keyframe);
+        assert!(order.recover_at(now + ASK_AGAIN).ask_for_keyframe);
+        order.accept_at(0, true, frame(0), now + ASK_AGAIN);
+        assert!(order.recovery_deadline().is_none());
+        assert!(!order.recover_at(now + ASK_AGAIN * 10).ask_for_keyframe);
+    }
+
+    #[test]
+    fn a_small_idle_gap_times_out_even_without_filling_the_window() {
+        let now = std::time::Instant::now();
+        let mut order = VideoOrder::new();
+        order.accept_at(0, true, frame(0), now);
+        order.accept_at(2, false, frame(2), now);
+        assert_eq!(order.recovery_deadline(), Some(now + REORDER_WAIT));
+        // More successors (including duplicates) must not extend the gap.
+        order.accept_at(3, false, frame(3), now + REORDER_WAIT / 2);
+        order.accept_at(2, false, frame(2), now + REORDER_WAIT / 2);
+        assert!(!order.recover_at(now + REORDER_WAIT / 2).ask_for_keyframe);
+        assert!(order.recover_at(now + REORDER_WAIT).ask_for_keyframe);
+        assert!(order.pending.is_empty());
+        assert!(order.next.is_none());
+        assert_eq!(
+            order.recovery_deadline(),
+            Some(now + REORDER_WAIT + ASK_AGAIN)
+        );
+    }
+
+    #[test]
+    fn repairing_a_gap_cancels_its_timer() {
+        let now = std::time::Instant::now();
+        let mut order = VideoOrder::new();
+        order.accept_at(0, true, frame(0), now);
+        order.accept_at(2, false, frame(2), now);
+        assert_eq!(
+            released(&order.accept_at(1, false, frame(1), now + REORDER_WAIT / 2)),
+            [1, 2]
+        );
+        assert!(order.recovery_deadline().is_none());
+        assert!(!order.recover_at(now + REORDER_WAIT).ask_for_keyframe);
+    }
+
+    #[test]
+    fn the_missing_predecessor_can_drain_a_completely_full_window() {
+        let mut order = VideoOrder::new();
+        order.accept(0, true, frame(0));
+        for seq in 2..=REORDER_WINDOW as u32 + 1 {
+            assert!(order.accept(seq, false, frame(seq)).frames.is_empty());
+        }
+        assert_eq!(order.pending.len(), REORDER_WINDOW);
+        let ready = order.accept(1, false, frame(1));
+        assert_eq!(
+            released(&ready),
+            (1..=REORDER_WINDOW as u32 + 1).collect::<Vec<_>>()
+        );
+        assert!(!ready.ask_for_keyframe);
+        assert!(order.pending.is_empty());
+    }
+
+    #[test]
+    fn unanchored_buffers_are_bounded_across_wrap_and_reordering() {
+        let mut order = VideoOrder::new();
+        for offset in 0..100u32 {
+            for seq in [
+                u32::MAX.wrapping_sub(offset),
+                offset,
+                u32::MAX.wrapping_sub(offset / 2),
+            ] {
+                assert!(order.accept(seq, false, frame(seq)).frames.is_empty());
+                assert!(order.orphans.len() <= REORDER_WINDOW);
+            }
+        }
     }
 
     #[test]
