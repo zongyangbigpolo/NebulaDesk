@@ -494,16 +494,27 @@ async fn the_real_agent_serves_a_real_client() {
     .expect("the agent should answer a ping");
     assert_eq!(pong.header.timestamp_us, 1234);
 
-    let sessions = deployment
-        .get("/v1/sessions", &deployment.owner_token)
-        .await;
-    let recorded = sessions
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|s| s["id"].as_str() == Some(session.to_string().as_str()))
-        .expect("the manager should have recorded the session");
-    assert_eq!(recorded["state"], "ACTIVE");
+    // The media handshake and the gateway's HTTP state report are independent.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let sessions = deployment
+                .get("/v1/sessions", &deployment.owner_token)
+                .await;
+            let recorded = sessions
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["id"].as_str() == Some(session.to_string().as_str()))
+                .expect("the manager should have recorded the session");
+            if recorded["state"] != "PENDING" {
+                assert_eq!(recorded["state"], "ACTIVE");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the gateway should report ACTIVE to the manager");
 
     client.close(0, b"done");
     deployment.gateway.shutdown();
