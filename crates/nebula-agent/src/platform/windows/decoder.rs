@@ -259,7 +259,8 @@ impl Decoder {
             let mut picture = None;
             for _ in 0..16 {
                 match mf::output(&self.transform, self.output) {
-                    Ok(sample) => picture = Some(self.copy(d3d, &sample)?),
+                    Ok(Some(sample)) => picture = Some(self.copy(d3d, &sample)?),
+                    Ok(None) => {}
                     Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
                         return Ok(picture)
                     }

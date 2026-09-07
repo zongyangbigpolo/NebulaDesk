@@ -7,6 +7,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 #[derive(Default)]
 pub struct WindowsInput {
     held: BTreeMap<u32, Vec<KEYBDINPUT>>,
+    synthetic_modifiers: BTreeSet<u32>,
     buttons: BTreeSet<u8>,
     wheel: [f64; 2],
 }
@@ -76,6 +77,7 @@ impl WindowsInput {
                     .collect::<Vec<_>>(),
             )?;
             self.held.remove(&usage);
+            self.synthetic_modifiers.remove(&usage);
         }
         Ok(())
     }
@@ -108,6 +110,7 @@ impl WindowsInput {
                 self.release(right)?;
             } else if !self.held.contains_key(&left) && !self.held.contains_key(&right) {
                 self.press(left, vec![scan(left)?])?;
+                self.synthetic_modifiers.insert(left);
             }
         }
         Ok(())
@@ -126,6 +129,15 @@ impl InputInjector for WindowsInput {
                 .all(|v| v.is_finite()),
             "non-finite pointer input"
         );
+        if matches!(event.kind, InputKind::KeyDown | InputKind::KeyUp)
+            && (0xe0..=0xe7).contains(&event.key.0)
+        {
+            let left = 0xe0 + (event.key.0 - 0xe0) % 4;
+            if left != event.key.0 && self.synthetic_modifiers.contains(&left) {
+                self.release(left)?;
+            }
+            self.synthetic_modifiers.remove(&event.key.0);
+        }
         self.modifiers(event)?;
         if event.kind.is_pointer() {
             // Absolute without VIRTUALDESK maps to the primary display, exactly the WGC capture target.
@@ -188,6 +200,9 @@ impl InputInjector for WindowsInput {
                     vec![scan(event.key.0)?]
                 };
                 self.press(event.key.0, keys)?;
+                if event.key.0 == 0 {
+                    self.release(0)?;
+                }
             }
             InputKind::PointerLeave | InputKind::MouseMove | InputKind::MouseDrag => {}
         }
@@ -211,6 +226,19 @@ impl Drop for WindowsInput {
 }
 
 fn scan(usage: u32) -> anyhow::Result<KEYBDINPUT> {
+    let virtual_key = match usage {
+        0x75 => Some(VK_HELP),
+        0x7f => Some(VK_VOLUME_MUTE),
+        0x80 => Some(VK_VOLUME_UP),
+        0x81 => Some(VK_VOLUME_DOWN),
+        _ => None,
+    };
+    if let Some(key) = virtual_key {
+        return Ok(KEYBDINPUT {
+            wVk: key,
+            ..Default::default()
+        });
+    }
     let code = scan_code(usage)
         .ok_or_else(|| anyhow::anyhow!("unsupported USB keyboard usage 0x{usage:02x}"))?;
     if code == 0xe145 {
@@ -330,5 +358,30 @@ mod tests {
         assert_eq!(scan_code(0x48), Some(0xe145));
         assert_eq!(scan_code(0), None);
         assert_eq!(scan_code(0xe8), None);
+    }
+
+    #[test]
+    fn extended_keys_and_releases_keep_their_flags() {
+        let right_control = scan(0xe4).unwrap();
+        assert_eq!(right_control.wScan, 0x1d);
+        assert!(right_control.dwFlags.contains(KEYEVENTF_EXTENDEDKEY));
+        let release = keyboard(right_control, true);
+        let key = unsafe { release.Anonymous.ki };
+        assert!(key
+            .dwFlags
+            .contains(KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP));
+        assert_eq!(scan(0x7f).unwrap().wVk, VK_VOLUME_MUTE);
+        assert!(!scan(0xe1).unwrap().dwFlags.contains(KEYEVENTF_EXTENDEDKEY));
+    }
+
+    #[test]
+    fn extra_buttons_use_xbutton_data() {
+        let back = unsafe { button(4, false).unwrap().Anonymous.mi };
+        assert_eq!(back.mouseData, 1);
+        assert_eq!(back.dwFlags, MOUSEEVENTF_XDOWN);
+        let forward = unsafe { button(5, true).unwrap().Anonymous.mi };
+        assert_eq!(forward.mouseData, 2);
+        assert_eq!(forward.dwFlags, MOUSEEVENTF_XUP);
+        assert!(button(0, false).is_err());
     }
 }

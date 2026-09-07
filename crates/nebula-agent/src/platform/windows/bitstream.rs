@@ -89,7 +89,7 @@ impl ParameterSets {
         }
         for unit in nals {
             if matches!(unit[0] & 31, 1 | 5) {
-                let rbsp = unescape(&unit[1..]);
+                let rbsp = unescape(&unit[1..unit.len().min(64)]);
                 let mut bits = Bits {
                     data: &rbsp,
                     offset: 0,

@@ -155,10 +155,14 @@ pub fn codec_bool(codec: &ICodecAPI, key: &GUID, value: bool) -> anyhow::Result<
 }
 
 /// Releases event/sample interfaces even on ProcessOutput failure.
-pub fn output(transform: &IMFTransform, stream: u32) -> windows::core::Result<IMFSample> {
+pub fn output(transform: &IMFTransform, stream: u32) -> windows::core::Result<Option<IMFSample>> {
     unsafe {
         let info = transform.GetOutputStreamInfo(stream)?;
-        let sample = if info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 != 0 {
+        let sample = if info.dwFlags
+            & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0)
+                as u32
+            != 0
+        {
             None
         } else {
             let sample = MFCreateSample()?;
@@ -176,11 +180,21 @@ pub fn output(transform: &IMFTransform, stream: u32) -> windows::core::Result<IM
         let mut status = 0;
         let result = transform.ProcessOutput(0, &mut buffers, &mut status);
         let sample = ManuallyDrop::take(&mut buffers[0].pSample);
-        ManuallyDrop::drop(&mut buffers[0].pEvents);
+        let events = ManuallyDrop::take(&mut buffers[0].pEvents);
         result?;
-        sample.ok_or_else(|| {
-            windows::core::Error::from_hresult(windows::Win32::Foundation::E_UNEXPECTED)
-        })
+        if let Some(events) = events {
+            for index in 0..events.GetElementCount()? {
+                let event: IMFMediaEvent = events.GetElement(index)?.cast()?;
+                event.GetStatus()?.ok()?;
+            }
+        }
+        if buffers[0].dwStatus & MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE.0 as u32
+            == MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE.0 as u32
+        {
+            Ok(None)
+        } else {
+            Ok(sample)
+        }
     }
 }
 

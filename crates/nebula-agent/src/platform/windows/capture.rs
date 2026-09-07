@@ -460,7 +460,9 @@ impl Encoder {
                 match event.GetType()? {
                     value if value == METransformNeedInput.0 as u32 => self.input_credit += 1,
                     value if value == METransformHaveOutput.0 as u32 => {
-                        let sample = mf::output(&self.transform, self.output)?;
+                        let Some(sample) = mf::output(&self.transform, self.output)? else {
+                            continue;
+                        };
                         let data = mf::bytes(&sample)?;
                         // Some drivers provide SPS/PPS only in the media type.
                         let ty = self.transform.GetOutputCurrentType(self.output)?;
@@ -556,7 +558,7 @@ fn pump(
     let mut last_frame = started - Duration::from_secs(1);
     let interval = Duration::from_secs_f64(1.0 / config.fps as f64);
     let mut current_bitrate = config.bitrate;
-    let mut recovering = true;
+    let mut delivery = Delivery::default();
     // Retain the last real capture so a keyframe request can recover an entirely static desktop.
     let mut latest = None;
     while running.load(Ordering::Acquire) && !sink.is_closed() {
@@ -565,13 +567,13 @@ fn pump(
             "captured display closed; reconnect after restoring the display"
         );
         for frame in encoder.poll()? {
-            if recovering && !frame.keyframe {
+            if !delivery.accepts(frame.keyframe) {
                 continue;
             }
             match sink.try_send(frame) {
-                Ok(()) => recovering = false,
+                Ok(()) => delivery.delivered(),
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    recovering = true;
+                    delivery.dropped();
                     keyframe.store(true, Ordering::Release);
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return Ok(()),
@@ -594,6 +596,16 @@ fn pump(
                 Err(error) => return Err(error).context("WGC frame acquisition failed"),
             }
         }
+        ensure!(
+            latest.is_some() || started.elapsed() < Duration::from_secs(5),
+            "WGC produced no initial frame; unlock the desktop and check screen capture permission"
+        );
+        ensure!(
+            encoder.input_credit > 0
+                || encoder.outstanding > 0
+                || started.elapsed() < Duration::from_secs(5),
+            "hardware encoder did not request input; update the GPU driver"
+        );
         if let Some(frame) = latest.as_ref() {
             if last_frame.elapsed() >= interval
                 && encoder.input_credit > 0
@@ -613,4 +625,50 @@ fn pump(
         std::thread::sleep(Duration::from_millis(2));
     }
     Ok(())
+}
+
+struct Delivery {
+    waiting_for_idr: bool,
+}
+
+impl Default for Delivery {
+    fn default() -> Self {
+        Self {
+            waiting_for_idr: true,
+        }
+    }
+}
+
+impl Delivery {
+    fn accepts(&self, idr: bool) -> bool {
+        idr || !self.waiting_for_idr
+    }
+    fn delivered(&mut self) {
+        self.waiting_for_idr = false;
+    }
+    fn dropped(&mut self) {
+        self.waiting_for_idr = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Delivery;
+
+    #[test]
+    fn a_dropped_encoded_frame_requires_a_delivered_idr() {
+        let mut delivery = Delivery::default();
+        assert!(!delivery.accepts(false));
+        assert!(delivery.accepts(true));
+        delivery.delivered();
+        assert!(delivery.accepts(false));
+        delivery.dropped();
+        assert!(!delivery.accepts(false));
+        assert!(delivery.accepts(true));
+        // A full queue can also drop the recovery IDR.
+        delivery.dropped();
+        assert!(!delivery.accepts(false));
+        delivery.delivered();
+        assert!(delivery.accepts(false));
+    }
 }
