@@ -145,16 +145,25 @@ async fn pump(
 ) -> Tally {
     let mut tally = Tally::default();
 
+    let platform = match platform.session_scope(request.policy.input) {
+        Ok(Some(scoped)) => scoped,
+        Ok(None) => platform,
+        Err(error) => {
+            tracing::error!(%error, "could not create the session's media scope");
+            session.close(0x21, b"media scope failed");
+            return tally;
+        }
+    };
     let mut video = match platform.video() {
         Ok(video) => video,
         Err(error) => {
-            tracing::error!(%error, "no video source; the session will carry input only");
+            tracing::error!(%error, "no video source; refusing the session");
             session.close(0x21, b"no video source");
             return tally;
         }
     };
-    let mut input = match platform.input() {
-        Ok(input) => Some(input),
+    let mut input = match input_for_session(platform.as_ref(), request.policy.input) {
+        Ok(input) => input,
         Err(error) => {
             // Not fatal: watching a machine you cannot control is still
             // worth something, and it is a legitimate configuration. But it
@@ -356,6 +365,17 @@ async fn pump(
     tally
 }
 
+fn input_for_session(
+    platform: &dyn Platform,
+    allowed: bool,
+) -> anyhow::Result<Option<Box<dyn crate::media::InputInjector>>> {
+    if allowed {
+        platform.input().map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 /// Act on one message from the client. Returns false when the session should
 /// end.
 async fn handle(
@@ -521,6 +541,7 @@ fn inbound_file(kind: MsgKind, payload: &[u8]) -> anyhow::Result<Option<files::I
             let (header, data) = ndp_proto::FileChunkHeader::split(payload)?;
             Some(files::Inbound::Chunk(header, data.to_vec()))
         }
+
         MsgKind::FileAck => Some(files::Inbound::Ack(ndp_proto::FileAck::decode(payload)?)),
         other => {
             tracing::debug!(
@@ -530,4 +551,40 @@ fn inbound_file(kind: MsgKind, payload: &[u8]) -> anyhow::Result<Option<files::I
             None
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct InputProbe {
+        opened: AtomicUsize,
+    }
+
+    impl Platform for InputProbe {
+        fn video(&self) -> anyhow::Result<Box<dyn crate::media::VideoSource>> {
+            anyhow::bail!("not used by the input permission tests")
+        }
+
+        fn input(&self) -> anyhow::Result<Box<dyn crate::media::InputInjector>> {
+            self.opened.fetch_add(1, Ordering::Relaxed);
+            anyhow::bail!("input permission denied")
+        }
+    }
+
+    #[test]
+    fn viewing_does_not_open_input_or_prompt_for_input_permission() {
+        let platform = InputProbe::default();
+        assert!(input_for_session(&platform, false).unwrap().is_none());
+        assert_eq!(platform.opened.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn input_permission_errors_are_propagated() {
+        let platform = InputProbe::default();
+        assert!(input_for_session(&platform, true).is_err());
+        assert_eq!(platform.opened.load(Ordering::Relaxed), 1);
+    }
 }

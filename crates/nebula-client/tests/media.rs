@@ -5,26 +5,27 @@
 //! AVCC framing, parameter sets riding in front of keyframes, and a decoder
 //! built from the stream rather than from anything agreed out of band.
 //!
-//! Ignored by default. It needs a display to capture and Screen Recording
-//! permission for the test binary, neither of which a CI machine has. Run it
-//! by hand:
+//! Ignored by default. It needs an interactive desktop, capture permission,
+//! and hardware H.264 encoding/decoding. A headless CI build does not establish
+//! any of those. Run it by hand on each supported platform:
 //!
 //! ```text
 //! cargo test -p nebula-client --test media -- --ignored --nocapture
 //! ```
 
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 
 use std::time::Duration;
 
-use nebula_agent::media::{VideoConfig, VideoSource};
-use nebula_agent::platform::macos::capture::MacVideo;
+use nebula_agent::media::VideoConfig;
 
 #[test]
-#[ignore = "needs a display and Screen Recording permission"]
+#[ignore = "needs an interactive desktop, capture permission and hardware codecs"]
 fn a_captured_screen_decodes_back_into_a_picture() {
     let (frames_tx, mut frames) = tokio::sync::mpsc::channel(8);
-    let mut video = MacVideo::new();
+    let mut video = nebula_agent::platform::native()
+        .video()
+        .expect("the native platform must provide a video source");
     video
         .start(
             VideoConfig {
@@ -35,10 +36,7 @@ fn a_captured_screen_decodes_back_into_a_picture() {
             },
             frames_tx,
         )
-        .expect(
-            "capture must start; if this fails, grant Screen Recording to the test binary \
-             in System Settings > Privacy & Security",
-        );
+        .expect("capture must start; check the platform's desktop, permission and GPU requirements");
 
     let mut decoder = nebula_client::video::decoder().expect("the client must have a decoder");
     let runtime = tokio::runtime::Runtime::new().unwrap();

@@ -1,11 +1,11 @@
 //! Prints what the capture pipeline actually produces, for checking a machine
-//! before it is enrolled. Needs Screen Recording permission.
-#[cfg(target_os = "macos")]
+//! before it is enrolled. Run inside the desktop session with capture permission
+//! and a supported hardware encoder.
 fn main() -> anyhow::Result<()> {
-    use nebula_agent::media::{VideoConfig, VideoSource};
+    use nebula_agent::media::VideoConfig;
     tracing_subscriber::fmt::init();
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-    let mut video = nebula_agent::platform::macos::capture::MacVideo::new();
+    let mut video = nebula_agent::platform::native().video()?;
     video.start(
         VideoConfig {
             width: 1920,
@@ -16,7 +16,7 @@ fn main() -> anyhow::Result<()> {
         tx,
     )?;
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
+    let result = rt.block_on(async {
         for n in 0..30u32 {
             match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
                 Ok(Some(f)) => println!(
@@ -26,20 +26,19 @@ fn main() -> anyhow::Result<()> {
                     f.timestamp_us
                 ),
                 Ok(None) => {
-                    println!("capture stopped");
-                    break;
+                    anyhow::bail!("capture stopped before the probe completed");
                 }
                 Err(_) => {
+                    if n == 0 {
+                        anyhow::bail!("capture started but produced no frame within 5s");
+                    }
                     println!("no frame within 5s");
                     break;
                 }
             }
         }
+        Ok(())
     });
     video.stop();
-    Ok(())
-}
-#[cfg(not(target_os = "macos"))]
-fn main() {
-    println!("macOS only");
+    result
 }
