@@ -7,13 +7,114 @@
 //! mapping is positional throughout and never depends on the layout either
 //! side happens to have selected.
 //!
-//! Text is carried separately, as a Unicode scalar, because the character a
-//! key produces depends on the *client's* layout and only the client knows
-//! it.
+//! Text metadata carries at most one Unicode scalar. It is not an IME commit
+//! stream; macOS injection currently uses physical keys and the remote layout.
 
 use ndp_proto::{InputEvent, InputKind, KeyCode as Hid, Modifiers, MouseButton};
 use winit::event::{ElementState, MouseButton as WinitButton, MouseScrollDelta};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+
+/// Tracks only presses actually forwarded to the agent.
+#[derive(Default)]
+pub struct HeldInput {
+    keys: Vec<Hid>,
+    buttons: Vec<MouseButton>,
+    last_pointer: (f32, f32),
+}
+
+impl HeldInput {
+    pub fn movement(&mut self, at: (f32, f32), modifiers: Modifiers) -> InputEvent {
+        self.last_pointer = at;
+        let mut event = InputEvent::mouse_move(at.0, at.1, modifiers);
+        if let Some(&button) = self.buttons.first() {
+            event.kind = InputKind::MouseDrag;
+            event.button = button;
+        }
+        event
+    }
+
+    pub fn button(
+        &mut self,
+        button: MouseButton,
+        state: ElementState,
+        at: Option<(f32, f32)>,
+        modifiers: Modifiers,
+    ) -> Option<InputEvent> {
+        if button == MouseButton::None {
+            return None;
+        }
+        let at = match state {
+            ElementState::Pressed => {
+                let at = at?;
+                if self.buttons.contains(&button) {
+                    return None;
+                }
+                self.buttons.push(button);
+                at
+            }
+            ElementState::Released => {
+                let index = self.buttons.iter().position(|held| *held == button)?;
+                self.buttons.remove(index);
+                at.unwrap_or(self.last_pointer)
+            }
+        };
+        self.last_pointer = at;
+        let mut event = InputEvent::mouse_move(at.0, at.1, modifiers);
+        event.kind = match state {
+            ElementState::Pressed => InputKind::MouseDown,
+            ElementState::Released => InputKind::MouseUp,
+        };
+        event.button = button;
+        Some(event)
+    }
+
+    pub fn keyboard(&mut self, mut event: InputEvent, repeat: bool) -> Option<InputEvent> {
+        let index = self.keys.iter().position(|key| *key == event.key);
+        match event.kind {
+            InputKind::KeyDown => {
+                // A repeat arriving after focus loss must not recreate a held key.
+                if repeat && index.is_none() {
+                    return None;
+                }
+                if index.is_none() {
+                    self.keys.push(event.key);
+                }
+                if repeat {
+                    event.modifiers = event.modifiers.union(Modifiers::REPEAT);
+                }
+            }
+            InputKind::KeyUp => {
+                self.keys.remove(index?);
+            }
+            _ => return None,
+        }
+        Some(event)
+    }
+
+    pub fn release_buttons(&mut self, modifiers: Modifiers) -> Vec<InputEvent> {
+        let at = self.last_pointer;
+        self.buttons
+            .drain(..)
+            .map(|button| {
+                let mut event = InputEvent::mouse_move(at.0, at.1, modifiers);
+                event.kind = InputKind::MouseUp;
+                event.button = button;
+                event
+            })
+            .collect()
+    }
+
+    pub fn release_all(&mut self) -> Vec<InputEvent> {
+        let mut events = self.release_buttons(Modifiers::NONE);
+        events.extend(
+            self.keys
+                .drain(..)
+                .rev()
+                .map(|key| InputEvent::key(InputKind::KeyUp, key, Modifiers::NONE)),
+        );
+        events
+    }
+}
 
 /// Where the picture sits inside the window.
 ///
@@ -302,6 +403,131 @@ pub fn hid(code: KeyCode) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn held_buttons_turn_moves_into_drags_until_released() {
+        let mut held = HeldInput::default();
+        let at = (0.25, 0.75);
+        assert_eq!(
+            held.movement(at, Modifiers::NONE).kind,
+            InputKind::MouseMove
+        );
+        for button in [MouseButton::Right, MouseButton::Left] {
+            held.button(button, ElementState::Pressed, Some(at), Modifiers::NONE)
+                .unwrap();
+        }
+        let drag = held.movement((0.5, 0.5), Modifiers::SHIFT);
+        assert_eq!(drag.kind, InputKind::MouseDrag);
+        assert_eq!(drag.button, MouseButton::Right);
+        assert_eq!(drag.modifiers, Modifiers::SHIFT);
+        let up = held
+            .button(
+                MouseButton::Right,
+                ElementState::Released,
+                None,
+                Modifiers::NONE,
+            )
+            .unwrap();
+        assert_eq!(up.kind, InputKind::MouseUp);
+        assert_eq!((up.x, up.y), (0.5, 0.5));
+        assert_eq!(held.movement(at, Modifiers::NONE).button, MouseButton::Left);
+        assert_eq!(held.release_buttons(Modifiers::NONE).len(), 1);
+        assert_eq!(
+            held.movement(at, Modifiers::NONE).kind,
+            InputKind::MouseMove
+        );
+    }
+
+    #[test]
+    fn pointer_leave_releases_buttons_but_preserves_keyboard_state() {
+        let mut held = HeldInput::default();
+        held.keyboard(
+            InputEvent::key(InputKind::KeyDown, Hid::A, Modifiers::NONE),
+            false,
+        )
+        .unwrap();
+        assert!(held
+            .button(
+                MouseButton::Left,
+                ElementState::Pressed,
+                None,
+                Modifiers::NONE
+            )
+            .is_none());
+        held.button(
+            MouseButton::Left,
+            ElementState::Pressed,
+            Some((0.4, 0.6)),
+            Modifiers::NONE,
+        )
+        .unwrap();
+        let releases = held.release_buttons(Modifiers::SHIFT);
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].kind, InputKind::MouseUp);
+        assert_eq!((releases[0].x, releases[0].y), (0.4, 0.6));
+        assert!(held
+            .button(
+                MouseButton::Left,
+                ElementState::Released,
+                None,
+                Modifiers::NONE
+            )
+            .is_none());
+        assert!(held
+            .keyboard(
+                InputEvent::key(InputKind::KeyUp, Hid::A, Modifiers::NONE),
+                false
+            )
+            .is_some());
+    }
+
+    #[test]
+    fn focus_loss_releases_every_press_once_and_rejects_late_repeats() {
+        let mut held = HeldInput::default();
+        for key in [Hid(0xe3), Hid::A] {
+            held.keyboard(
+                InputEvent::key(InputKind::KeyDown, key, Modifiers::META),
+                false,
+            )
+            .unwrap();
+        }
+        let repeat = held
+            .keyboard(
+                InputEvent::key(InputKind::KeyDown, Hid::A, Modifiers::META),
+                true,
+            )
+            .unwrap();
+        assert!(repeat.modifiers.contains(Modifiers::REPEAT));
+        assert!(repeat.modifiers.contains(Modifiers::META));
+        held.button(
+            MouseButton::Left,
+            ElementState::Pressed,
+            Some((0.2, 0.3)),
+            Modifiers::META,
+        )
+        .unwrap();
+        let releases = held.release_all();
+        assert_eq!(releases.len(), 3);
+        assert_eq!(releases[0].kind, InputKind::MouseUp);
+        assert_eq!(releases[1].key, Hid::A);
+        assert_eq!(releases[2].key, Hid(0xe3));
+        assert!(releases
+            .iter()
+            .all(|event| event.modifiers == Modifiers::NONE));
+        assert!(held.release_all().is_empty());
+        assert!(held
+            .keyboard(
+                InputEvent::key(InputKind::KeyDown, Hid::A, Modifiers::NONE),
+                true
+            )
+            .is_none());
+        assert!(held
+            .keyboard(
+                InputEvent::key(InputKind::KeyUp, Hid::A, Modifiers::NONE),
+                false
+            )
+            .is_none());
+    }
 
     #[test]
     fn the_picture_is_centred_and_keeps_its_shape() {

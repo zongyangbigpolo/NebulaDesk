@@ -9,7 +9,7 @@
 //!
 //! * The name is validated before anything touches the filesystem, so a
 //!   sender cannot name its way out of the download directory.
-//! * Bytes land in a `.part` file and are renamed into place only after the
+//! * Bytes land in a `.part` file and are published without replacement after the
 //!   hash matches. A transfer that dies halfway leaves something obviously
 //!   incomplete rather than a file that looks finished and isn't.
 //! * Chunks are written where the sender says they belong, and the file is
@@ -20,7 +20,7 @@
 //!   promised. Nothing is trusted about where a chunk claims to go beyond
 //!   its having to fit inside the announced size.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -52,6 +52,21 @@ pub const MAX_ACTIVE: usize = 4;
 /// How long the worker waits for traffic before looking for work to do.
 const POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
+/// Also bounds waits for older peers that silently discard a failed transfer.
+const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+// FileAck rejects zero windows on the wire. This impossible byte count means
+// terminal receiver failure, never success; actual files are capped at MAX_FILE.
+const FAILED_RECEIVED: u64 = u64::MAX;
+
+fn failure_ack(transfer_id: u64) -> Action {
+    Action::Ack(FileAck {
+        transfer_id,
+        received: FAILED_RECEIVED,
+        window: WINDOW,
+    })
+}
+
 /// Something to put on the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -70,6 +85,8 @@ struct Sending {
     size: u64,
     /// Highest offset the receiver has allowed.
     allowed: u64,
+    finished: bool,
+    last_progress: std::time::Instant,
     name: String,
 }
 
@@ -84,6 +101,7 @@ struct Receiving {
     size: u64,
     expected: String,
     modified_secs: Option<i64>,
+    last_progress: std::time::Instant,
 }
 
 /// The set of byte ranges that have arrived.
@@ -179,6 +197,14 @@ impl FileTransfers {
             .context("a file to send needs a name")?
             .to_owned();
 
+        // A Finder copy or window drop authorizes a regular file, not traversal
+        // into a copied directory or following a symlink to another location.
+        if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+            bail!(
+                "{} is not a regular file (symlinks and directories are not sent)",
+                path.display()
+            );
+        }
         let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let metadata = file.metadata()?;
         if !metadata.is_file() {
@@ -225,6 +251,8 @@ impl FileTransfers {
                 offset: 0,
                 size,
                 allowed: 0,
+                finished: false,
+                last_progress: std::time::Instant::now(),
                 name,
             },
         );
@@ -257,13 +285,9 @@ impl FileTransfers {
                 return None;
             }
         };
-        let part = final_path.with_extension("nebulapart");
-        let file = match File::options()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&part)
-        {
+        let part =
+            final_path.with_file_name(format!(".nebula-{}.nebulapart", uuid::Uuid::new_v4()));
+        let file = match File::options().create_new(true).write(true).open(&part) {
             Ok(file) => file,
             Err(error) => {
                 tracing::warn!(%error, path = %part.display(), "could not open a file to receive into");
@@ -282,6 +306,7 @@ impl FileTransfers {
                 size: offer.size,
                 expected: offer.blake3.clone(),
                 modified_secs: offer.modified_secs,
+                last_progress: std::time::Instant::now(),
             },
         );
 
@@ -294,8 +319,27 @@ impl FileTransfers {
 
     /// Note how much more the peer is willing to receive.
     pub fn on_ack(&mut self, ack: &FileAck) {
+        if ack.received == FAILED_RECEIVED {
+            if let Some(send) = self.sending.remove(&ack.transfer_id) {
+                tracing::warn!(name = %send.name, "the peer rejected or could not finish receiving a file");
+            }
+            return;
+        }
         if let Some(send) = self.sending.get_mut(&ack.transfer_id) {
-            send.allowed = ack.received.saturating_add(u64::from(ack.window));
+            if ack.received > send.size {
+                return;
+            }
+            if send.finished && ack.received == send.size {
+                tracing::info!(name = %send.name, "a file finished sending");
+                self.sending.remove(&ack.transfer_id);
+            } else {
+                // Each acknowledgement has its own stream and can arrive late.
+                let allowed = ack.received.saturating_add(u64::from(ack.window));
+                if allowed > send.allowed {
+                    send.allowed = allowed;
+                    send.last_progress = std::time::Instant::now();
+                }
+            }
         }
     }
 
@@ -307,7 +351,7 @@ impl FileTransfers {
         if end > recv.size {
             tracing::warn!("abandoning a transfer that overran its announced size");
             self.abandon(header.transfer_id);
-            return None;
+            return Some(failure_ack(header.transfer_id));
         }
 
         let written = recv
@@ -317,19 +361,25 @@ impl FileTransfers {
         if let Err(error) = written {
             tracing::warn!(%error, "abandoning a transfer that could not be written");
             self.abandon(header.transfer_id);
-            return None;
+            return Some(failure_ack(header.transfer_id));
         }
+        recv.last_progress = std::time::Instant::now();
         recv.have.add(header.offset, end);
 
         let complete = recv.have.complete(recv.size);
         let received = recv.have.contiguous();
         let due = complete || received - recv.acked >= ACK_EVERY;
-        recv.acked = received;
+        if due {
+            recv.acked = received;
+        }
 
         if complete {
             match self.finish(header.transfer_id) {
                 Ok(path) => tracing::info!(path = %path.display(), "a file arrived"),
-                Err(error) => tracing::warn!(%error, "a file arrived damaged and was discarded"),
+                Err(error) => {
+                    tracing::warn!(%error, "a file arrived damaged and was discarded");
+                    return Some(failure_ack(header.transfer_id));
+                }
             }
         }
 
@@ -345,10 +395,21 @@ impl FileTransfers {
         let ready = self
             .sending
             .iter()
-            .find(|(_, s)| s.offset < s.size && s.offset < s.allowed)
+            .find(|(_, s)| !s.finished && s.offset < s.allowed)
             .map(|(id, _)| *id)?;
 
         let send = self.sending.get_mut(&ready)?;
+        if send.size == 0 {
+            send.finished = true;
+            send.last_progress = std::time::Instant::now();
+            return Some(Action::Chunk(
+                FileChunkHeader {
+                    transfer_id: ready,
+                    offset: 0,
+                },
+                Vec::new(),
+            ));
+        }
         let room = (send.allowed - send.offset).min(send.size - send.offset);
         let want = room.min(CHUNK as u64) as usize;
         let mut buffer = vec![0u8; want];
@@ -376,9 +437,11 @@ impl FileTransfers {
             offset: send.offset,
         };
         send.offset += filled as u64;
+        send.last_progress = std::time::Instant::now();
         if send.offset >= send.size {
-            tracing::info!(name = %send.name, "a file finished sending");
-            self.sending.remove(&ready);
+            // Retain the slot until the receiver confirms completion. New offers
+            // otherwise overtake the final chunk on independent QUIC streams.
+            send.finished = true;
         }
         Some(Action::Chunk(header, buffer))
     }
@@ -388,7 +451,27 @@ impl FileTransfers {
     pub fn wants_to_send(&self) -> bool {
         self.sending
             .values()
-            .any(|s| s.offset < s.size && s.offset < s.allowed)
+            .any(|s| !s.finished && s.offset < s.allowed)
+    }
+
+    fn expire_stalled(&mut self, now: std::time::Instant) {
+        self.sending.retain(|_, send| {
+            let expired = now.saturating_duration_since(send.last_progress) >= STALL_TIMEOUT;
+            if expired {
+                tracing::warn!(name = %send.name, "file send timed out without peer progress");
+            }
+            !expired
+        });
+        let expired: Vec<_> = self
+            .receiving
+            .iter()
+            .filter(|(_, recv)| now.saturating_duration_since(recv.last_progress) >= STALL_TIMEOUT)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in expired {
+            tracing::warn!(transfer_id = id, "incomplete file receive timed out");
+            self.abandon(id);
+        }
     }
 
     /// Verify a completed arrival and move it into place.
@@ -397,39 +480,59 @@ impl FileTransfers {
             .receiving
             .remove(&transfer_id)
             .context("no such transfer")?;
-        recv.file.sync_all().ok();
+        let synced = recv.file.sync_all();
         drop(recv.file);
 
-        // Hashed by reading the finished file rather than as bytes arrive:
-        // out-of-order chunks mean there is no arrival order to hash in.
-        let mut hasher = blake3::Hasher::new();
-        let mut reading = File::open(&recv.part)?;
-        let mut buffer = vec![0u8; CHUNK];
-        loop {
-            let read = reading.read(&mut buffer)?;
-            if read == 0 {
-                break;
+        let result = (|| {
+            synced.context("syncing the arriving file")?;
+            // Hashed by reading the finished file rather than as bytes arrive:
+            // out-of-order chunks mean there is no arrival order to hash in.
+            let mut hasher = blake3::Hasher::new();
+            let mut reading = File::open(&recv.part)?;
+            let mut buffer = vec![0u8; CHUNK];
+            loop {
+                let read = reading.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
             }
-            hasher.update(&buffer[..read]);
-        }
-        drop(reading);
-        let actual = hasher.finalize().to_hex().to_string();
-        if actual != recv.expected {
-            std::fs::remove_file(&recv.part).ok();
-            bail!("the contents did not match the announced hash");
-        }
+            drop(reading);
+            let actual = hasher.finalize().to_hex().to_string();
+            if actual != recv.expected {
+                bail!("the contents did not match the announced hash");
+            }
 
-        std::fs::rename(&recv.part, &recv.final_path).with_context(|| {
-            format!(
-                "moving {} into place at {}",
-                recv.part.display(),
-                recv.final_path.display()
-            )
-        })?;
-        if let Some(secs) = recv.modified_secs {
-            set_modified(&recv.final_path, secs);
+            if let Some(secs) = recv.modified_secs {
+                set_modified(&recv.part, secs);
+            }
+            let name = recv
+                .final_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("an arriving file needs a name")?;
+            let mut destination = recv.final_path.clone();
+            for _ in 0..1000 {
+                // Publication never overwrites a case alias, symlink or racing file.
+                match publish_no_replace(&recv.part, &destination) {
+                    Ok(()) => return Ok(destination),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        destination = self.free_path(name)?;
+                    }
+                    Err(error) => {
+                        return Err(error)
+                            .context("publishing the arriving file without replacement")
+                    }
+                }
+            }
+            bail!("too many collisions while publishing the arriving file")
+        })();
+        if let Err(error) = std::fs::remove_file(&recv.part) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(%error, path = %recv.part.display(), "could not remove file-transfer staging file");
+            }
         }
-        Ok(recv.final_path)
+        result
     }
 
     /// Drop a transfer and remove whatever was written for it.
@@ -447,7 +550,7 @@ impl FileTransfers {
     fn free_path(&self, name: &str) -> anyhow::Result<PathBuf> {
         std::fs::create_dir_all(&self.downloads)?;
         let direct = self.downloads.join(name);
-        if !direct.exists() {
+        if self.path_available(&direct)? {
             return Ok(direct);
         }
 
@@ -457,12 +560,57 @@ impl FileTransfers {
         };
         for n in 2..1000 {
             let candidate = self.downloads.join(format!("{stem} ({n}){extension}"));
-            if !candidate.exists() {
+            if self.path_available(&candidate)? {
                 return Ok(candidate);
             }
         }
         bail!("there are already too many files called {name}")
     }
+
+    fn path_available(&self, path: &Path) -> anyhow::Result<bool> {
+        if self.receiving.values().any(|r| r.final_path == path) {
+            return Ok(false);
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error).context("checking a file-transfer destination"),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn publish_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::ffi::{c_char, c_int, c_uint, CString};
+    use std::os::unix::ffi::OsStrExt;
+
+    unsafe extern "C" {
+        fn renamex_np(from: *const c_char, to: *const c_char, flags: c_uint) -> c_int;
+    }
+    // Darwin <sys/stdio.h>. Unlike hard links, exclusive rename supports exFAT.
+    const RENAME_EXCL: c_uint = 0x00000004;
+    let source = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "source path contains NUL")
+    })?;
+    let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "destination path contains NUL",
+        )
+    })?;
+    // SAFETY: Both pointers reference live NUL-terminated path byte strings.
+    // RENAME_EXCL atomically refuses an existing destination, including symlinks.
+    if unsafe { renamex_np(source.as_ptr(), destination.as_ptr(), RENAME_EXCL) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn publish_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    // Staging and destination are on the same filesystem; the caller unlinks staging.
+    std::fs::hard_link(source, destination)
 }
 
 /// Restore the sender's modification time where the platform allows it.
@@ -513,9 +661,11 @@ pub struct Worker {
 }
 
 impl Worker {
-    /// Hand something to the worker, ignoring a worker that has gone away.
+    /// Hand something to the worker, logging a worker that has gone away.
     pub fn deliver(&self, message: Inbound) {
-        let _ = self.inbound.send(message);
+        if self.inbound.send(message).is_err() {
+            tracing::warn!("file transfer worker is unavailable");
+        }
     }
 
     /// A sender that can ask for local files to be sent.
@@ -536,10 +686,13 @@ pub fn spawn(downloads: PathBuf, enabled: bool) -> Worker {
         .name("nebula-files".into())
         .spawn(move || {
             let mut transfers = FileTransfers::new(downloads, enabled);
+            let mut pending = VecDeque::new();
             loop {
+                transfers.expire_stalled(std::time::Instant::now());
                 // With chunks waiting there is no reason to sit on the
                 // channel; with nothing to send there is no reason to spin.
-                let wait = if transfers.wants_to_send() {
+                let can_start = transfers.sending.len() < MAX_ACTIVE && !pending.is_empty();
+                let wait = if transfers.wants_to_send() || can_start {
                     std::time::Duration::ZERO
                 } else {
                     POLL
@@ -552,18 +705,40 @@ pub fn spawn(downloads: PathBuf, enabled: bool) -> Worker {
                         transfers.on_ack(&ack);
                         None
                     }
-                    Ok(Inbound::Send(path)) => match transfers.send_file(&path) {
-                        Ok(action) => Some(action),
-                        Err(error) => {
-                            tracing::warn!(%error, path = %path.display(), "cannot send that file");
-                            None
+                    Ok(Inbound::Send(path)) => {
+                        if !enabled {
+                            tracing::warn!(path = %path.display(), "file transfer is not permitted");
+                        } else if pending.len() >= 256 {
+                            tracing::warn!(path = %path.display(), "file send queue is full; copy this file again later");
+                        } else {
+                            pending.push_back(path);
                         }
+                        None
                     },
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => transfers.pump(),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
                 };
 
                 if let Some(action) = action {
+                    if actions.blocking_send(action).is_err() {
+                        return;
+                    }
+                }
+                if transfers.sending.len() < MAX_ACTIVE {
+                    if let Some(path) = pending.pop_front() {
+                        match transfers.send_file(&path) {
+                            Ok(action) => {
+                                if actions.blocking_send(action).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, path = %path.display(), "cannot send that file");
+                            }
+                        }
+                    }
+                }
+                if let Some(action) = transfers.pump() {
                     if actions.blocking_send(action).is_err() {
                         return;
                     }
@@ -578,6 +753,230 @@ pub fn spawn(downloads: PathBuf, enabled: bool) -> Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exclusive_native_rename_preserves_path_bytes_and_rejects_nul() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source-中 é");
+        let destination = dir.path().join("target-中 é");
+        std::fs::write(&source, b"native").unwrap();
+        let invalid = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"invalid\0suffix".to_vec()));
+        assert_eq!(
+            publish_no_replace(&source, &invalid).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            publish_no_replace(&invalid, &destination)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert!(source.exists());
+        publish_no_replace(&source, &destination).unwrap();
+        assert!(
+            !source.exists(),
+            "native publication renames rather than links"
+        );
+        assert_eq!(std::fs::read(destination).unwrap(), b"native");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_does_not_replace_or_follow_directory_symlink_destinations() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = write(dir.path(), "staging", b"verified");
+        let directory = dir.path().join("existing-directory");
+        std::fs::create_dir(&directory).unwrap();
+        let link = dir.path().join("existing-link");
+        std::os::unix::fs::symlink(&directory, &link).unwrap();
+        let dangling = dir.path().join("dangling-link");
+        std::os::unix::fs::symlink(dir.path().join("absent"), &dangling).unwrap();
+        for destination in [&directory, &link, &dangling] {
+            assert_eq!(
+                publish_no_replace(&source, destination).unwrap_err().kind(),
+                std::io::ErrorKind::AlreadyExists
+            );
+            assert_eq!(std::fs::read(&source).unwrap(), b"verified");
+        }
+        assert!(std::fs::symlink_metadata(link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::symlink_metadata(dangling)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_dir(directory).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn four_changed_sources_fail_explicitly_and_queued_file_still_arrives() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let mut sender = spawn(source.path().into(), true);
+        let mut receiver = spawn(target.path().into(), true);
+        for i in 0..=MAX_ACTIVE {
+            let path = write(source.path(), &format!("copy-{i}.txt"), b"before");
+            sender.deliver(Inbound::Send(path));
+        }
+        let mut failures = 0;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    action = sender.outbound.recv() => match action.unwrap() {
+                        Action::Offer(offer) => {
+                            if offer.name != format!("copy-{MAX_ACTIVE}.txt") {
+                                // The offer proves hashing finished; retain the original size.
+                                std::fs::write(source.path().join(&offer.name), b"after!").unwrap();
+                            }
+                            receiver.deliver(Inbound::Offer(offer));
+                        }
+                        Action::Chunk(header, bytes) => receiver.deliver(Inbound::Chunk(header, bytes)),
+                        other => panic!("unexpected sender action {other:?}"),
+                    },
+                    action = receiver.outbound.recv() => {
+                        let Action::Ack(ack) = action.unwrap() else { panic!("expected an ack") };
+                        // Exercise the actual wire decoder, which forbids a zero window.
+                        let decoded = FileAck::decode(&ack.to_bytes()).unwrap();
+                        if decoded.received == FAILED_RECEIVED {
+                            failures += 1;
+                        }
+                        sender.deliver(Inbound::Ack(decoded));
+                    },
+                }
+                if failures == MAX_ACTIVE && target.path().join(format!("copy-{MAX_ACTIVE}.txt")).exists() {
+                    break;
+                }
+            }
+        }).await.expect("failed transfers must not permanently occupy the send slots");
+        assert_eq!(
+            std::fs::read(target.path().join(format!("copy-{MAX_ACTIVE}.txt"))).unwrap(),
+            b"before"
+        );
+        assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn stalled_legacy_sends_and_incomplete_receives_release_their_slots() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let path = write(source.path(), "stalled.txt", b"contents");
+        let mut sender = FileTransfers::new(source.path().into(), true);
+        let mut receiver = FileTransfers::new(target.path().into(), true);
+        for _ in 0..MAX_ACTIVE {
+            let Action::Offer(offer) = sender.send_file(&path).unwrap() else {
+                panic!("expected offer")
+            };
+            let Some(Action::Ack(ack)) = receiver.on_offer(&offer) else {
+                panic!("expected ack")
+            };
+            sender.on_ack(&ack);
+        }
+        while sender.pump().is_some() {}
+        assert_eq!(sender.sending.len(), MAX_ACTIVE);
+        assert!(sender.send_file(&path).is_err());
+        let expired_at = std::time::Instant::now() + STALL_TIMEOUT;
+        sender.expire_stalled(expired_at);
+        receiver.expire_stalled(expired_at);
+        assert!(sender.sending.is_empty());
+        assert!(receiver.receiving.is_empty());
+        assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
+        assert!(sender.send_file(&path).is_ok());
+    }
+
+    #[test]
+    fn concurrent_case_equivalent_names_never_overwrite_each_other() {
+        let target = tempfile::tempdir().unwrap();
+        let probe = write(target.path(), "CaseProbe", b"probe");
+        let case_insensitive = target.path().join("caseprobe").exists();
+        std::fs::remove_file(probe).unwrap();
+        let mut receiver = FileTransfers::new(target.path().into(), true);
+        for (id, name, bytes) in [
+            (1, "Report.txt", b"first".as_slice()),
+            (2, "report.txt", b"second".as_slice()),
+        ] {
+            assert!(receiver
+                .on_offer(&FileOffer {
+                    transfer_id: id,
+                    name: name.into(),
+                    size: bytes.len() as u64,
+                    blake3: blake3::hash(bytes).to_hex().to_string(),
+                    modified_secs: None,
+                })
+                .is_some());
+        }
+        for (id, bytes) in [(1, b"first".as_slice()), (2, b"second".as_slice())] {
+            let Some(Action::Ack(ack)) = receiver.on_chunk(
+                FileChunkHeader {
+                    transfer_id: id,
+                    offset: 0,
+                },
+                bytes,
+            ) else {
+                panic!("completion must be acknowledged")
+            };
+            assert_eq!(ack.received, bytes.len() as u64);
+        }
+        assert_eq!(
+            std::fs::read(target.path().join("Report.txt")).unwrap(),
+            b"first"
+        );
+        let second = if case_insensitive {
+            "report (2).txt"
+        } else {
+            "report.txt"
+        };
+        assert_eq!(
+            std::fs::read(target.path().join(second)).unwrap(),
+            b"second"
+        );
+        assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn destination_created_during_transfer_is_preserved_and_arrival_is_numbered() {
+        let target = tempfile::tempdir().unwrap();
+        let mut receiver = FileTransfers::new(target.path().into(), true);
+        let bytes = b"received";
+        assert!(receiver
+            .on_offer(&FileOffer {
+                transfer_id: 1,
+                name: "report.txt".into(),
+                size: bytes.len() as u64,
+                blake3: blake3::hash(bytes).to_hex().to_string(),
+                modified_secs: None,
+            })
+            .is_some());
+        write(target.path(), "report.txt", b"external writer");
+        write(target.path(), "report (2).txt", b"another external writer");
+        let Some(Action::Ack(ack)) = receiver.on_chunk(
+            FileChunkHeader {
+                transfer_id: 1,
+                offset: 0,
+            },
+            bytes,
+        ) else {
+            panic!("completion must be acknowledged")
+        };
+        assert_eq!(ack.received, bytes.len() as u64);
+        assert_eq!(
+            std::fs::read(target.path().join("report.txt")).unwrap(),
+            b"external writer"
+        );
+        assert_eq!(
+            std::fs::read(target.path().join("report (2).txt")).unwrap(),
+            b"another external writer"
+        );
+        assert_eq!(
+            std::fs::read(target.path().join("report (3).txt")).unwrap(),
+            bytes
+        );
+        assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 3);
+    }
 
     /// Drive a file from one engine to the other and hand back where it
     /// landed, exactly as the session loop would.
@@ -629,6 +1028,127 @@ mod tests {
         let landed = transfer(&mut sender, &mut receiver, &path).unwrap();
 
         assert_eq!(std::fs::read(&landed).unwrap(), contents);
+    }
+
+    #[test]
+    fn a_file_larger_than_the_window_does_not_stall() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let contents: Vec<u8> = (0..WINDOW as usize * 2 + 17)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let path = write(source.path(), "large.bin", &contents);
+        let mut sender = FileTransfers::new(source.path().into(), true);
+        let mut receiver = FileTransfers::new(target.path().into(), true);
+        let landed = transfer(&mut sender, &mut receiver, &path).unwrap();
+        assert_eq!(
+            blake3::hash(&std::fs::read(landed).unwrap()),
+            blake3::hash(&contents)
+        );
+    }
+
+    #[test]
+    fn an_empty_file_completes_and_releases_its_slot() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let path = write(source.path(), "empty.txt", b"");
+        let mut sender = FileTransfers::new(source.path().into(), true);
+        let mut receiver = FileTransfers::new(target.path().into(), true);
+        let landed = transfer(&mut sender, &mut receiver, &path).unwrap();
+        assert_eq!(std::fs::read(landed).unwrap(), b"");
+        assert!(sender.sending.is_empty());
+        assert!(receiver.receiving.is_empty());
+        transfer(&mut sender, &mut receiver, &path).unwrap();
+        assert_eq!(
+            std::fs::read(target.path().join("empty (2).txt")).unwrap(),
+            b""
+        );
+    }
+
+    #[test]
+    fn completion_waits_for_the_peer_and_old_window_acks_do_not_regress() {
+        let source = tempfile::tempdir().unwrap();
+        let path = write(source.path(), "ack.txt", b"file");
+        let mut sender = FileTransfers::new(source.path().into(), true);
+        let Action::Offer(offer) = sender.send_file(&path).unwrap() else {
+            panic!("missing offer")
+        };
+        sender.on_ack(&FileAck {
+            transfer_id: offer.transfer_id,
+            received: 2,
+            window: WINDOW,
+        });
+        sender.on_ack(&FileAck {
+            transfer_id: offer.transfer_id,
+            received: 0,
+            window: WINDOW,
+        });
+        assert_eq!(
+            sender.sending[&offer.transfer_id].allowed,
+            u64::from(WINDOW) + 2
+        );
+        assert!(sender.pump().is_some());
+        assert!(!sender.wants_to_send());
+        assert_eq!(sender.sending.len(), 1, "the receiver still owns a slot");
+        sender.on_ack(&FileAck {
+            transfer_id: offer.transfer_id,
+            received: 4,
+            window: WINDOW,
+        });
+        assert!(sender.sending.is_empty());
+    }
+
+    #[test]
+    fn concurrent_same_stem_and_same_name_transfers_have_distinct_files() {
+        let target = tempfile::tempdir().unwrap();
+        let mut receiver = FileTransfers::new(target.path().into(), true);
+        for (id, name) in [(1, "report.pdf"), (2, "report.txt"), (3, "report.pdf")] {
+            assert!(receiver
+                .on_offer(&FileOffer {
+                    transfer_id: id,
+                    name: name.into(),
+                    size: 1,
+                    blake3: blake3::hash(&[id as u8]).to_hex().to_string(),
+                    modified_secs: None,
+                })
+                .is_some());
+        }
+        for id in [3, 1, 2] {
+            assert!(receiver
+                .on_chunk(
+                    FileChunkHeader {
+                        transfer_id: id,
+                        offset: 0,
+                    },
+                    &[id as u8]
+                )
+                .is_some());
+        }
+        assert_eq!(
+            std::fs::read(target.path().join("report.pdf")).unwrap(),
+            [1]
+        );
+        assert_eq!(
+            std::fs::read(target.path().join("report.txt")).unwrap(),
+            [2]
+        );
+        assert_eq!(
+            std::fs::read(target.path().join("report (2).pdf")).unwrap(),
+            [3]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_local_gesture_does_not_send_directories_or_follow_symlinks() {
+        let source = tempfile::tempdir().unwrap();
+        let path = write(source.path(), "real.txt", b"local");
+        let link = source.path().join("link.txt");
+        std::os::unix::fs::symlink(path, &link).unwrap();
+        let mut sender = FileTransfers::new(source.path().into(), true);
+        assert!(sender.send_file(source.path()).is_err());
+        assert!(sender.send_file(&link).is_err());
+        assert!(sender.sending.is_empty());
     }
 
     #[test]
@@ -686,13 +1206,14 @@ mod tests {
             modified_secs: None,
         };
         assert!(receiver.on_offer(&offer).is_some());
-        receiver.on_chunk(
+        let failure = receiver.on_chunk(
             FileChunkHeader {
                 transfer_id: 7,
                 offset: 0,
             },
             b"wrong",
         );
+        assert_eq!(failure, Some(failure_ack(7)));
 
         assert!(
             !target.path().join("invoice.pdf").exists(),
@@ -799,15 +1320,16 @@ mod tests {
             modified_secs: None,
         };
         assert!(receiver.on_offer(&offer).is_some());
-        assert!(receiver
-            .on_chunk(
+        assert_eq!(
+            receiver.on_chunk(
                 FileChunkHeader {
                     transfer_id: 9,
                     offset: 0,
                 },
                 &[0u8; 4096],
-            )
-            .is_none());
+            ),
+            Some(failure_ack(9))
+        );
         assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
     }
 

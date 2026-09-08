@@ -9,6 +9,9 @@
 //! binary and then silently drops events without it, giving no error at the
 //! call site — a session where the picture moves but the mouse does not is
 //! otherwise a very confusing thing to debug.
+//!
+//! Keyboard injection is physical/remote-layout based. Unicode metadata and
+//! client-side IME composition are not injected as committed text.
 
 use core_graphics::display::CGDisplay;
 use core_graphics::event::{
@@ -17,6 +20,7 @@ use core_graphics::event::{
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 use ndp_proto::{InputEvent, InputKind, KeyCode, Modifiers, MouseButton};
+use std::time::{Duration, Instant};
 
 use crate::media::InputInjector;
 
@@ -109,7 +113,113 @@ struct Desktop {
     last: CGPoint,
     /// Which buttons this session believes are down, so they can be released
     /// if it ends mid-drag.
-    held: Vec<CGMouseButton>,
+    held: Vec<MouseButton>,
+    keys: HeldKeys,
+    clicks: Clicks,
+    clock: Instant,
+    wheel: [f64; 2],
+}
+
+#[derive(Default)]
+struct HeldKeys(Vec<u16>);
+
+impl HeldKeys {
+    fn update(&mut self, code: u16, down: bool) -> bool {
+        let repeated = self.0.contains(&code);
+        if down && !repeated {
+            self.0.push(code);
+        } else if !down {
+            self.0.retain(|held| *held != code);
+        }
+        down && repeated
+    }
+
+    fn modifiers(&self, code: u16, mut modifiers: Modifiers) -> Modifiers {
+        // Winit can deliver the physical transition before ModifiersChanged.
+        for (left, right, flag) in [
+            (0x38, 0x3c, Modifiers::SHIFT),
+            (0x3b, 0x3e, Modifiers::CONTROL),
+            (0x3a, 0x3d, Modifiers::ALT),
+            (0x37, 0x36, Modifiers::META),
+        ] {
+            if code == left || code == right {
+                modifiers.0 &= !flag.0;
+                if self.0.contains(&left) || self.0.contains(&right) {
+                    modifiers = modifiers.union(flag);
+                }
+            }
+        }
+        modifiers
+    }
+
+    fn release_all(&mut self) -> Vec<u16> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+struct Click {
+    button: MouseButton,
+    point: CGPoint,
+    time: Duration,
+    count: i64,
+    released: bool,
+}
+
+struct Clicks {
+    interval: Duration,
+    last: Option<Click>,
+    pressed: [i64; 5],
+}
+
+impl Clicks {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last: None,
+            pressed: [0; 5],
+        }
+    }
+
+    fn moved(&mut self, point: CGPoint) {
+        if self.last.as_ref().is_some_and(|last| {
+            (point.x - last.point.x).powi(2) + (point.y - last.point.y).powi(2) > 16.0
+        }) {
+            self.last = None;
+        }
+    }
+
+    fn update(&mut self, button: MouseButton, down: bool, point: CGPoint, now: Duration) -> i64 {
+        let Some(index) = button_number(button).map(|number| number as usize) else {
+            return 0;
+        };
+        self.moved(point);
+        if !down {
+            if let Some(last) = self.last.as_mut().filter(|last| last.button == button) {
+                last.released = true;
+            }
+            return std::mem::take(&mut self.pressed[index]).max(1);
+        }
+        let count = self
+            .last
+            .as_ref()
+            .filter(|last| {
+                last.button == button
+                    && last.released
+                    && now
+                        .checked_sub(last.time)
+                        .is_some_and(|elapsed| elapsed <= self.interval)
+            })
+            .map_or(1, |last| last.count.saturating_add(1));
+        self.last = Some(Click {
+            button,
+            point,
+            time: now,
+            count,
+            released: false,
+        });
+        self.pressed[index] = count;
+        count
+    }
 }
 
 impl Desktop {
@@ -134,6 +244,10 @@ impl Desktop {
                 frame.origin.y + frame.size.height / 2.0,
             ),
             held: Vec::new(),
+            keys: HeldKeys::default(),
+            clicks: Clicks::new(double_click_interval()),
+            clock: Instant::now(),
+            wheel: [0.0; 2],
         })
     }
 
@@ -150,17 +264,36 @@ impl Desktop {
         )
     }
 
-    /// Release anything this session left held.
-    fn release_all(&mut self) {
+    fn release_buttons(&mut self, modifiers: Modifiers) {
         let held = std::mem::take(&mut self.held);
         for button in held {
-            let up = match button {
-                CGMouseButton::Left => CGEventType::LeftMouseUp,
-                CGMouseButton::Right => CGEventType::RightMouseUp,
-                CGMouseButton::Center => CGEventType::OtherMouseUp,
+            let Some(cg_button) = cg_button(button) else {
+                continue;
             };
-            if let Ok(event) = CGEvent::new_mouse_event(self.source.clone(), up, self.last, button)
+            let up = mouse_kind(button, false);
+            if let Ok(event) =
+                CGEvent::new_mouse_event(self.source.clone(), up, self.last, cg_button)
             {
+                set_button_number(&event, button);
+                apply_modifiers(&event, modifiers);
+                event.set_integer_value_field(
+                    EventField::MOUSE_EVENT_CLICK_STATE,
+                    self.clicks
+                        .update(button, false, self.last, self.clock.elapsed()),
+                );
+                event.post(CGEventTapLocation::HID);
+            }
+        }
+        self.clicks.last = None;
+        self.clicks.pressed = [0; 5];
+    }
+
+    /// Release physical keys as well as buttons when the transport disappears.
+    fn release_all(&mut self) {
+        self.release_buttons(Modifiers::NONE);
+        for code in self.keys.release_all().into_iter().rev() {
+            if let Ok(event) = CGEvent::new_keyboard_event(self.source.clone(), code, false) {
+                apply_modifiers(&event, Modifiers::NONE);
                 event.post(CGEventTapLocation::HID);
             }
         }
@@ -178,25 +311,48 @@ impl Drop for Desktop {
 
 impl Desktop {
     fn apply(&mut self, event: &InputEvent) -> anyhow::Result<()> {
+        tracing::trace!(
+            target: "nebula_agent::input_trace",
+            kind = ?event.kind,
+            x = event.x,
+            y = event.y,
+            hid = event.key.0,
+            button = ?event.button,
+            modifiers = event.modifiers.0,
+            "applying input"
+        );
         match event.kind {
             InputKind::MouseMove | InputKind::MouseDrag => {
                 let point = self.point(event.x, event.y);
                 self.last = point;
-                let (kind, button) = match (event.kind, cg_button(event.button)) {
-                    (InputKind::MouseDrag, Some(CGMouseButton::Left)) => {
+                self.clicks.moved(point);
+                // Also tolerate older clients that label a held-button move MouseMove.
+                let dragging = self.held.first().copied().unwrap_or(MouseButton::None);
+                let (kind, button) = match cg_button(dragging) {
+                    Some(CGMouseButton::Left) => {
                         (CGEventType::LeftMouseDragged, CGMouseButton::Left)
                     }
-                    (InputKind::MouseDrag, Some(CGMouseButton::Right)) => {
+                    Some(CGMouseButton::Right) => {
                         (CGEventType::RightMouseDragged, CGMouseButton::Right)
                     }
-                    (InputKind::MouseDrag, Some(CGMouseButton::Center)) => {
+                    Some(CGMouseButton::Center) => {
                         (CGEventType::OtherMouseDragged, CGMouseButton::Center)
                     }
                     _ => (CGEventType::MouseMoved, CGMouseButton::Left),
                 };
                 let cg = CGEvent::new_mouse_event(self.source.clone(), kind, point, button)
                     .map_err(|()| anyhow::anyhow!("could not build a mouse event"))?;
+                set_button_number(&cg, dragging);
                 apply_modifiers(&cg, event.modifiers);
+                tracing::trace!(
+                    target: "nebula_agent::input_trace",
+                    x = point.x,
+                    y = point.y,
+                    cg_kind = kind as u32,
+                    button = ?dragging,
+                    bounds = ?self.bounds,
+                    "posting native pointer movement (display points)"
+                );
                 cg.post(CGEventTapLocation::HID);
             }
 
@@ -207,29 +363,35 @@ impl Desktop {
                 let point = self.point(event.x, event.y);
                 self.last = point;
                 let down = event.kind == InputKind::MouseDown;
-                let kind = match (button, down) {
-                    (CGMouseButton::Left, true) => CGEventType::LeftMouseDown,
-                    (CGMouseButton::Left, false) => CGEventType::LeftMouseUp,
-                    (CGMouseButton::Right, true) => CGEventType::RightMouseDown,
-                    (CGMouseButton::Right, false) => CGEventType::RightMouseUp,
-                    (CGMouseButton::Center, true) => CGEventType::OtherMouseDown,
-                    (CGMouseButton::Center, false) => CGEventType::OtherMouseUp,
-                };
+                let kind = mouse_kind(event.button, down);
                 let cg = CGEvent::new_mouse_event(self.source.clone(), kind, point, button)
                     .map_err(|()| anyhow::anyhow!("could not build a mouse event"))?;
+                set_button_number(&cg, event.button);
                 apply_modifiers(&cg, event.modifiers);
 
                 // Click state is what turns two clicks into a double click.
                 // Without it no application will ever see one.
-                cg.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, 1);
+                cg.set_integer_value_field(
+                    EventField::MOUSE_EVENT_CLICK_STATE,
+                    self.clicks
+                        .update(event.button, down, point, self.clock.elapsed()),
+                );
+                tracing::trace!(
+                    target: "nebula_agent::input_trace",
+                    x = point.x,
+                    y = point.y,
+                    cg_kind = kind as u32,
+                    button = ?event.button,
+                    "posting native pointer button (display points)"
+                );
                 cg.post(CGEventTapLocation::HID);
 
                 if down {
-                    if !self.held.iter().any(|b| *b as u32 == button as u32) {
-                        self.held.push(button);
+                    if !self.held.contains(&event.button) {
+                        self.held.push(event.button);
                     }
                 } else {
-                    self.held.retain(|b| *b as u32 != button as u32);
+                    self.held.retain(|button| *button != event.button);
                 }
             }
 
@@ -237,11 +399,11 @@ impl Desktop {
                 // Line units, not pixels: the wire carries lines, and macOS
                 // applies its own acceleration and direction preferences to
                 // line-based scrolls exactly as it would for a real wheel.
-                post_scroll(
-                    event.scroll_y.round() as i32,
-                    event.scroll_x.round() as i32,
-                    event.modifiers,
-                );
+                let horizontal = wheel_lines(&mut self.wheel[0], event.scroll_x);
+                let vertical = wheel_lines(&mut self.wheel[1], event.scroll_y);
+                if vertical != 0 || horizontal != 0 {
+                    post_scroll(vertical, horizontal, event.modifiers);
+                }
             }
 
             InputKind::KeyDown | InputKind::KeyUp => {
@@ -252,14 +414,67 @@ impl Desktop {
                 let down = event.kind == InputKind::KeyDown;
                 let cg = CGEvent::new_keyboard_event(self.source.clone(), code, down)
                     .map_err(|()| anyhow::anyhow!("could not build a key event"))?;
-                apply_modifiers(&cg, event.modifiers);
+                let repeat = self.keys.update(code, down);
+                let modifiers = self.keys.modifiers(code, event.modifiers);
+                apply_modifiers(&cg, modifiers);
+                cg.set_integer_value_field(
+                    EventField::KEYBOARD_EVENT_AUTOREPEAT,
+                    i64::from(down && (repeat || event.modifiers.contains(Modifiers::REPEAT))),
+                );
+                tracing::trace!(
+                    target: "nebula_agent::input_trace",
+                    hid = event.key.0,
+                    virtual_key = code,
+                    down,
+                    repeat,
+                    flags = cg_flags(modifiers).bits(),
+                    "posting native physical key"
+                );
                 cg.post(CGEventTapLocation::HID);
             }
 
-            InputKind::PointerLeave => self.release_all(),
+            InputKind::PointerLeave => self.release_buttons(event.modifiers),
         }
         Ok(())
     }
+}
+
+fn wheel_lines(remainder: &mut f64, delta: f32) -> i32 {
+    if !delta.is_finite() {
+        return 0;
+    }
+    *remainder += f64::from(delta);
+    let lines = remainder
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX))
+        .trunc() as i32;
+    *remainder -= f64::from(lines);
+    lines
+}
+
+fn double_click_interval() -> Duration {
+    // This IOKit query reads the user's setting without requiring an AppKit
+    // application or invoking UI on the injection worker.
+    let seconds = unsafe {
+        let handle = NXOpenEventStatus();
+        if handle == 0 {
+            return Duration::from_millis(500);
+        }
+        let seconds = NXClickTime(handle);
+        NXCloseEventStatus(handle);
+        seconds
+    };
+    if seconds.is_finite() && (0.0..=10.0).contains(&seconds) && seconds > 0.0 {
+        Duration::from_secs_f64(seconds)
+    } else {
+        Duration::from_millis(500)
+    }
+}
+
+#[link(name = "IOKit", kind = "framework")]
+extern "C" {
+    fn NXOpenEventStatus() -> u32;
+    fn NXClickTime(handle: u32) -> f64;
+    fn NXCloseEventStatus(handle: u32);
 }
 
 /// Post a scroll event.
@@ -358,11 +573,38 @@ fn cg_button(button: MouseButton) -> Option<CGMouseButton> {
     match button {
         MouseButton::Left => Some(CGMouseButton::Left),
         MouseButton::Right => Some(CGMouseButton::Right),
-        MouseButton::Middle => Some(CGMouseButton::Center),
-        // Back and forward have no CoreGraphics constant; posting them would
-        // mean an other-button event carrying a button number, which this API
-        // does not expose. Dropping beats sending the wrong button.
-        MouseButton::Back | MouseButton::Forward | MouseButton::None => None,
+        MouseButton::Middle | MouseButton::Back | MouseButton::Forward => {
+            Some(CGMouseButton::Center)
+        }
+        MouseButton::None => None,
+    }
+}
+
+fn button_number(button: MouseButton) -> Option<i64> {
+    match button {
+        MouseButton::Left => Some(0),
+        MouseButton::Right => Some(1),
+        MouseButton::Middle => Some(2),
+        MouseButton::Back => Some(3),
+        MouseButton::Forward => Some(4),
+        MouseButton::None => None,
+    }
+}
+
+fn set_button_number(event: &CGEvent, button: MouseButton) {
+    if let Some(number) = button_number(button) {
+        event.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, number);
+    }
+}
+
+fn mouse_kind(button: MouseButton, down: bool) -> CGEventType {
+    match (button, down) {
+        (MouseButton::Left, true) => CGEventType::LeftMouseDown,
+        (MouseButton::Left, false) => CGEventType::LeftMouseUp,
+        (MouseButton::Right, true) => CGEventType::RightMouseDown,
+        (MouseButton::Right, false) => CGEventType::RightMouseUp,
+        (_, true) => CGEventType::OtherMouseDown,
+        (_, false) => CGEventType::OtherMouseUp,
     }
 }
 
@@ -445,6 +687,14 @@ fn virtual_key(key: KeyCode) -> Option<u16> {
         0x43 => 0x6D,
         0x44 => 0x67,
         0x45 => 0x6F,
+        0x68 => 0x69, // F13
+        0x69 => 0x6B, // F14
+        0x6A => 0x71, // F15
+        0x6B => 0x6A, // F16
+        0x6C => 0x40, // F17
+        0x6D => 0x4F, // F18
+        0x6E => 0x50, // F19
+        0x6F => 0x5A, // F20
 
         0x49 => 0x72, // Insert / Help
         0x4A => 0x73, // Home
@@ -494,6 +744,105 @@ fn virtual_key(key: KeyCode) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn click_counts_match_down_and_up_and_expire() {
+        let mut clicks = Clicks::new(Duration::from_millis(500));
+        let point = CGPoint::new(100.0, 200.0);
+        for (time, count) in [(0, 1), (200, 2), (400, 3), (1000, 1)] {
+            assert_eq!(
+                clicks.update(MouseButton::Left, true, point, Duration::from_millis(time)),
+                count
+            );
+            assert_eq!(
+                clicks.update(
+                    MouseButton::Left,
+                    false,
+                    point,
+                    Duration::from_millis(time + 50)
+                ),
+                count
+            );
+        }
+    }
+
+    #[test]
+    fn clicks_require_same_button_nearby_completed_press_and_monotonic_time() {
+        let mut clicks = Clicks::new(Duration::from_millis(500));
+        let at = CGPoint::new(10.0, 10.0);
+        let now = Duration::from_millis(100);
+        assert_eq!(clicks.update(MouseButton::Left, true, at, now), 1);
+        assert_eq!(clicks.update(MouseButton::Left, true, at, now), 1);
+        assert_eq!(clicks.update(MouseButton::Left, false, at, now), 1);
+        assert_eq!(clicks.update(MouseButton::Right, true, at, now), 1);
+        assert_eq!(clicks.update(MouseButton::Right, false, at, now), 1);
+        assert_eq!(clicks.update(MouseButton::Left, true, at, now), 1);
+        assert_eq!(clicks.update(MouseButton::Left, false, at, now), 1);
+        assert_eq!(
+            clicks.update(MouseButton::Left, true, at, Duration::ZERO),
+            1
+        );
+        clicks.update(MouseButton::Left, false, at, Duration::ZERO);
+        clicks.moved(CGPoint::new(20.0, 10.0));
+        clicks.moved(at);
+        assert_eq!(clicks.update(MouseButton::Left, true, at, now), 1);
+    }
+
+    #[test]
+    fn repeat_and_disconnect_tracking_do_not_duplicate_key_releases() {
+        let mut keys = HeldKeys::default();
+        assert!(!keys.update(0x37, true));
+        assert!(!keys.update(0x00, true));
+        assert!(keys.update(0x00, true));
+        assert_eq!(keys.release_all(), vec![0x37, 0x00]);
+        assert!(keys.release_all().is_empty());
+        assert!(!keys.update(0x00, true));
+        assert!(!keys.update(0x00, false));
+        assert!(keys.release_all().is_empty());
+    }
+
+    #[test]
+    fn physical_modifier_transitions_override_stale_snapshots() {
+        let mut keys = HeldKeys::default();
+        keys.update(0x37, true);
+        assert_eq!(keys.modifiers(0x37, Modifiers::NONE), Modifiers::META);
+        keys.update(0x36, true);
+        keys.update(0x37, false);
+        assert_eq!(keys.modifiers(0x37, Modifiers::NONE), Modifiers::META);
+        keys.update(0x36, false);
+        assert_eq!(keys.modifiers(0x36, Modifiers::META), Modifiers::NONE);
+    }
+
+    #[test]
+    fn fractional_trackpad_deltas_accumulate_instead_of_disappearing() {
+        let mut remainder = 0.0;
+        assert_eq!(wheel_lines(&mut remainder, 0.25), 0);
+        assert_eq!(wheel_lines(&mut remainder, 0.25), 0);
+        assert_eq!(wheel_lines(&mut remainder, 0.5), 1);
+        assert_eq!(wheel_lines(&mut remainder, -0.5), 0);
+        assert_eq!(wheel_lines(&mut remainder, -0.5), -1);
+        assert_eq!(wheel_lines(&mut remainder, f32::NAN), 0);
+        assert_eq!(remainder, 0.0);
+    }
+
+    #[test]
+    fn extra_buttons_keep_distinct_native_numbers_and_click_counts() {
+        let mut clicks = Clicks::new(Duration::from_millis(500));
+        let at = CGPoint::new(1.0, 1.0);
+        for (button, number) in [
+            (MouseButton::Middle, 2),
+            (MouseButton::Back, 3),
+            (MouseButton::Forward, 4),
+        ] {
+            assert_eq!(button_number(button), Some(number));
+            assert!(matches!(
+                mouse_kind(button, true),
+                CGEventType::OtherMouseDown
+            ));
+            assert_eq!(clicks.update(button, true, at, Duration::ZERO), 1);
+            assert_eq!(clicks.update(button, false, at, Duration::ZERO), 1);
+        }
+    }
 
     #[test]
     fn the_key_table_never_maps_two_usages_to_one_key() {

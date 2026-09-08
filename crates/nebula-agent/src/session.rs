@@ -290,12 +290,14 @@ async fn pump_media(
     let mut audio = None;
     let mut packets = None;
 
-    // The clipboard runs on its own thread and only when the entitlement
-    // allows it, so a session without the permission never opens the
-    // machine's clipboard at all.
-    let mut clipboard = if request.policy.clipboard {
+    // File-copy gestures use the same native watcher, with independent policy.
+    let mut clipboard = if request.policy.clipboard || request.policy.file_transfer {
         match platform.clipboard() {
-            Ok(board) => Some(clipboard::spawn(board, true)),
+            Ok(board) => Some(clipboard::spawn_with_files(
+                board,
+                request.policy.clipboard,
+                request.policy.file_transfer,
+            )),
             Err(error) => {
                 tracing::warn!(%error, "no clipboard on this machine; the session will not share one");
                 None
@@ -451,6 +453,16 @@ async fn pump_media(
                     clipboard = None;
                     continue;
                 };
+                if let clipboard::Action::Files(paths) = action {
+                    if let Some(worker) = transfers.as_ref() {
+                        for path in paths {
+                            worker.deliver(files::Inbound::Send(path));
+                        }
+                    } else {
+                        tracing::warn!("copied files cannot be sent: file transfer is unavailable");
+                    }
+                    continue;
+                }
                 if !send_clipboard(&session, &action, &mut seq).await {
                     break;
                 }
@@ -685,13 +697,35 @@ async fn send_clipboard(session: &Session, action: &clipboard::Action, seq: &mut
             serde_json::to_vec(request).unwrap_or_default(),
         ),
         clipboard::Action::Data(header, bytes) => (MsgKind::ClipboardData, header.payload(bytes)),
+        clipboard::Action::Files(_) => {
+            tracing::error!("local file-copy action incorrectly routed to clipboard wire sender");
+            return false;
+        }
     };
     let header = MsgHeader::new(kind, *seq, 0);
     *seq = seq.wrapping_add(1);
-    session
+    let sent = session
         .send(Channel::Clipboard, header, &payload)
         .await
-        .is_ok()
+        .is_ok();
+    if sent {
+        match action {
+            clipboard::Action::Offer(offer) => tracing::debug!(
+                offer_id = offer.offer_id,
+                format = ?offer.formats,
+                bytes = offer.size_hint,
+                "clipboard offer sent on Nebula channel"
+            ),
+            clipboard::Action::Data(header, bytes) => tracing::debug!(
+                offer_id = header.offer_id,
+                format = ?header.format,
+                bytes = bytes.len(),
+                "clipboard data sent on Nebula channel"
+            ),
+            _ => {}
+        }
+    }
+    sent
 }
 
 /// Parse one clipboard message from the peer.

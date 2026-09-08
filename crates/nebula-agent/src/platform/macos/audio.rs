@@ -1,9 +1,9 @@
 //! System audio capture and Opus encoding on macOS.
 //!
-//! ScreenCaptureKit is the only supported way to tap the system mixer since
-//! macOS 13: there is no public device to open, and the kernel extensions
-//! people used to install for this stopped loading. So audio comes from the
-//! same framework as the picture, on its own stream.
+//! This backend uses ScreenCaptureKit (macOS 13+) on its own stream.
+//! Core Audio also exposes public process taps on macOS 14.2+, but they are
+//! not an automatic fallback: a tap starting successfully does not establish
+//! that it delivers audio, particularly when the system output itself fails.
 //!
 //! # Why a second stream
 //!
@@ -107,20 +107,22 @@ impl AudioSource for MacAudio {
         let (buffers, incoming) = mpsc::sync_channel::<Vec<f32>>(QUEUE_DEPTH);
         let channels = config.channels;
         let mut stream = SCStream::new(&filter, &stream_config);
-        stream.add_output_handler(
-            move |sample: CMSampleBuffer, kind: SCStreamOutputType| {
-                if kind != SCStreamOutputType::Audio {
-                    return;
-                }
-                if let Some(pcm) = interleave(&sample, channels) {
-                    // A full queue means the encoder is behind. Discarding
-                    // the newest buffer keeps the delay bounded; queueing it
-                    // would only move the same gap later and add latency.
-                    let _ = buffers.try_send(pcm);
-                }
-            },
-            SCStreamOutputType::Audio,
-        );
+        stream
+            .add_output_handler(
+                move |sample: CMSampleBuffer, kind: SCStreamOutputType| {
+                    if kind != SCStreamOutputType::Audio {
+                        return;
+                    }
+                    if let Some(pcm) = interleave(&sample, channels) {
+                        // A full queue means the encoder is behind. Discarding
+                        // the newest buffer keeps the delay bounded; queueing it
+                        // would only move the same gap later and add latency.
+                        let _ = buffers.try_send(pcm);
+                    }
+                },
+                SCStreamOutputType::Audio,
+            )
+            .ok_or_else(|| anyhow::anyhow!("ScreenCaptureKit refused the audio output handler"))?;
 
         let running = Arc::clone(&self.running);
         running.store(true, Ordering::Relaxed);

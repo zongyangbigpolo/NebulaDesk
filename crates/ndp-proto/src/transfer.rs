@@ -209,7 +209,8 @@ impl FileChunkHeader {
 pub struct FileAck {
     /// Which transfer is being acknowledged.
     pub transfer_id: u64,
-    /// Bytes contiguously received so far.
+    /// Bytes contiguously received so far, or `u64::MAX` to reject/cancel
+    /// the transfer. A cancellation still carries a valid nonzero window.
     pub received: u64,
     /// Additional bytes the receiver is willing to accept.
     pub window: u32,

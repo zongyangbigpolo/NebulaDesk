@@ -221,9 +221,57 @@ first frame, or a capture pipeline that closes early, is reported as an error.
 Working end to end: the control plane, the relay, the gateway, an agent that
 captures and encodes a real screen in hardware, plays out system audio and
 injects input, and the client that signs a user in, connects, decodes, draws
-and plays. The clipboard synchronises both ways, and a file dropped onto the
-client window lands on the remote machine. Every one of those paths has a test
-that drives it through a real gateway, a real relay and a real handshake.
+and plays. Clipboard text/images and client-window file drops have protocol
+and session integration coverage through the gateway, relay and handshake.
+Two-Mac desktop runs have also exercised native text/PNG pasteboards in both
+directions, with endpoint logs confirming Nebula clipboard messages, and
+six-file batches in each direction (including empty and 5 MiB files) verified
+by content hashes. Copying a file again preserves the earlier arrival.
+
+### Clipboard and files on macOS
+
+With a connected session, copy text or an image on either Mac to synchronize
+it when the `clipboard` policy permits. Both native PNG-only and TIFF image
+representations are supported. Content already copied before connection is
+not sent.
+
+To send files **in either direction**, select regular files in Finder on the
+source Mac and choose **Copy** (Command-C) after connection. Native
+`public.file-url` items feed the file-transfer worker; this uses the independent
+`file_transfer` policy and also works when text/image clipboard sync is disabled.
+A copied filename is not downgraded to clipboard text when file transfer is
+disabled. Client-window file drops remain available for client-to-agent sends.
+
+Files arrive automatically in `~/Downloads/NebulaDesk` on the receiving machine,
+or its `NEBULA_DOWNLOADS` override; there is no remote Finder Paste step. File
+arrivals do not replace the receiving clipboard or trigger a return transfer.
+Copying the same file again starts another transfer and keeps existing arrivals
+under numbered names. Directories, symlinks and nonlocal file URLs are refused;
+there is no directory traversal or remote path-read command. Empty files and
+multi-file copies are supported, with four active sends, a bounded pending queue,
+an 8 GiB per-file limit and BLAKE3 verification before finalization.
+Read/write, format, hash and queue failures are reported in the endpoint logs.
+On macOS, finalization uses an atomic no-replace rename, including for
+case-equivalent names. Other platforms currently require hard-link support in
+the download filesystem. Transfers stalled for 120 seconds release their slots.
+
+### macOS input and audio
+
+Desktop runs have exercised physical typing, Command-A selection, clicks,
+double/triple clicks, right clicks, dragging and scrolling through the graphical
+client. Held input is released on client focus loss or disconnect. Keys use the
+remote keyboard layout; client-side IME composition/commit forwarding is not
+implemented.
+
+System audio has been verified from a generated tone on the remote Mac through
+ScreenCaptureKit, Opus and the live session to the client's native audio output,
+with a silent baseline. This is not a measurement of physical speaker audibility.
+An earlier host-level audio startup failure also affected standalone native
+playback; it stopped reproducing without an audio-service reset. If it recurs,
+`cargo run -p nebula-agent --example audio_probe` provides a bounded
+capture/Opus diagnostic with a generated tone, rather than treating silent
+callbacks as successful capture. Run it from the authorized desktop application
+(for example Terminal); SSH and GUI launches can have different macOS permissions.
 
 The macOS path has been exercised between two Apple Silicon machines through
 a remote gateway and relay, including user-confirmed keyboard and mouse

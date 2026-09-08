@@ -79,6 +79,7 @@ pub fn run(ticket: SessionTicket, resource_name: &str) -> anyhow::Result<()> {
         modifiers: ndp_proto::Modifiers::NONE,
         viewport: Viewport::fit((1.0, 1.0), (1, 1)),
         pointer: None,
+        held: input::HeldInput::default(),
         status: "Connecting",
     };
     event_loop.run_app(&mut app)?;
@@ -101,6 +102,7 @@ struct App {
     modifiers: ndp_proto::Modifiers,
     viewport: Viewport,
     pointer: Option<(f32, f32)>,
+    held: input::HeldInput,
     status: &'static str,
 }
 
@@ -108,7 +110,36 @@ impl App {
     /// Send one event, ignoring a closed session: the window will be told
     /// about that separately and there is nothing useful to do here.
     fn send(&self, event: InputEvent) {
+        tracing::trace!(
+            target: "nebula_client::input_trace",
+            kind = ?event.kind,
+            x = event.x,
+            y = event.y,
+            hid = event.key.0,
+            button = ?event.button,
+            modifiers = event.modifiers.0,
+            "forwarding input"
+        );
         let _ = self.input.send(event);
+    }
+
+    fn release_input(&mut self) {
+        for event in self.held.release_all() {
+            self.send(event);
+        }
+        self.modifiers = ndp_proto::Modifiers::NONE;
+        self.pointer = None;
+    }
+
+    fn leave_pointer(&mut self) {
+        for event in self.held.release_buttons(self.modifiers) {
+            self.send(event);
+        }
+        if self.pointer.take().is_some() {
+            let mut event = InputEvent::mouse_move(0.0, 0.0, self.modifiers);
+            event.kind = InputKind::PointerLeave;
+            self.send(event);
+        }
     }
 
     /// Recompute where the picture sits after a resize or a new resolution.
@@ -167,7 +198,10 @@ impl ApplicationHandler<SessionEvent> for App {
                     ndp_transport::PathKind::Direct => "Direct",
                 };
             }
-            SessionEvent::Ended => self.status = "Disconnected",
+            SessionEvent::Ended => {
+                self.release_input();
+                self.status = "Disconnected";
+            }
         }
         if let Some(window) = &self.window {
             window.set_title(format!("{} [{}]", self.title, self.status).as_str());
@@ -176,7 +210,12 @@ impl ApplicationHandler<SessionEvent> for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.release_input();
+                event_loop.exit();
+            }
+
+            WindowEvent::Focused(false) => self.release_input(),
 
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = &mut self.renderer {
@@ -209,56 +248,67 @@ impl ApplicationHandler<SessionEvent> for App {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
+                tracing::trace!(
+                    target: "nebula_client::input_trace",
+                    x = position.x,
+                    y = position.y,
+                    viewport_x = self.viewport.x,
+                    viewport_y = self.viewport.y,
+                    viewport_width = self.viewport.width,
+                    viewport_height = self.viewport.height,
+                    "local cursor moved (physical pixels)"
+                );
                 match self.viewport.normalise(position.x, position.y) {
                     Some(at) => {
                         self.pointer = Some(at);
-                        self.send(InputEvent::mouse_move(at.0, at.1, self.modifiers));
+                        let event = self.held.movement(at, self.modifiers);
+                        self.send(event);
                     }
                     None => {
                         // The pointer moved into the letterbox bars. Tell the
                         // agent it left rather than pinning it to an edge.
-                        if self.pointer.take().is_some() {
-                            let mut event = InputEvent::mouse_move(0.0, 0.0, self.modifiers);
-                            event.kind = InputKind::PointerLeave;
-                            self.send(event);
-                        }
+                        self.leave_pointer();
                     }
                 }
             }
 
-            WindowEvent::CursorLeft { .. } => {
-                if self.pointer.take().is_some() {
-                    let mut event = InputEvent::mouse_move(0.0, 0.0, self.modifiers);
-                    event.kind = InputKind::PointerLeave;
-                    self.send(event);
-                }
-            }
+            WindowEvent::CursorLeft { .. } => self.leave_pointer(),
 
             WindowEvent::MouseInput { state, button, .. } => {
                 // A click with no known position would land wherever the
                 // agent's pointer happens to be, which is worse than nothing.
-                let (Some(at), Some(button)) = (self.pointer, input::button(button)) else {
+                let Some(button) = input::button(button) else {
                     return;
                 };
-                let mut event = InputEvent::mouse_move(at.0, at.1, self.modifiers);
-                event.kind = match state {
-                    ElementState::Pressed => InputKind::MouseDown,
-                    ElementState::Released => InputKind::MouseUp,
-                };
-                event.button = button;
-                self.send(event);
+                if let Some(event) = self
+                    .held
+                    .button(button, state, self.pointer, self.modifiers)
+                {
+                    self.send(event);
+                }
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                let at = self.pointer.unwrap_or((0.5, 0.5));
-                self.send(input::scroll(delta, at, self.modifiers));
+                if let Some(at) = self.pointer {
+                    self.send(input::scroll(delta, at, self.modifiers));
+                }
             }
 
-            WindowEvent::KeyboardInput { event, .. } => {
-                // Auto-repeat is generated locally by the client's OS. The
-                // agent's OS will generate its own from the held key, so
-                // forwarding these would double the repeat rate.
-                if event.repeat {
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic,
+                ..
+            } => {
+                tracing::trace!(
+                    target: "nebula_client::input_trace",
+                    physical_key = ?event.physical_key,
+                    state = ?event.state,
+                    repeat = event.repeat,
+                    is_synthetic,
+                    "local physical key transition"
+                );
+                // Do not restore keys that were already down when focus returned.
+                if is_synthetic && event.state == ElementState::Pressed {
                     return;
                 }
                 if let Some(translated) = input::key(
@@ -267,7 +317,9 @@ impl ApplicationHandler<SessionEvent> for App {
                     event.text.as_deref(),
                     self.modifiers,
                 ) {
-                    self.send(translated);
+                    if let Some(translated) = self.held.keyboard(translated, event.repeat) {
+                        self.send(translated);
+                    }
                 }
             }
 
@@ -327,9 +379,13 @@ async fn pump(
 
     // The same engine the agent runs, mirrored. Both sides watch and both
     // sides write; what stops that being a loop is in the engine itself.
-    let mut clipboard = if ticket.policy.clipboard {
+    let mut clipboard = if ticket.policy.clipboard || ticket.policy.file_transfer {
         match nebula_agent::clipboard::SystemClipboard::open() {
-            Ok(board) => Some(nebula_agent::clipboard::spawn(board, true)),
+            Ok(board) => Some(nebula_agent::clipboard::spawn_with_files(
+                board,
+                ticket.policy.clipboard,
+                ticket.policy.file_transfer,
+            )),
             Err(error) => {
                 tracing::warn!(%error, "no clipboard on this machine; nothing will be shared");
                 None
@@ -481,6 +537,16 @@ async fn pump(
                     clipboard = None;
                     continue;
                 };
+                if let nebula_agent::clipboard::Action::Files(paths) = action {
+                    if let Some(worker) = transfers.as_ref() {
+                        for path in paths {
+                            worker.deliver(nebula_agent::files::Inbound::Send(path));
+                        }
+                    } else {
+                        tracing::warn!("copied files cannot be sent: file transfer is unavailable");
+                    }
+                    continue;
+                }
                 if !send_clipboard(&session, &action, &mut seq).await {
                     break;
                 }
@@ -672,13 +738,35 @@ async fn send_clipboard(
             serde_json::to_vec(request).unwrap_or_default(),
         ),
         Action::Data(header, bytes) => (MsgKind::ClipboardData, header.payload(bytes)),
+        Action::Files(_) => {
+            tracing::error!("local file-copy action incorrectly routed to clipboard wire sender");
+            return false;
+        }
     };
     let header = MsgHeader::new(kind, *seq, 0);
     *seq = seq.wrapping_add(1);
-    session
+    let sent = session
         .send(Channel::Clipboard, header, &payload)
         .await
-        .is_ok()
+        .is_ok();
+    if sent {
+        match action {
+            Action::Offer(offer) => tracing::debug!(
+                offer_id = offer.offer_id,
+                format = ?offer.formats,
+                bytes = offer.size_hint,
+                "clipboard offer sent on Nebula channel"
+            ),
+            Action::Data(header, bytes) => tracing::debug!(
+                offer_id = header.offer_id,
+                format = ?header.format,
+                bytes = bytes.len(),
+                "clipboard data sent on Nebula channel"
+            ),
+            _ => {}
+        }
+    }
+    sent
 }
 
 /// Put one file transfer action on the wire.
