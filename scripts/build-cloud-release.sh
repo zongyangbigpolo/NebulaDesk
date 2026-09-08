@@ -39,5 +39,5 @@ done
   cd "$STAGE"
   shasum -a 256 bin/nebula-manager bin/nebula-gateway bin/nebula-relay build-info.txt > SHA256SUMS
 )
-COPYFILE_DISABLE=1 tar -czf "$ARCHIVE" -C "$STAGE" bin build-info.txt SHA256SUMS
+COPYFILE_DISABLE=1 tar --no-xattrs -czf "$ARCHIVE" -C "$STAGE" bin build-info.txt SHA256SUMS
 printf 'Linux release: %s\n' "$ARCHIVE"
