@@ -188,6 +188,19 @@ impl<C: ClipboardAccess> ClipboardSync<C> {
         }
     }
 
+    /// Change text/image sync without changing permission to copy files.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        if self.enabled == enabled {
+            return;
+        }
+        self.enabled = enabled;
+        self.outgoing = None;
+        self.known = None;
+        if enabled {
+            self.prime();
+        }
+    }
+
     /// Look for a local change worth announcing.
     pub fn poll(&mut self) -> Option<Action> {
         if !self.enabled && !self.files_enabled {
@@ -660,9 +673,16 @@ pub enum Inbound {
 
 /// A running clipboard sync, on its own thread.
 pub struct Worker {
-    inbound: std::sync::mpsc::Sender<Inbound>,
+    inbound: std::sync::mpsc::Sender<(u64, Inbound)>,
+    settings: std::sync::Arc<std::sync::Mutex<Settings>>,
+    actions: tokio::sync::mpsc::WeakSender<Action>,
     /// What to send to the peer.
     pub outbound: tokio::sync::mpsc::Receiver<Action>,
+}
+
+struct Settings {
+    enabled: bool,
+    revision: u64,
 }
 
 impl Worker {
@@ -671,7 +691,33 @@ impl Worker {
     /// Dropping on a closed channel rather than failing: a dead clipboard
     /// thread is a session without clipboard sync, not a session over.
     pub fn deliver(&self, message: Inbound) {
-        let _ = self.inbound.send(message);
+        let settings = self.settings.lock().unwrap();
+        if settings.enabled {
+            let _ = self.inbound.send((settings.revision, message));
+        }
+    }
+
+    /// Atomically discard queued text/image sync. File-copy gestures are retained.
+    /// The caller supplies the effective setting, including any session policy.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        let mut settings = self.settings.lock().unwrap();
+        if settings.enabled == enabled {
+            return;
+        }
+        settings.enabled = enabled;
+        settings.revision += 1;
+        let mut files = Vec::new();
+        while let Ok(action) = self.outbound.try_recv() {
+            if matches!(action, Action::Files(_)) {
+                files.push(action);
+            }
+        }
+        if let Some(actions) = self.actions.upgrade() {
+            for action in files {
+                // The producer uses the same lock, so the drained slots remain free.
+                let _ = actions.try_send(action);
+            }
+        }
     }
 }
 
@@ -691,10 +737,17 @@ pub fn spawn_with_files<C: ClipboardAccess + 'static>(
     enabled: bool,
     files_enabled: bool,
 ) -> Worker {
-    let (inbound, requests) = std::sync::mpsc::channel::<Inbound>();
+    let (inbound, requests) = std::sync::mpsc::channel::<(u64, Inbound)>();
     // Bounded: clipboard traffic is human-paced, so a backlog means the
     // session is gone rather than that the peer is slow.
     let (actions, outbound) = tokio::sync::mpsc::channel::<Action>(8);
+    let settings = std::sync::Arc::new(std::sync::Mutex::new(Settings {
+        enabled,
+        revision: 0,
+    }));
+    let worker_settings = settings.clone();
+    let worker_actions = actions;
+    let actions = worker_actions.downgrade();
 
     std::thread::Builder::new()
         .name("nebula-clipboard".into())
@@ -703,36 +756,109 @@ pub fn spawn_with_files<C: ClipboardAccess + 'static>(
             // Whatever was already copied is not news; announcing it would
             // overwrite the other side's clipboard on connect.
             sync.prime();
+            let mut revision = 0;
+            let mut pending = None;
+            let mut requested: Option<ClipboardRequest> = None;
 
             loop {
-                let action = match requests.recv_timeout(POLL) {
-                    Ok(Inbound::Offer(offer)) => sync.on_offer(&offer),
-                    Ok(Inbound::Request(request)) => sync.on_request(&request),
-                    Ok(Inbound::Data(header, bytes)) => {
+                let message = requests.recv_timeout(POLL);
+                let settings = worker_settings.lock().unwrap();
+                if revision != settings.revision {
+                    // A disable/enable pair must invalidate old offers even if
+                    // both changes happened between two worker iterations.
+                    sync.set_enabled(false);
+                    sync.set_enabled(settings.enabled);
+                    requested = None;
+                    if !matches!(pending, Some(Action::Files(_))) {
+                        pending = None;
+                    }
+                    revision = settings.revision;
+                }
+                if let Some(action) = pending.take() {
+                    match worker_actions.try_send(action) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(action)) => {
+                            pending = Some(action)
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                    }
+                }
+                let action = match message {
+                    Ok((incoming_revision, _))
+                        if incoming_revision != revision || !settings.enabled =>
+                    {
+                        None
+                    }
+                    Ok((_, Inbound::Offer(offer))) => sync.on_offer(&offer),
+                    Ok((_, Inbound::Request(request))) => sync.on_request(&request),
+                    Ok((_, Inbound::Data(header, bytes))) => {
+                        if !requested.as_ref().is_some_and(|request| {
+                            request.offer_id == header.offer_id && request.format == header.format
+                        }) {
+                            continue;
+                        }
+                        requested = None;
                         if let Err(error) = sync.on_data(header, &bytes) {
                             tracing::warn!(%error, "clipboard contents could not be applied");
                         }
                         None
                     }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => sync.poll(),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) if pending.is_none() => {
+                        sync.poll()
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
                 };
 
                 if let Some(action) = action {
-                    if actions.blocking_send(action).is_err() {
-                        return;
+                    if let Action::Request(request) = &action {
+                        requested = Some(*request);
+                    }
+                    // Never block with the settings lock held: disabling must
+                    // work even when the network stopped draining the channel.
+                    match worker_actions.try_send(action) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(action)) => {
+                            if !matches!(pending, Some(Action::Files(_))) {
+                                pending = Some(action);
+                            }
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
                     }
                 }
             }
         })
         .expect("spawning a thread should not fail");
 
-    Worker { inbound, outbound }
+    Worker {
+        inbound,
+        outbound,
+        settings,
+        actions,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn worker_shutdown_closes_outbound_even_while_settings_handle_exists() {
+        let Worker {
+            inbound,
+            mut outbound,
+            actions,
+            ..
+        } = spawn(MemoryClipboard::default(), true);
+        drop(inbound);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), outbound.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(actions.upgrade().is_none());
+    }
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
@@ -780,6 +906,167 @@ mod tests {
             self.copy(Some(contents.clone()), None);
             Ok(())
         }
+    }
+
+    #[test]
+    fn disabling_clears_clipboard_sync_but_keeps_file_copy_gestures() {
+        let board = NativeFake::default();
+        let mut sync = ClipboardSync::with_file_transfer(board.clone(), true, true);
+        sync.prime();
+        board.copy(Some(Contents::text("offered before disable")), None);
+        let Some(Action::Offer(offer)) = sync.poll() else {
+            panic!()
+        };
+        let request = ClipboardRequest {
+            offer_id: offer.offer_id,
+            format: ClipboardFormat::Text,
+        };
+        sync.set_enabled(false);
+        assert!(sync.outgoing.is_none());
+        assert_eq!(sync.on_request(&request), None);
+        assert_eq!(sync.on_offer(&offer), None);
+        assert!(sync
+            .on_data(
+                ClipboardDataHeader {
+                    offer_id: offer.offer_id,
+                    format: ClipboardFormat::Text,
+                },
+                b"remote content"
+            )
+            .is_err());
+        assert_eq!(
+            board.0.lock().unwrap().contents,
+            Some(Contents::text("offered before disable"))
+        );
+        board.copy(Some(Contents::text("private copy while disabled")), None);
+        assert_eq!(sync.poll(), None);
+        let files = vec![PathBuf::from("/local/explicitly-copied.txt")];
+        board.copy(None, Some(files.clone()));
+        assert_eq!(sync.poll(), Some(Action::Files(files)));
+        board.copy(Some(Contents::text("private contents on reenable")), None);
+        sync.set_enabled(true);
+        assert_eq!(
+            sync.poll(),
+            None,
+            "reenabling must prime, not announce private contents"
+        );
+        assert_eq!(
+            sync.on_request(&request),
+            None,
+            "old offers must remain invalid"
+        );
+        board.copy(Some(Contents::text("new public copy")), None);
+        assert!(matches!(sync.poll(), Some(Action::Offer(_))));
+    }
+
+    #[test]
+    fn setting_change_atomically_drains_clipboard_actions_and_keeps_queued_files() {
+        let (inbound, requests) = std::sync::mpsc::channel();
+        let (actions, outbound) = tokio::sync::mpsc::channel(8);
+        let settings = std::sync::Arc::new(std::sync::Mutex::new(Settings {
+            enabled: true,
+            revision: 0,
+        }));
+        let mut worker = Worker {
+            inbound,
+            actions: actions.downgrade(),
+            outbound,
+            settings,
+        };
+        let files = vec![PathBuf::from("/local/copied.txt")];
+        actions.try_send(Action::Files(files.clone())).unwrap();
+        actions
+            .try_send(Action::Data(
+                ClipboardDataHeader {
+                    offer_id: 1,
+                    format: ClipboardFormat::Text,
+                },
+                b"pending contents".to_vec(),
+            ))
+            .unwrap();
+        worker.set_enabled(false);
+        assert_eq!(worker.outbound.try_recv().unwrap(), Action::Files(files));
+        assert!(worker.outbound.try_recv().is_err());
+        worker.deliver(Inbound::Request(ClipboardRequest {
+            offer_id: 1,
+            format: ClipboardFormat::Text,
+        }));
+        assert!(
+            requests.try_recv().is_err(),
+            "disabled inbound requests never reach the engine"
+        );
+        worker.set_enabled(true);
+        worker.deliver(Inbound::Request(ClipboardRequest {
+            offer_id: 1,
+            format: ClipboardFormat::Text,
+        }));
+        assert_eq!(
+            requests.try_recv().unwrap().0,
+            2,
+            "queued traffic is tied to its enable generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_discards_late_data_from_before_disable_and_accepts_new_requests() {
+        let board = NativeFake::default();
+        board.copy(Some(Contents::text("local")), None);
+        let mut worker = spawn_with_files(board.clone(), true, true);
+        let offer = |offer_id| {
+            Inbound::Offer(ClipboardOffer {
+                offer_id,
+                formats: vec![ClipboardFormat::Text],
+                size_hint: 4,
+            })
+        };
+        let data = |offer_id, bytes: &[u8]| {
+            Inbound::Data(
+                ClipboardDataHeader {
+                    offer_id,
+                    format: ClipboardFormat::Text,
+                },
+                bytes.to_vec(),
+            )
+        };
+        worker.deliver(offer(1));
+        assert!(matches!(
+            tokio::time::timeout(POLL * 10, worker.outbound.recv())
+                .await
+                .unwrap(),
+            Some(Action::Request(_))
+        ));
+        worker.set_enabled(false);
+        worker.deliver(data(1, b"disabled"));
+        worker.set_enabled(true);
+        worker.deliver(data(1, b"late"));
+        worker.deliver(offer(2));
+        let Some(Action::Request(request)) =
+            tokio::time::timeout(POLL * 10, worker.outbound.recv())
+                .await
+                .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(request.offer_id, 2);
+        assert_eq!(
+            board.0.lock().unwrap().contents,
+            Some(Contents::text("local"))
+        );
+        worker.deliver(data(2, b"new"));
+        // A subsequent request is a deterministic barrier after the data write.
+        worker.deliver(offer(3));
+        let Some(Action::Request(request)) =
+            tokio::time::timeout(POLL * 10, worker.outbound.recv())
+                .await
+                .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(request.offer_id, 3);
+        assert_eq!(
+            board.0.lock().unwrap().contents,
+            Some(Contents::text("new"))
+        );
     }
 
     struct WriteThenCopy {

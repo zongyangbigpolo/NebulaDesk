@@ -41,7 +41,7 @@ impl Resource {
 }
 
 /// Everything needed to reach an agent, valid for about a minute.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct SessionTicket {
     /// The session this ticket opens.
     pub session_id: uuid::Uuid,
@@ -65,6 +65,39 @@ pub struct SessionTicket {
     /// that would be silently refused.
     #[serde(default = "nebula_common::SessionPolicy::view_only")]
     pub policy: nebula_common::SessionPolicy,
+}
+
+impl std::fmt::Debug for SessionTicket {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionTicket")
+            .field("session_id", &self.session_id)
+            .field("policy", &self.policy)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TryFrom<nebula_desktop_protocol::LaunchTicket> for SessionTicket {
+    type Error = anyhow::Error;
+
+    fn try_from(ticket: nebula_desktop_protocol::LaunchTicket) -> anyhow::Result<Self> {
+        Ok(Self {
+            session_id: ticket
+                .session_id
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid session id"))?,
+            ticket: ticket.ticket,
+            gateway_addr: ticket.gateway_addr,
+            gateway_pin: ticket.gateway_pin,
+            agent_key: ticket.agent_key,
+            policy: nebula_common::SessionPolicy {
+                input: ticket.policy.input,
+                audio: ticket.policy.audio,
+                clipboard: ticket.policy.clipboard,
+                file_transfer: ticket.policy.file_transfer,
+            },
+        })
+    }
 }
 
 #[derive(Serialize)]
@@ -191,6 +224,28 @@ const fn client_os() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_ticket_preserves_authorization_and_redacts_debug() {
+        let ticket = SessionTicket::try_from(nebula_desktop_protocol::LaunchTicket {
+            session_id: uuid::Uuid::nil().to_string(),
+            ticket: "SECRET_BEARER".into(),
+            gateway_addr: "localhost:1".into(),
+            gateway_pin: "pin".into(),
+            agent_key: "key".into(),
+            policy: nebula_desktop_protocol::Policy {
+                input: false,
+                audio: true,
+                clipboard: false,
+                file_transfer: true,
+            },
+        })
+        .unwrap();
+        assert_eq!(ticket.ticket, "SECRET_BEARER");
+        assert!(ticket.policy.audio && ticket.policy.file_transfer);
+        assert!(!ticket.policy.input && !ticket.policy.clipboard);
+        assert!(!format!("{ticket:?}").contains("SECRET_BEARER"));
+    }
 
     #[test]
     fn a_resource_is_only_offered_when_its_machine_is_up() {

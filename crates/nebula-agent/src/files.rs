@@ -59,6 +59,59 @@ const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 // terminal receiver failure, never success; actual files are capped at MAX_FILE.
 const FAILED_RECEIVED: u64 = u64::MAX;
 
+/// A transfer id is unique within its direction, not across both peers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TransferDirection {
+    /// From this machine to the peer.
+    Send,
+    /// From the peer to this machine.
+    Receive,
+}
+
+/// Lifecycle state reported by the local file engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TransferState {
+    /// An outgoing offer was prepared or an incoming offer accepted.
+    Offered,
+    /// Bytes are moving; even all bytes sent still requires final verification.
+    Transferring,
+    /// The receiver verified and published the file, and acknowledged it for sends.
+    Complete,
+    /// The engine rejected or could not finish the transfer.
+    Failed,
+}
+
+/// Latest local engine state; completion means the receiver verified and published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferUpdate {
+    /// Sender-assigned id, unique within a direction.
+    pub id: u64,
+    /// The offered filename, or the local filename for a pre-offer failure.
+    pub name: String,
+    /// Direction relative to this machine.
+    pub direction: TransferDirection,
+    /// Bytes read for sending, or unique bytes written while receiving.
+    pub transferred: u64,
+    /// Expected file size; zero when a failed source could not be inspected.
+    pub total: u64,
+    /// Latest engine state, not an estimate based on bytes sent.
+    pub state: TransferState,
+    /// Local explanation for a failure.
+    pub error: Option<String>,
+}
+
+// Bound the engine's coalescing buffer independently of the UI's receiver.
+const MAX_UPDATES: usize = 256;
+const TELEMETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+fn record_update(updates: &mut VecDeque<TransferUpdate>, update: TransferUpdate) {
+    updates.retain(|old| old.id != update.id || old.direction != update.direction);
+    if updates.len() == MAX_UPDATES {
+        updates.pop_front();
+    }
+    updates.push_back(update);
+}
+
 fn failure_ack(transfer_id: u64) -> Action {
     Action::Ack(FileAck {
         transfer_id,
@@ -90,8 +143,23 @@ struct Sending {
     name: String,
 }
 
+impl Sending {
+    fn update(&self, id: u64, state: TransferState, error: Option<String>) -> TransferUpdate {
+        TransferUpdate {
+            id,
+            name: self.name.clone(),
+            direction: TransferDirection::Send,
+            transferred: self.offset,
+            total: self.size,
+            state,
+            error,
+        }
+    }
+}
+
 /// A file being received.
 struct Receiving {
+    name: String,
     file: File,
     part: PathBuf,
     final_path: PathBuf,
@@ -102,6 +170,20 @@ struct Receiving {
     expected: String,
     modified_secs: Option<i64>,
     last_progress: std::time::Instant,
+}
+
+impl Receiving {
+    fn update(&self, id: u64, state: TransferState, error: Option<String>) -> TransferUpdate {
+        TransferUpdate {
+            id,
+            name: self.name.clone(),
+            direction: TransferDirection::Receive,
+            transferred: self.have.0.iter().map(|(start, end)| end - start).sum(),
+            total: self.size,
+            state,
+            error,
+        }
+    }
 }
 
 /// The set of byte ranges that have arrived.
@@ -153,6 +235,8 @@ pub struct FileTransfers {
     next_id: u64,
     sending: HashMap<u64, Sending>,
     receiving: HashMap<u64, Receiving>,
+    updates: VecDeque<TransferUpdate>,
+    last_telemetry: std::time::Instant,
 }
 
 impl FileTransfers {
@@ -168,6 +252,8 @@ impl FileTransfers {
             next_id: 1,
             sending: HashMap::new(),
             receiving: HashMap::new(),
+            updates: VecDeque::new(),
+            last_telemetry: std::time::Instant::now(),
         }
     }
 
@@ -184,6 +270,41 @@ impl FileTransfers {
     /// shows up after it has already written everything to disk. The cost is
     /// one read of the file before sending starts.
     pub fn send_file(&mut self, path: &Path) -> anyhow::Result<Action> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let result = self.prepare_send(id, path);
+        if let Err(error) = &result {
+            self.local_failure(id, path, format!("{error:#}"));
+        }
+        result
+    }
+
+    fn local_failure(&mut self, id: u64, path: &Path, error: String) {
+        record_update(
+            &mut self.updates,
+            TransferUpdate {
+                id,
+                name: path
+                    .file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy()
+                    .into_owned(),
+                direction: TransferDirection::Send,
+                transferred: 0,
+                total: std::fs::symlink_metadata(path).map_or(0, |metadata| metadata.len()),
+                state: TransferState::Failed,
+                error: Some(error),
+            },
+        );
+    }
+
+    fn reject_local(&mut self, path: &Path, error: &str) {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.local_failure(id, path, error.into());
+    }
+
+    fn prepare_send(&mut self, id: u64, path: &Path) -> anyhow::Result<Action> {
         if !self.enabled {
             bail!("file transfer is not permitted in this session");
         }
@@ -230,7 +351,7 @@ impl FileTransfers {
         file.seek(SeekFrom::Start(0))?;
 
         let offer = FileOffer {
-            transfer_id: self.next_id,
+            transfer_id: id,
             name: name.clone(),
             size,
             blake3: hasher.finalize().to_hex().to_string(),
@@ -245,7 +366,7 @@ impl FileTransfers {
         }
 
         self.sending.insert(
-            self.next_id,
+            id,
             Sending {
                 file,
                 offset: 0,
@@ -256,7 +377,10 @@ impl FileTransfers {
                 name,
             },
         );
-        self.next_id += 1;
+        record_update(
+            &mut self.updates,
+            self.sending[&id].update(id, TransferState::Offered, None),
+        );
         Ok(Action::Offer(offer))
     }
 
@@ -264,17 +388,24 @@ impl FileTransfers {
     pub fn on_offer(&mut self, offer: &FileOffer) -> Option<Action> {
         if !self.enabled {
             tracing::debug!(name = %offer.name, "declining a file: not permitted here");
+            self.reject_offer(offer, "file transfer is not permitted in this session");
             return None;
         }
         if !offer.has_safe_name() {
             tracing::warn!(name = %offer.name, "declining a file with an unusable name");
+            self.reject_offer(offer, "unusable file name");
             return None;
         }
         if offer.size > MAX_FILE {
             tracing::warn!(name = %offer.name, size = offer.size, "declining an oversized file");
+            self.reject_offer(offer, "file exceeds the size limit");
             return None;
         }
         if self.receiving.len() >= MAX_ACTIVE || self.receiving.contains_key(&offer.transfer_id) {
+            // Do not mark an existing transfer failed for a duplicate offer.
+            if !self.receiving.contains_key(&offer.transfer_id) {
+                self.reject_offer(offer, "too many transfers already in flight");
+            }
             return None;
         }
 
@@ -282,6 +413,7 @@ impl FileTransfers {
             Ok(path) => path,
             Err(error) => {
                 tracing::warn!(%error, name = %offer.name, "nowhere to put an arriving file");
+                self.reject_offer(offer, &format!("{error:#}"));
                 return None;
             }
         };
@@ -291,6 +423,7 @@ impl FileTransfers {
             Ok(file) => file,
             Err(error) => {
                 tracing::warn!(%error, path = %part.display(), "could not open a file to receive into");
+                self.reject_offer(offer, &format!("{error:#}"));
                 return None;
             }
         };
@@ -298,6 +431,7 @@ impl FileTransfers {
         self.receiving.insert(
             offer.transfer_id,
             Receiving {
+                name: offer.name.clone(),
                 file,
                 part,
                 final_path,
@@ -309,6 +443,14 @@ impl FileTransfers {
                 last_progress: std::time::Instant::now(),
             },
         );
+        record_update(
+            &mut self.updates,
+            self.receiving[&offer.transfer_id].update(
+                offer.transfer_id,
+                TransferState::Offered,
+                None,
+            ),
+        );
 
         Some(Action::Ack(FileAck {
             transfer_id: offer.transfer_id,
@@ -317,11 +459,37 @@ impl FileTransfers {
         }))
     }
 
+    fn reject_offer(&mut self, offer: &FileOffer, error: &str) {
+        if self.receiving.contains_key(&offer.transfer_id) {
+            return;
+        }
+        record_update(
+            &mut self.updates,
+            TransferUpdate {
+                id: offer.transfer_id,
+                name: offer.name.clone(),
+                direction: TransferDirection::Receive,
+                transferred: 0,
+                total: offer.size,
+                state: TransferState::Failed,
+                error: Some(error.into()),
+            },
+        );
+    }
+
     /// Note how much more the peer is willing to receive.
     pub fn on_ack(&mut self, ack: &FileAck) {
         if ack.received == FAILED_RECEIVED {
             if let Some(send) = self.sending.remove(&ack.transfer_id) {
                 tracing::warn!(name = %send.name, "the peer rejected or could not finish receiving a file");
+                record_update(
+                    &mut self.updates,
+                    send.update(
+                        ack.transfer_id,
+                        TransferState::Failed,
+                        Some("the peer rejected or could not verify and publish the file".into()),
+                    ),
+                );
             }
             return;
         }
@@ -331,6 +499,10 @@ impl FileTransfers {
             }
             if send.finished && ack.received == send.size {
                 tracing::info!(name = %send.name, "a file finished sending");
+                record_update(
+                    &mut self.updates,
+                    send.update(ack.transfer_id, TransferState::Complete, None),
+                );
                 self.sending.remove(&ack.transfer_id);
             } else {
                 // Each acknowledgement has its own stream and can arrive late.
@@ -350,7 +522,10 @@ impl FileTransfers {
         let end = header.offset.saturating_add(data.len() as u64);
         if end > recv.size {
             tracing::warn!("abandoning a transfer that overran its announced size");
-            self.abandon(header.transfer_id);
+            self.fail_receive(
+                header.transfer_id,
+                "chunk overran the announced size".into(),
+            );
             return Some(failure_ack(header.transfer_id));
         }
 
@@ -360,11 +535,18 @@ impl FileTransfers {
             .and_then(|_| recv.file.write_all(data));
         if let Err(error) = written {
             tracing::warn!(%error, "abandoning a transfer that could not be written");
-            self.abandon(header.transfer_id);
+            self.fail_receive(
+                header.transfer_id,
+                format!("could not write arriving file: {error}"),
+            );
             return Some(failure_ack(header.transfer_id));
         }
         recv.last_progress = std::time::Instant::now();
         recv.have.add(header.offset, end);
+        record_update(
+            &mut self.updates,
+            recv.update(header.transfer_id, TransferState::Transferring, None),
+        );
 
         let complete = recv.have.complete(recv.size);
         let received = recv.have.contiguous();
@@ -402,6 +584,10 @@ impl FileTransfers {
         if send.size == 0 {
             send.finished = true;
             send.last_progress = std::time::Instant::now();
+            record_update(
+                &mut self.updates,
+                send.update(ready, TransferState::Transferring, None),
+            );
             return Some(Action::Chunk(
                 FileChunkHeader {
                     transfer_id: ready,
@@ -420,6 +606,14 @@ impl FileTransfers {
                 Ok(n) => filled += n,
                 Err(error) => {
                     tracing::warn!(%error, name = %send.name, "giving up on a file being sent");
+                    record_update(
+                        &mut self.updates,
+                        send.update(
+                            ready,
+                            TransferState::Failed,
+                            Some(format!("could not read file: {error}")),
+                        ),
+                    );
                     self.sending.remove(&ready);
                     return None;
                 }
@@ -427,6 +621,14 @@ impl FileTransfers {
         }
         if filled == 0 {
             // The file shrank under us. Nothing sensible left to send.
+            record_update(
+                &mut self.updates,
+                send.update(
+                    ready,
+                    TransferState::Failed,
+                    Some("source file shrank during transfer".into()),
+                ),
+            );
             self.sending.remove(&ready);
             return None;
         }
@@ -443,6 +645,10 @@ impl FileTransfers {
             // otherwise overtake the final chunk on independent QUIC streams.
             send.finished = true;
         }
+        record_update(
+            &mut self.updates,
+            send.update(ready, TransferState::Transferring, None),
+        );
         Some(Action::Chunk(header, buffer))
     }
 
@@ -455,10 +661,18 @@ impl FileTransfers {
     }
 
     fn expire_stalled(&mut self, now: std::time::Instant) {
-        self.sending.retain(|_, send| {
+        self.sending.retain(|&id, send| {
             let expired = now.saturating_duration_since(send.last_progress) >= STALL_TIMEOUT;
             if expired {
                 tracing::warn!(name = %send.name, "file send timed out without peer progress");
+                record_update(
+                    &mut self.updates,
+                    send.update(
+                        id,
+                        TransferState::Failed,
+                        Some("file send timed out without peer progress".into()),
+                    ),
+                );
             }
             !expired
         });
@@ -470,7 +684,7 @@ impl FileTransfers {
             .collect();
         for id in expired {
             tracing::warn!(transfer_id = id, "incomplete file receive timed out");
-            self.abandon(id);
+            self.fail_receive(id, "incomplete file receive timed out".into());
         }
     }
 
@@ -480,6 +694,7 @@ impl FileTransfers {
             .receiving
             .remove(&transfer_id)
             .context("no such transfer")?;
+        let mut update = recv.update(transfer_id, TransferState::Complete, None);
         let synced = recv.file.sync_all();
         drop(recv.file);
 
@@ -532,6 +747,11 @@ impl FileTransfers {
                 tracing::warn!(%error, path = %recv.part.display(), "could not remove file-transfer staging file");
             }
         }
+        if let Err(error) = &result {
+            update.state = TransferState::Failed;
+            update.error = Some(format!("{error:#}"));
+        }
+        record_update(&mut self.updates, update);
         result
     }
 
@@ -540,6 +760,44 @@ impl FileTransfers {
         if let Some(recv) = self.receiving.remove(&transfer_id) {
             drop(recv.file);
             std::fs::remove_file(&recv.part).ok();
+        }
+    }
+
+    fn fail_receive(&mut self, id: u64, error: String) {
+        if let Some(recv) = self.receiving.get(&id) {
+            record_update(
+                &mut self.updates,
+                recv.update(id, TransferState::Failed, Some(error)),
+            );
+        }
+        self.abandon(id);
+    }
+
+    fn flush_updates(&mut self, telemetry: &tokio::sync::mpsc::UnboundedSender<TransferUpdate>) {
+        self.flush_updates_at(telemetry, std::time::Instant::now());
+    }
+
+    fn flush_updates_at(
+        &mut self,
+        telemetry: &tokio::sync::mpsc::UnboundedSender<TransferUpdate>,
+        now: std::time::Instant,
+    ) {
+        if telemetry.is_closed() {
+            self.updates.clear();
+            return;
+        }
+        let progress_due = now.saturating_duration_since(self.last_telemetry) >= TELEMETRY_INTERVAL;
+        let mut deferred = VecDeque::new();
+        while let Some(update) = self.updates.pop_front() {
+            if update.state == TransferState::Transferring && !progress_due {
+                deferred.push_back(update);
+                continue;
+            }
+            let _ = telemetry.send(update);
+        }
+        self.updates = deferred;
+        if progress_due {
+            self.last_telemetry = now;
         }
     }
 
@@ -658,6 +916,11 @@ pub struct Worker {
     inbound: std::sync::mpsc::Sender<Inbound>,
     /// What to send to the peer.
     pub outbound: tokio::sync::mpsc::Receiver<Action>,
+    /// Coalesced engine snapshots, keyed by `(direction, id)`.
+    /// Progress is coalesced at 10 Hz; terminal states are sent immediately.
+    /// Closed unless created with [`spawn_with_telemetry`]; opted-in consumers
+    /// must drain or drop this unbounded receiver.
+    pub telemetry: tokio::sync::mpsc::UnboundedReceiver<TransferUpdate>,
 }
 
 impl Worker {
@@ -676,11 +939,26 @@ impl Worker {
 }
 
 /// Run file transfer on its own thread.
+///
+/// Telemetry is disabled so existing callers need not drain an unused receiver.
 pub fn spawn(downloads: PathBuf, enabled: bool) -> Worker {
+    spawn_inner(downloads, enabled, false)
+}
+
+/// Run file transfer with telemetry for a caller that will drain the updates.
+pub fn spawn_with_telemetry(downloads: PathBuf, enabled: bool) -> Worker {
+    spawn_inner(downloads, enabled, true)
+}
+
+fn spawn_inner(downloads: PathBuf, enabled: bool, telemetry_enabled: bool) -> Worker {
     let (inbound, requests) = std::sync::mpsc::channel::<Inbound>();
     // Bounded so that a session which has stopped draining stops the disk
     // reads too, instead of pulling the whole file into memory.
     let (actions, outbound) = tokio::sync::mpsc::channel::<Action>(4);
+    let (telemetry_tx, mut telemetry) = tokio::sync::mpsc::unbounded_channel();
+    if !telemetry_enabled {
+        telemetry.close();
+    }
 
     std::thread::Builder::new()
         .name("nebula-files".into())
@@ -689,6 +967,7 @@ pub fn spawn(downloads: PathBuf, enabled: bool) -> Worker {
             let mut pending = VecDeque::new();
             loop {
                 transfers.expire_stalled(std::time::Instant::now());
+                transfers.flush_updates(&telemetry_tx);
                 // With chunks waiting there is no reason to sit on the
                 // channel; with nothing to send there is no reason to spin.
                 let can_start = transfers.sending.len() < MAX_ACTIVE && !pending.is_empty();
@@ -708,8 +987,10 @@ pub fn spawn(downloads: PathBuf, enabled: bool) -> Worker {
                     Ok(Inbound::Send(path)) => {
                         if !enabled {
                             tracing::warn!(path = %path.display(), "file transfer is not permitted");
+                            transfers.reject_local(&path, "file transfer is not permitted in this session");
                         } else if pending.len() >= 256 {
                             tracing::warn!(path = %path.display(), "file send queue is full; copy this file again later");
+                            transfers.reject_local(&path, "file send queue is full; copy this file again later");
                         } else {
                             pending.push_back(path);
                         }
@@ -718,6 +999,7 @@ pub fn spawn(downloads: PathBuf, enabled: bool) -> Worker {
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
                 };
+                transfers.flush_updates(&telemetry_tx);
 
                 if let Some(action) = action {
                     if actions.blocking_send(action).is_err() {
@@ -728,6 +1010,7 @@ pub fn spawn(downloads: PathBuf, enabled: bool) -> Worker {
                     if let Some(path) = pending.pop_front() {
                         match transfers.send_file(&path) {
                             Ok(action) => {
+                                transfers.flush_updates(&telemetry_tx);
                                 if actions.blocking_send(action).is_err() {
                                     return;
                                 }
@@ -738,7 +1021,9 @@ pub fn spawn(downloads: PathBuf, enabled: bool) -> Worker {
                         }
                     }
                 }
-                if let Some(action) = transfers.pump() {
+                let action = transfers.pump();
+                transfers.flush_updates(&telemetry_tx);
+                if let Some(action) = action {
                     if actions.blocking_send(action).is_err() {
                         return;
                     }
@@ -747,12 +1032,297 @@ pub fn spawn(downloads: PathBuf, enabled: bool) -> Worker {
         })
         .expect("spawning a thread should not fail");
 
-    Worker { inbound, outbound }
+    Worker {
+        inbound,
+        outbound,
+        telemetry,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn telemetry_completes_only_after_verified_publish_and_final_ack() {
+        for contents in [b"verified contents".as_slice(), b"".as_slice()] {
+            let source = tempfile::tempdir().unwrap();
+            let target = tempfile::tempdir().unwrap();
+            let path = write(source.path(), "transfer.txt", contents);
+            let mut sender = FileTransfers::new(source.path().into(), true);
+            let mut receiver = FileTransfers::new(target.path().into(), true);
+            let Action::Offer(offer) = sender.send_file(&path).unwrap() else {
+                panic!()
+            };
+            assert_eq!(
+                sender.updates.pop_front().unwrap().state,
+                TransferState::Offered
+            );
+            let Some(Action::Ack(ack)) = receiver.on_offer(&offer) else {
+                panic!()
+            };
+            assert_eq!(
+                receiver.updates.pop_front().unwrap().state,
+                TransferState::Offered
+            );
+            sender.on_ack(&ack);
+            assert!(
+                sender.updates.is_empty(),
+                "the initial zero-byte ACK is not completion"
+            );
+            let Some(Action::Chunk(header, bytes)) = sender.pump() else {
+                panic!()
+            };
+            let progress = sender.updates.pop_front().unwrap();
+            assert_eq!(progress.state, TransferState::Transferring);
+            assert_eq!(progress.transferred, offer.size);
+            assert!(sender.sending.contains_key(&offer.transfer_id));
+            let Some(Action::Ack(final_ack)) = receiver.on_chunk(header, &bytes) else {
+                panic!()
+            };
+            let received = receiver.updates.pop_front().unwrap();
+            assert_eq!(received.state, TransferState::Complete);
+            assert_eq!(received.direction, TransferDirection::Receive);
+            assert_eq!(received.transferred, offer.size);
+            assert_eq!(
+                std::fs::read(target.path().join(&offer.name)).unwrap(),
+                contents
+            );
+            assert!(
+                sender.updates.is_empty(),
+                "publication alone does not finish the sender"
+            );
+            sender.on_ack(&final_ack);
+            let sent = sender.updates.pop_front().unwrap();
+            assert_eq!(sent.state, TransferState::Complete);
+            assert_eq!(sent.direction, TransferDirection::Send);
+            assert_eq!(sent.error, None);
+            assert!(!sender.sending.contains_key(&offer.transfer_id));
+            sender.on_ack(&final_ack);
+            assert!(
+                sender.updates.is_empty(),
+                "duplicate ACKs do not repeat completion"
+            );
+        }
+    }
+
+    #[test]
+    fn telemetry_reports_hash_failure_and_peer_failure_without_completion() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let path = write(source.path(), "damaged.txt", b"before");
+        let mut sender = FileTransfers::new(source.path().into(), true);
+        let mut receiver = FileTransfers::new(target.path().into(), true);
+        let Action::Offer(offer) = sender.send_file(&path).unwrap() else {
+            panic!()
+        };
+        let Some(Action::Ack(ack)) = receiver.on_offer(&offer) else {
+            panic!()
+        };
+        sender.on_ack(&ack);
+        std::fs::write(path, b"after!").unwrap();
+        let Some(Action::Chunk(header, bytes)) = sender.pump() else {
+            panic!()
+        };
+        let Some(Action::Ack(ack)) = receiver.on_chunk(header, &bytes) else {
+            panic!()
+        };
+        assert_eq!(ack.received, FAILED_RECEIVED);
+        sender.on_ack(&ack);
+        for updates in [&sender.updates, &receiver.updates] {
+            let update = updates.back().unwrap();
+            assert_eq!(update.state, TransferState::Failed);
+            assert!(update.error.as_ref().is_some_and(|error| !error.is_empty()));
+        }
+        assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn telemetry_reports_unique_pre_offer_failures_and_receive_disk_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut transfers = FileTransfers::new(dir.path().into(), true);
+        let missing = dir.path().join("missing.txt");
+        assert!(transfers.send_file(&missing).is_err());
+        assert!(transfers.send_file(&missing).is_err());
+        transfers.reject_local(&missing, "queue full");
+        let updates: Vec<_> = transfers.updates.drain(..).collect();
+        assert_eq!(updates.len(), 3);
+        assert!(updates.windows(2).all(|pair| pair[0].id != pair[1].id));
+        assert!(updates
+            .iter()
+            .all(|update| update.state == TransferState::Failed
+                && update.name == "missing.txt"
+                && update.error.is_some()));
+
+        let blocked = write(dir.path(), "not-a-directory", b"block downloads");
+        let mut receiver = FileTransfers::new(blocked, true);
+        assert!(receiver
+            .on_offer(&FileOffer {
+                transfer_id: 7,
+                name: "incoming.txt".into(),
+                size: 1,
+                blake3: blake3::hash(b"x").to_hex().to_string(),
+                modified_secs: None,
+            })
+            .is_none());
+        let failed = receiver.updates.pop_front().unwrap();
+        assert_eq!(failed.direction, TransferDirection::Receive);
+        assert_eq!(failed.state, TransferState::Failed);
+        assert!(failed.error.is_some());
+    }
+
+    #[test]
+    fn telemetry_counts_nonoverlapping_received_bytes_and_bounds_pending_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut receiver = FileTransfers::new(dir.path().into(), true);
+        let offer = FileOffer {
+            transfer_id: 1,
+            name: "reordered.txt".into(),
+            size: 6,
+            blake3: blake3::hash(b"abcdef").to_hex().to_string(),
+            modified_secs: None,
+        };
+        receiver.on_offer(&offer);
+        for _ in 0..2 {
+            receiver.on_chunk(
+                FileChunkHeader {
+                    transfer_id: 1,
+                    offset: 3,
+                },
+                b"def",
+            );
+            assert_eq!(receiver.updates.back().unwrap().transferred, 3);
+        }
+        receiver.expire_stalled(std::time::Instant::now() + STALL_TIMEOUT);
+        assert_eq!(
+            receiver.updates.back().unwrap().state,
+            TransferState::Failed
+        );
+        for _ in 0..MAX_UPDATES + 10 {
+            receiver.reject_local(&dir.path().join("missing.txt"), "queue full");
+        }
+        assert_eq!(receiver.updates.len(), MAX_UPDATES);
+    }
+
+    #[test]
+    fn telemetry_reports_source_read_failure_and_tolerates_a_dropped_consumer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "shrinking.txt", b"contents");
+        let mut sender = FileTransfers::new(dir.path().into(), true);
+        let Action::Offer(offer) = sender.send_file(&path).unwrap() else {
+            panic!()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        sender.flush_updates(&tx);
+        assert_eq!(rx.try_recv().unwrap().state, TransferState::Offered);
+        sender.on_ack(&FileAck {
+            transfer_id: offer.transfer_id,
+            received: 0,
+            window: WINDOW,
+        });
+        std::fs::write(path, b"").unwrap();
+        assert!(sender.pump().is_none());
+        sender.flush_updates(&tx);
+        assert_eq!(rx.try_recv().unwrap().state, TransferState::Failed);
+        assert!(sender.sending.is_empty());
+        drop(rx);
+        sender.reject_local(&dir.path().join("missing"), "missing source");
+        sender.flush_updates(&tx);
+        assert!(sender.updates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn worker_exposes_failed_paths_before_any_wire_offer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut worker = spawn_with_telemetry(dir.path().into(), true);
+        worker.deliver(Inbound::Send(dir.path().join("missing.txt")));
+        let update =
+            tokio::time::timeout(std::time::Duration::from_secs(5), worker.telemetry.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(update.state, TransferState::Failed);
+        assert_eq!(update.name, "missing.txt");
+        assert!(worker.outbound.try_recv().is_err());
+    }
+
+    #[test]
+    fn telemetry_progress_is_coalesced_per_transfer_for_one_hundred_milliseconds() {
+        let mut transfers = FileTransfers::new(PathBuf::new(), true);
+        let start = transfers.last_telemetry;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let update = |id, state, transferred| TransferUpdate {
+            id,
+            name: format!("file-{id}"),
+            direction: TransferDirection::Send,
+            transferred,
+            total: 1000,
+            state,
+            error: None,
+        };
+        for id in 1..=2 {
+            record_update(
+                &mut transfers.updates,
+                update(id, TransferState::Offered, 0),
+            );
+            transfers.flush_updates_at(&tx, start);
+            assert_eq!(rx.try_recv().unwrap().state, TransferState::Offered);
+        }
+        for transferred in 1..=1000 {
+            for id in 1..=2 {
+                record_update(
+                    &mut transfers.updates,
+                    update(id, TransferState::Transferring, transferred),
+                );
+                transfers.flush_updates_at(&tx, start + TELEMETRY_INTERVAL / 2);
+            }
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "line-rate chunks must not flood telemetry"
+        );
+        assert_eq!(transfers.updates.len(), 2);
+        transfers.flush_updates_at(&tx, start + TELEMETRY_INTERVAL);
+        for _ in 1..=2 {
+            let progress = rx.try_recv().unwrap();
+            assert_eq!(progress.state, TransferState::Transferring);
+            assert_eq!(progress.transferred, 1000);
+        }
+        assert!(rx.try_recv().is_err());
+        for (id, state) in [
+            (1, TransferState::Complete),
+            (2, TransferState::Failed),
+            (3, TransferState::Offered),
+        ] {
+            record_update(&mut transfers.updates, update(id, state, 1000));
+            transfers.flush_updates_at(&tx, start + TELEMETRY_INTERVAL);
+            assert_eq!(
+                rx.try_recv().unwrap().state,
+                state,
+                "lifecycle events bypass throttling"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn default_worker_never_queues_unconsumed_telemetry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "standalone.txt", b"contents");
+        let mut worker = spawn(dir.path().into(), true);
+        assert!(worker.telemetry.is_closed());
+        worker.deliver(Inbound::Send(path));
+        let action =
+            tokio::time::timeout(std::time::Duration::from_secs(5), worker.outbound.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(matches!(action, Action::Offer(_)));
+        assert_eq!(worker.telemetry.len(), 0);
+        assert!(matches!(
+            worker.telemetry.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -882,6 +1452,14 @@ mod tests {
         let expired_at = std::time::Instant::now() + STALL_TIMEOUT;
         sender.expire_stalled(expired_at);
         receiver.expire_stalled(expired_at);
+        assert!(sender
+            .updates
+            .iter()
+            .all(|update| update.state == TransferState::Failed));
+        assert!(receiver
+            .updates
+            .iter()
+            .all(|update| update.state == TransferState::Failed));
         assert!(sender.sending.is_empty());
         assert!(receiver.receiving.is_empty());
         assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);

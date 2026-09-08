@@ -9,7 +9,9 @@
 use std::sync::Arc;
 
 use wgpu::util::DeviceExt;
+use winit::window::Window;
 
+use crate::chrome::{Action, Chrome};
 use crate::video::Picture;
 
 /// BT.709 limited range, which is what every screen encoder produces.
@@ -64,6 +66,7 @@ pub struct Renderer {
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     planes: Option<Planes>,
+    chrome_renderer: egui_wgpu::Renderer,
 }
 
 /// The textures holding the most recent picture.
@@ -191,6 +194,7 @@ impl Renderer {
             ..Default::default()
         });
 
+        let chrome_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
         Ok(Self {
             surface,
             device,
@@ -200,6 +204,7 @@ impl Renderer {
             layout,
             sampler,
             planes: None,
+            chrome_renderer,
         })
     }
 
@@ -265,6 +270,22 @@ impl Renderer {
 
     /// Draw the current picture, letterboxed to keep its shape.
     pub fn draw(&mut self) -> anyhow::Result<()> {
+        self.draw_frame(None).map(|_| ())
+    }
+
+    /// Composite native controls after the video, using the same GPU and surface.
+    pub fn draw_chrome(
+        &mut self,
+        window: &Window,
+        chrome: &mut Chrome,
+    ) -> anyhow::Result<Vec<Action>> {
+        self.draw_frame(Some((window, chrome)))
+    }
+
+    fn draw_frame(
+        &mut self,
+        chrome: Option<(&Window, &mut Chrome)>,
+    ) -> anyhow::Result<Vec<Action>> {
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
             // The surface goes stale when a window is resized or moved
@@ -272,8 +293,9 @@ impl Renderer {
             // whole recovery.
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
                 self.surface.configure(&self.device, &self.config);
-                return Ok(());
+                return Ok(Vec::new());
             }
+            Err(wgpu::SurfaceError::Timeout) => return Ok(Vec::new()),
             Err(error) => return Err(error.into()),
         };
 
@@ -285,6 +307,38 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
+        let mut actions = Vec::new();
+        let mut viewport = None;
+        let mut overlay = None;
+        let mut command_buffers = Vec::new();
+        if let Some((window, chrome)) = chrome {
+            viewport = Some(chrome.viewport(
+                (self.config.width, self.config.height),
+                window.scale_factor(),
+                self.picture_size().unwrap_or((0, 0)),
+            ));
+            let (output, frame_actions) = chrome.frame(window);
+            actions = frame_actions;
+            for (id, delta) in &output.textures_delta.set {
+                self.chrome_renderer
+                    .update_texture(&self.device, &self.queue, *id, delta);
+            }
+            let jobs = chrome
+                .context
+                .tessellate(output.shapes, output.pixels_per_point);
+            let screen = egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [self.config.width, self.config.height],
+                pixels_per_point: output.pixels_per_point,
+            };
+            command_buffers = self.chrome_renderer.update_buffers(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &jobs,
+                &screen,
+            );
+            overlay = Some((jobs, screen, output.textures_delta.free));
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("picture"),
@@ -302,21 +356,52 @@ impl Renderer {
             });
 
             if let Some(planes) = &self.planes {
-                let (x, y, w, h) = letterbox(
-                    self.config.width as f32,
-                    self.config.height as f32,
-                    planes.width as f32,
-                    planes.height as f32,
+                let (x, y, w, h) = viewport.map_or_else(
+                    || {
+                        letterbox(
+                            self.config.width as f32,
+                            self.config.height as f32,
+                            planes.width as f32,
+                            planes.height as f32,
+                        )
+                    },
+                    |v| (v.x as f32, v.y as f32, v.width as f32, v.height as f32),
                 );
-                pass.set_viewport(x, y, w, h, 0.0, 1.0);
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &planes.bind, &[]);
-                pass.draw(0..3, 0..1);
+                if w > 0.0 && h > 0.0 {
+                    pass.set_viewport(x, y, w, h, 0.0, 1.0);
+                    pass.set_pipeline(&self.pipeline);
+                    pass.set_bind_group(0, &planes.bind, &[]);
+                    pass.draw(0..3, 0..1);
+                }
             }
         }
-        self.queue.submit(Some(encoder.finish()));
+        if let Some((jobs, screen, _)) = &overlay {
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("native-session-chrome"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            self.chrome_renderer
+                .render(&mut pass.forget_lifetime(), jobs, screen);
+        }
+        command_buffers.push(encoder.finish());
+        self.queue.submit(command_buffers);
         frame.present();
-        Ok(())
+        if let Some((_, _, free)) = overlay {
+            for id in free {
+                self.chrome_renderer.free_texture(&id);
+            }
+        }
+        Ok(actions)
     }
 
     fn plane_texture(&self, width: u32, height: u32, data: &[u8]) -> wgpu::Texture {
@@ -437,6 +522,24 @@ fn letterbox(window_w: f32, window_h: f32, picture_w: f32, picture_h: f32) -> (f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chrome_video_geometry_matches_input_and_stays_inside_surface() {
+        for (size, scale) in [((1280, 820), 1.0), ((2560, 1640), 2.0), ((800, 600), 1.5)] {
+            let viewport = crate::chrome::video_viewport(size, scale, (1920, 1080));
+            let (x, y, w, h) = letterbox(
+                size.0 as f32,
+                size.1 as f32 - (88.0 * scale) as f32,
+                1920.0,
+                1080.0,
+            );
+            assert!((viewport.x - f64::from(x)).abs() < 0.01);
+            assert!((viewport.y - (f64::from(y) + 48.0 * scale)).abs() < 0.01);
+            assert!((viewport.width - f64::from(w)).abs() < 0.01);
+            assert!((viewport.height - f64::from(h)).abs() < 0.01);
+            assert!(viewport.y + viewport.height <= f64::from(size.1) - 40.0 * scale + 0.01);
+        }
+    }
 
     #[test]
     fn the_viewport_matches_what_the_input_path_computes() {

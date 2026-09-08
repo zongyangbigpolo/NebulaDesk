@@ -100,7 +100,7 @@ pub async fn connect_to_agent(ticket: &SessionTicket) -> anyhow::Result<Connecte
         .map_err(|error| {
         anyhow::anyhow!("the agent would not complete the handshake: {error}")
     })?;
-    tracing::debug!(greeting = %String::from_utf8_lossy(&greeting), "the agent accepted the session");
+    tracing::debug!("the agent accepted the session");
     let multipath = greeting == MULTIPATH_GREETING;
     let (session, incoming) = if multipath {
         session.into_multipath(incoming)

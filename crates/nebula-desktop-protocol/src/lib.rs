@@ -206,4 +206,18 @@ mod tests {
         .validate()
         .is_err());
     }
+
+    #[test]
+    fn buffered_lines_do_not_consume_the_next_command() {
+        let mut input = &b"{\"command\":\"focus\"}\n{\"command\":\"disconnect\"}\n"[..];
+        assert_eq!(
+            read_message::<Command>(&mut input).unwrap(),
+            Some(Command::Focus {})
+        );
+        assert_eq!(
+            read_message::<Command>(&mut input).unwrap(),
+            Some(Command::Disconnect {})
+        );
+        assert!(read_message::<Command>(&mut input).unwrap().is_none());
+    }
 }

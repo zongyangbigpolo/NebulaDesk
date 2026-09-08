@@ -16,15 +16,15 @@ use nebula_client::{session, ManagerClient};
 struct Cli {
     /// The manager to sign in to.
     #[arg(long, env = "NEBULA_MANAGER_URL")]
-    manager_url: String,
+    manager_url: Option<String>,
 
     /// Tenant slug.
     #[arg(long, env = "NEBULA_TENANT")]
-    tenant: String,
+    tenant: Option<String>,
 
     /// Email address to sign in with.
     #[arg(long, env = "NEBULA_EMAIL")]
-    email: String,
+    email: Option<String>,
 
     /// Password. Prefer the prompt or the environment over the command line,
     /// where it would be visible to every other process on the machine.
@@ -37,6 +37,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run a host-owned native session with bounded control messages on stdin.
+    DesktopSession,
     /// Show everything this account may connect to.
     List,
     /// Open a resource in a window.
@@ -48,6 +50,7 @@ enum Command {
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "nebula_client=info,warn".into()),
@@ -55,9 +58,24 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if matches!(cli.command, Command::DesktopSession) {
+        return nebula_client::desktop::run();
+    }
+    let manager_url = cli
+        .manager_url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--manager-url is required"))?;
+    let tenant = cli
+        .tenant
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--tenant is required"))?;
+    let email = cli
+        .email
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--email is required"))?;
     let password = match cli.password {
         Some(password) => password,
-        None => rpassword::prompt_password(format!("Password for {}: ", cli.email))?,
+        None => rpassword::prompt_password(format!("Password for {email}: "))?,
     };
 
     // The window has to own the main thread on macOS and Windows, so the
@@ -68,13 +86,13 @@ fn main() -> anyhow::Result<()> {
         .build()?;
 
     let (manager, resources) = runtime.block_on(async {
-        let manager =
-            ManagerClient::login(&cli.manager_url, &cli.tenant, &cli.email, &password).await?;
+        let manager = ManagerClient::login(manager_url, tenant, email, &password).await?;
         let resources = manager.resources().await?;
         anyhow::Ok((manager, resources))
     })?;
 
     match cli.command {
+        Command::DesktopSession => unreachable!("handled before login"),
         Command::List => {
             if resources.is_empty() {
                 println!("Nothing has been shared with this account yet.");
@@ -142,6 +160,29 @@ fn pick<'a>(
 mod tests {
     use super::*;
     use nebula_client::Resource;
+
+    #[test]
+    fn desktop_session_can_parse_without_human_login_arguments() {
+        let cli = Cli::try_parse_from(["nebula-client", "desktop-session"]).unwrap();
+        assert!(matches!(cli.command, Command::DesktopSession));
+    }
+
+    #[test]
+    fn existing_cli_login_options_still_parse() {
+        let cli = Cli::try_parse_from([
+            "nebula-client",
+            "--manager-url",
+            "https://manager.example",
+            "--tenant",
+            "work",
+            "--email",
+            "me@example.test",
+            "connect",
+            "Office",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Command::Connect { resource } if resource == "Office"));
+    }
 
     fn resource(id: &str, name: &str) -> Resource {
         Resource {

@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ndp_proto::{Channel, InputEvent, InputKind, MouseButton, MsgFlags, MsgHeader, MsgKind};
+use nebula_desktop_protocol::{Command, ConnectionPath, Event, SessionState};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -34,6 +35,11 @@ enum SessionEvent {
     Frame,
     Path(ndp_transport::PathKind),
     Ended,
+    Commands,
+    Telemetry(Event),
+    Settings { audio: bool, clipboard: bool },
+    Notice(String),
+    PickerFinished(Option<Vec<std::path::PathBuf>>),
 }
 
 /// Connect, open a window, and run until the user closes it.
@@ -42,13 +48,61 @@ enum SessionEvent {
 /// event loop to run on the thread the process started on, so the network
 /// side is what gets moved onto a runtime of its own.
 pub fn run(ticket: SessionTicket, resource_name: &str) -> anyhow::Result<()> {
+    run_inner(ticket, resource_name, false)
+}
+
+pub fn run_managed(ticket: SessionTicket, resource_name: &str) -> anyhow::Result<()> {
+    run_inner(ticket, resource_name, true)
+}
+
+fn run_inner(ticket: SessionTicket, resource_name: &str, managed: bool) -> anyhow::Result<()> {
     let event_loop = EventLoop::with_user_event().build()?;
     let mailbox: Mailbox = Arc::new(Mutex::new(None));
     let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
-    // Dropping a file on the window is the send gesture. It is deliberately
-    // the only one: a session that could reach into this machine's
-    // filesystem on the remote side's say-so would be a different product.
-    let (drop_tx, drop_rx) = tokio::sync::mpsc::unbounded_channel::<std::path::PathBuf>();
+    // Only local drops/pickers (including the supervising host's picker)
+    // authorize file reads; the remote protocol cannot name a local path.
+    let (drop_tx, drop_rx) = tokio::sync::mpsc::channel::<std::path::PathBuf>(64);
+    let (commands_tx, commands_rx) = std::sync::mpsc::sync_channel(64);
+    let (control_tx, control_rx) = tokio::sync::mpsc::channel(64);
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let events = managed.then(crate::desktop::Events::start).transpose()?;
+    let policy = ticket.policy;
+    if managed {
+        let proxy = event_loop.create_proxy();
+        let stop = stop_tx.clone();
+        std::thread::Builder::new()
+            .name("nebula-desktop-commands".into())
+            .spawn(move || {
+                let mut stdin = std::io::stdin().lock();
+                loop {
+                    match nebula_desktop_protocol::read_message::<Command>(&mut stdin) {
+                        Ok(Some(command)) if command.validate().is_ok() => {
+                            if matches!(command, Command::Disconnect {}) {
+                                let _ = stop.send(true);
+                            }
+                            if commands_tx.try_send(command).is_err()
+                                || proxy.send_event(SessionEvent::Commands).is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        _ => {
+                            tracing::warn!("invalid desktop command; ending managed session");
+                            let _ = proxy.send_event(SessionEvent::Telemetry(Event::State {
+                                state: SessionState::Failed,
+                                path: None,
+                                error: Some("Invalid desktop control message".into()),
+                            }));
+                            break;
+                        }
+                    }
+                }
+                let _ = stop.send(true);
+                let _ = commands_tx.try_send(Command::Disconnect {});
+                let _ = proxy.send_event(SessionEvent::Commands);
+            })?;
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -59,15 +113,29 @@ pub fn run(ticket: SessionTicket, resource_name: &str) -> anyhow::Result<()> {
     // Waking the event loop from the network side is what keeps the window
     // redrawing without a spin loop: nothing is drawn until a frame arrives.
     let waker = event_loop.create_proxy();
-    let network = runtime.spawn(pump(
+    let network_task = runtime.spawn(pump(
         ticket,
         Arc::clone(&mailbox),
         input_rx,
         drop_rx,
+        control_rx,
+        stop_rx,
         move |event| {
             let _ = waker.send_event(event);
         },
     ));
+    let abort_network = network_task.abort_handle();
+    let observer = event_loop.create_proxy();
+    let mut network = runtime.spawn(async move {
+        if network_task.await.is_err() {
+            let _ = observer.send_event(SessionEvent::Telemetry(Event::State {
+                state: SessionState::Failed,
+                path: None,
+                error: Some("Native session task failed".into()),
+            }));
+            let _ = observer.send_event(SessionEvent::Ended);
+        }
+    });
 
     let mut app = App {
         title: format!("{resource_name} — NebulaDesk"),
@@ -79,15 +147,48 @@ pub fn run(ticket: SessionTicket, resource_name: &str) -> anyhow::Result<()> {
         modifiers: ndp_proto::Modifiers::NONE,
         viewport: Viewport::fit((1.0, 1.0), (1, 1)),
         pointer: None,
+        cursor: None,
         held: input::HeldInput::default(),
         status: "Connecting",
+        chrome: crate::chrome::Chrome::new(resource_name.to_owned(), policy),
+        policy,
+        control: control_tx,
+        stop: stop_tx,
+        events,
+        closing: false,
+        managed,
+        proxy: event_loop.create_proxy(),
+        picker_open: false,
+        fatal: None,
+        network_ended: false,
+        commands: commands_rx,
+        next_ui_tick: Instant::now(),
+        closing_deadline: None,
     };
-    event_loop.run_app(&mut app)?;
+    let result = event_loop.run_app(&mut app);
 
     // The window is gone; stop the session rather than leaving the agent
     // capturing a screen nobody is watching.
-    network.abort();
+    let _ = app.stop.send(true);
+    runtime.block_on(async {
+        match tokio::time::timeout(Duration::from_secs(5), &mut network).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => app.fatal = Some(format!("session task failed: {error}")),
+            Err(_) => {
+                abort_network.abort();
+                network.abort();
+                app.fatal = Some("session shutdown timed out".into());
+            }
+        }
+    });
     runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    if let Some(events) = app.events.take() {
+        events.finish()?;
+    }
+    result?;
+    if let Some(error) = app.fatal {
+        anyhow::bail!(error);
+    }
     Ok(())
 }
 
@@ -98,18 +199,36 @@ struct App {
     renderer: Option<Renderer>,
     mailbox: Mailbox,
     input: tokio::sync::mpsc::UnboundedSender<InputEvent>,
-    dropped: tokio::sync::mpsc::UnboundedSender<std::path::PathBuf>,
+    dropped: tokio::sync::mpsc::Sender<std::path::PathBuf>,
     modifiers: ndp_proto::Modifiers,
     viewport: Viewport,
     pointer: Option<(f32, f32)>,
+    cursor: Option<(f64, f64)>,
     held: input::HeldInput,
     status: &'static str,
+    chrome: crate::chrome::Chrome,
+    policy: nebula_common::SessionPolicy,
+    control: tokio::sync::mpsc::Sender<Command>,
+    stop: tokio::sync::watch::Sender<bool>,
+    events: Option<crate::desktop::Events>,
+    closing: bool,
+    managed: bool,
+    proxy: winit::event_loop::EventLoopProxy<SessionEvent>,
+    picker_open: bool,
+    fatal: Option<String>,
+    network_ended: bool,
+    commands: std::sync::mpsc::Receiver<Command>,
+    next_ui_tick: Instant,
+    closing_deadline: Option<Instant>,
 }
 
 impl App {
     /// Send one event, ignoring a closed session: the window will be told
     /// about that separately and there is nothing useful to do here.
     fn send(&self, event: InputEvent) {
+        if !self.policy.input {
+            return;
+        }
         tracing::trace!(
             target: "nebula_client::input_trace",
             kind = ?event.kind,
@@ -149,12 +268,156 @@ impl App {
         };
         let size = window.inner_size();
         if let Some(picture) = renderer.picture_size() {
-            self.viewport = Viewport::fit((f64::from(size.width), f64::from(size.height)), picture);
+            self.viewport =
+                self.chrome
+                    .viewport((size.width, size.height), window.scale_factor(), picture);
+        }
+        if let Some((x, y)) = self.cursor {
+            let at = (!self.chrome.blocks_pointer(x, y, window.scale_factor()))
+                .then(|| self.viewport.normalise(x, y))
+                .flatten();
+            if at.is_none() {
+                self.leave_pointer();
+            } else {
+                self.pointer = at;
+            }
+        }
+    }
+
+    fn emit(&mut self, mut event: Event) {
+        if let Event::State { state, error, .. } = &mut event {
+            if *state == SessionState::Disconnected && self.fatal.is_some() {
+                *state = SessionState::Failed;
+                error.clone_from(&self.fatal);
+            }
+        }
+        if let Event::State {
+            state: SessionState::Failed,
+            error,
+            ..
+        } = &event
+        {
+            self.fatal = Some(
+                error
+                    .clone()
+                    .unwrap_or_else(|| "Native session failed".into()),
+            );
+        }
+        self.chrome.event(&event);
+        if let Some(events) = &self.events {
+            if let Err(error) = events.emit(event) {
+                tracing::error!(%error, "desktop supervision failed");
+                self.disconnect();
+            }
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn disconnect(&mut self) {
+        self.release_input();
+        self.closing = true;
+        self.closing_deadline
+            .get_or_insert_with(|| Instant::now() + Duration::from_secs(3));
+        let _ = self.stop.send(true);
+        if let Some(window) = &self.window {
+            window.set_visible(false);
+        }
+    }
+
+    fn command(&mut self, command: Command) {
+        match command {
+            Command::Focus {} => {
+                if let Some(window) = &self.window {
+                    window.set_visible(true);
+                    window.set_minimized(false);
+                    window.request_user_attention(Some(
+                        winit::window::UserAttentionType::Informational,
+                    ));
+                    window.focus_window();
+                }
+            }
+            Command::Disconnect {} => self.disconnect(),
+            Command::SendFiles { paths } => {
+                for path in paths {
+                    self.send_path(path.into());
+                }
+            }
+            other => {
+                if let Err(error) = self.control.try_send(other) {
+                    tracing::warn!(%error, "session command unavailable");
+                    self.chrome.notice("Session command unavailable".into());
+                }
+            }
+        }
+    }
+
+    fn send_path(&mut self, path: std::path::PathBuf) {
+        if !self.policy.file_transfer {
+            self.chrome.notice("File transfer is not permitted".into());
+        } else if self.dropped.try_send(path).is_err() {
+            self.chrome
+                .notice("File queue is full or session is disconnected".into());
+        }
+    }
+
+    fn action(&mut self, action: crate::chrome::Action) {
+        use crate::chrome::Action;
+        match action {
+            Action::Audio(enabled) => self.command(Command::SetAudio { enabled }),
+            Action::Clipboard(enabled) => self.command(Command::SetClipboard { enabled }),
+            Action::Disconnect => self.disconnect(),
+            Action::Fullscreen => {
+                if let Some(window) = &self.window {
+                    window.set_fullscreen(if window.fullscreen().is_some() {
+                        None
+                    } else {
+                        Some(winit::window::Fullscreen::Borderless(None))
+                    });
+                }
+            }
+            Action::PickFiles => {
+                if self.picker_open || !self.policy.file_transfer {
+                    return;
+                }
+                self.release_input();
+                self.picker_open = true;
+                let proxy = self.proxy.clone();
+                if let Err(error) = std::thread::Builder::new()
+                    .name("nebula-file-picker".into())
+                    .spawn(move || {
+                        let files = pollster::block_on(rfd::AsyncFileDialog::new().pick_files())
+                            .map(|files| files.into_iter().map(|f| f.path().to_owned()).collect());
+                        let _ = proxy.send_event(SessionEvent::PickerFinished(files));
+                    })
+                {
+                    self.picker_open = false;
+                    self.chrome.notice(format!("File picker failed: {error}"));
+                }
+            }
         }
     }
 }
 
 impl ApplicationHandler<SessionEvent> for App {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self
+            .closing_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            event_loop.exit();
+            return;
+        }
+        if Instant::now() >= self.next_ui_tick {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+            self.next_ui_tick = Instant::now() + Duration::from_secs(1);
+        }
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(self.next_ui_tick));
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             // Resuming happens more than once on mobile-style lifecycles;
@@ -163,11 +426,25 @@ impl ApplicationHandler<SessionEvent> for App {
         }
         let attributes = Window::default_attributes()
             .with_title(format!("{} [{}]", self.title, self.status))
-            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
+            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 820.0))
+            .with_min_inner_size(winit::dpi::LogicalSize::new(800.0, 500.0));
+        #[cfg(target_os = "macos")]
+        let attributes = {
+            use winit::platform::macos::WindowAttributesExtMacOS;
+            attributes
+                .with_titlebar_transparent(true)
+                .with_title_hidden(true)
+                .with_fullsize_content_view(true)
+        };
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
                 tracing::error!(%error, "could not open a window");
+                self.emit(Event::State {
+                    state: SessionState::Failed,
+                    path: None,
+                    error: Some("Could not open native session window".into()),
+                });
                 event_loop.exit();
                 return;
             }
@@ -177,14 +454,24 @@ impl ApplicationHandler<SessionEvent> for App {
             Ok(renderer) => self.renderer = Some(renderer),
             Err(error) => {
                 tracing::error!(%error, "could not set up the GPU");
+                self.emit(Event::State {
+                    state: SessionState::Failed,
+                    path: None,
+                    error: Some("Could not initialize native renderer".into()),
+                });
                 event_loop.exit();
                 return;
             }
         }
         self.window = Some(window);
+        self.emit(Event::State {
+            state: SessionState::Connecting,
+            path: None,
+            error: None,
+        });
     }
 
-    fn user_event(&mut self, _: &ActiveEventLoop, event: SessionEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: SessionEvent) {
         match event {
             SessionEvent::Frame => {
                 if let Some(window) = &self.window {
@@ -197,22 +484,75 @@ impl ApplicationHandler<SessionEvent> for App {
                     ndp_transport::PathKind::Relay => "Relay",
                     ndp_transport::PathKind::Direct => "Direct",
                 };
+                self.emit(Event::State {
+                    state: SessionState::Connected,
+                    path: Some(match path {
+                        ndp_transport::PathKind::Direct => ConnectionPath::Direct,
+                        ndp_transport::PathKind::Relay => ConnectionPath::Relay,
+                    }),
+                    error: None,
+                });
             }
             SessionEvent::Ended => {
+                self.network_ended = true;
                 self.release_input();
                 self.status = "Disconnected";
+                if self.managed || self.closing {
+                    event_loop.exit();
+                }
+            }
+            SessionEvent::Commands => {
+                while let Ok(command) = self.commands.try_recv() {
+                    self.command(command);
+                }
+                if *self.stop.borrow() {
+                    self.disconnect();
+                }
+                if self.closing && self.network_ended {
+                    event_loop.exit();
+                }
+            }
+            SessionEvent::Telemetry(event) => self.emit(event),
+            SessionEvent::Settings { audio, clipboard } => self.chrome.settings(audio, clipboard),
+            SessionEvent::Notice(message) => self.chrome.notice(message),
+            SessionEvent::PickerFinished(files) => {
+                self.picker_open = false;
+                if let Some(files) = files {
+                    for path in files {
+                        self.send_path(path);
+                    }
+                }
             }
         }
         if let Some(window) = &self.window {
             window.set_title(format!("{} [{}]", self.title, self.status).as_str());
+            window.request_redraw();
         }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        let consumed = self
+            .window
+            .as_ref()
+            .is_some_and(|window| self.chrome.on_window_event(window, &event));
+        if consumed
+            && matches!(
+                event,
+                WindowEvent::MouseInput { .. }
+                    | WindowEvent::MouseWheel { .. }
+                    | WindowEvent::KeyboardInput { .. }
+                    | WindowEvent::Ime(_)
+            )
+        {
+            self.release_input();
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => {
-                self.release_input();
-                event_loop.exit();
+                self.disconnect();
+                if self.network_ended {
+                    event_loop.exit();
+                }
             }
 
             WindowEvent::Focused(false) => self.release_input(),
@@ -222,7 +562,11 @@ impl ApplicationHandler<SessionEvent> for App {
                     renderer.resize(size.width, size.height);
                 }
                 self.refit();
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
             }
+            WindowEvent::ScaleFactorChanged { .. } => self.refit(),
 
             WindowEvent::RedrawRequested => {
                 // Take rather than clone: whatever is in the slot is the
@@ -236,10 +580,16 @@ impl ApplicationHandler<SessionEvent> for App {
                     // actually uploaded rather than from what was expected.
                     self.refit();
                 }
-                if let Some(renderer) = &mut self.renderer {
-                    if let Err(error) = renderer.draw() {
-                        tracing::warn!(%error, "a frame could not be drawn");
+                if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) {
+                    match renderer.draw_chrome(window, &mut self.chrome) {
+                        Ok(actions) => {
+                            for action in actions {
+                                self.action(action);
+                            }
+                        }
+                        Err(error) => tracing::warn!(%error, "a frame could not be drawn"),
                     }
+                    self.refit();
                 }
             }
 
@@ -248,6 +598,16 @@ impl ApplicationHandler<SessionEvent> for App {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = Some((position.x, position.y));
+                if self.picker_open
+                    || self.window.as_ref().is_some_and(|window| {
+                        self.chrome
+                            .blocks_pointer(position.x, position.y, window.scale_factor())
+                    })
+                {
+                    self.leave_pointer();
+                    return;
+                }
                 tracing::trace!(
                     target: "nebula_client::input_trace",
                     x = position.x,
@@ -272,7 +632,10 @@ impl ApplicationHandler<SessionEvent> for App {
                 }
             }
 
-            WindowEvent::CursorLeft { .. } => self.leave_pointer(),
+            WindowEvent::CursorLeft { .. } => {
+                self.cursor = None;
+                self.leave_pointer();
+            }
 
             WindowEvent::MouseInput { state, button, .. } => {
                 // A click with no known position would land wherever the
@@ -299,6 +662,9 @@ impl ApplicationHandler<SessionEvent> for App {
                 is_synthetic,
                 ..
             } => {
+                if self.picker_open || self.chrome.wants_keyboard_input() {
+                    return;
+                }
                 tracing::trace!(
                     target: "nebula_client::input_trace",
                     physical_key = ?event.physical_key,
@@ -324,7 +690,7 @@ impl ApplicationHandler<SessionEvent> for App {
             }
 
             WindowEvent::DroppedFile(path) => {
-                let _ = self.dropped.send(path);
+                self.send_path(path);
             }
 
             _ => {}
@@ -337,13 +703,29 @@ async fn pump(
     ticket: SessionTicket,
     mailbox: Mailbox,
     mut input: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
-    mut dropped: tokio::sync::mpsc::UnboundedReceiver<std::path::PathBuf>,
+    mut dropped: tokio::sync::mpsc::Receiver<std::path::PathBuf>,
+    mut control: tokio::sync::mpsc::Receiver<Command>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
     wake: impl Fn(SessionEvent) + Send + 'static,
 ) {
-    let connected = match crate::connect_to_agent(&ticket).await {
+    let connected = tokio::select! {
+        biased;
+        _ = async { let _ = stop.wait_for(|stopped| *stopped).await; } => {
+            wake(SessionEvent::Telemetry(Event::State { state: SessionState::Disconnected, path: None, error: None }));
+            wake(SessionEvent::Ended);
+            return;
+        }
+        result = crate::connect_to_agent(&ticket) => result,
+    };
+    let connected = match connected {
         Ok(connected) => connected,
-        Err(error) => {
-            tracing::error!(%error, "could not connect to the resource");
+        Err(_) => {
+            tracing::error!("could not connect to the resource");
+            wake(SessionEvent::Telemetry(Event::State {
+                state: SessionState::Failed,
+                path: None,
+                error: Some("Could not establish the encrypted session".into()),
+            }));
             wake(SessionEvent::Ended);
             return;
         }
@@ -361,6 +743,13 @@ async fn pump(
         Ok(decoder) => decoder,
         Err(error) => {
             tracing::error!(%error, "no video decoder");
+            session.close(1, b"video decoder unavailable");
+            drop(gateway);
+            wake(SessionEvent::Telemetry(Event::State {
+                state: SessionState::Failed,
+                path: None,
+                error: Some("Native video decoder unavailable".into()),
+            }));
             wake(SessionEvent::Ended);
             return;
         }
@@ -369,13 +758,19 @@ async fn pump(
     // A session without sound is worth having; a session that refuses to
     // start because this machine has no output device is not. So playback
     // failing is a warning, not the end of the connection.
-    let mut playback = match crate::audio::Playback::start(2) {
-        Ok(playback) => Some(playback),
-        Err(error) => {
-            tracing::warn!(%error, "no audio output; this session will be silent");
-            None
+    let mut playback = if ticket.policy.audio {
+        match crate::audio::Playback::start(2) {
+            Ok(playback) => Some(playback),
+            Err(error) => {
+                tracing::warn!(%error, "no audio output; this session will be silent");
+                wake(SessionEvent::Notice("Audio output is unavailable".into()));
+                None
+            }
         }
+    } else {
+        None
     };
+    let mut clipboard_enabled = ticket.policy.clipboard;
 
     // The same engine the agent runs, mirrored. Both sides watch and both
     // sides write; what stops that being a loop is in the engine itself.
@@ -388,6 +783,9 @@ async fn pump(
             )),
             Err(error) => {
                 tracing::warn!(%error, "no clipboard on this machine; nothing will be shared");
+                wake(SessionEvent::Notice(
+                    "Local clipboard is unavailable".into(),
+                ));
                 None
             }
         }
@@ -395,10 +793,20 @@ async fn pump(
         None
     };
 
-    let mut transfers = ticket
-        .policy
-        .file_transfer
-        .then(|| nebula_agent::files::spawn(nebula_agent::files::default_downloads(), true));
+    let mut transfers = ticket.policy.file_transfer.then(|| {
+        nebula_agent::files::spawn_with_telemetry(nebula_agent::files::default_downloads(), true)
+    });
+    let mut active_transfers = std::collections::HashMap::<String, Event>::new();
+    let mut transfer_updates = transfers.as_mut().map(|worker| {
+        std::mem::replace(
+            &mut worker.telemetry,
+            tokio::sync::mpsc::unbounded_channel().1,
+        )
+    });
+    wake(SessionEvent::Settings {
+        audio: playback.is_some(),
+        clipboard: clipboard_enabled && clipboard.is_some(),
+    });
 
     tracing::info!(session = %ticket.session_id, "connected");
     let mut seq: u32 = 0;
@@ -416,6 +824,54 @@ async fn pump(
     loop {
         let recovery_at = order.recovery_deadline();
         tokio::select! {
+            _ = async { let _ = stop.wait_for(|stopped| *stopped).await; } => break,
+            command = control.recv() => {
+                let Some(command) = command else { break };
+                match command {
+                    Command::SetAudio { enabled } => {
+                        // Dropping the stream discards both buffered PCM and decoder history.
+                        playback = None;
+                        if enabled && ticket.policy.audio {
+                            match crate::audio::Playback::start(2) {
+                                Ok(output) => playback = Some(output),
+                                Err(error) => {
+                                    tracing::warn!(%error, "could not start audio playback");
+                                    wake(SessionEvent::Notice("Audio output is unavailable".into()));
+                                }
+                            }
+                        } else if enabled {
+                            wake(SessionEvent::Notice("Audio is not permitted by this session".into()));
+                        }
+                    }
+                    Command::SetClipboard { enabled } => {
+                        clipboard_enabled = enabled && ticket.policy.clipboard;
+                        if let Some(worker) = &mut clipboard {
+                            worker.set_enabled(clipboard_enabled);
+                        }
+                        if enabled && (!ticket.policy.clipboard || clipboard.is_none()) {
+                            wake(SessionEvent::Notice("Clipboard sharing is unavailable".into()));
+                        }
+                    }
+                    _ => {}
+                }
+                wake(SessionEvent::Settings {
+                    audio: playback.is_some(), clipboard: clipboard_enabled && clipboard.is_some(),
+                });
+            }
+            update = async {
+                match transfer_updates.as_mut() {
+                    Some(updates) => updates.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(update) = update {
+                    let event = transfer_event(update);
+                    remember_transfer(&mut active_transfers, &event);
+                    wake(SessionEvent::Telemetry(event));
+                } else {
+                    transfer_updates = None;
+                }
+            }
             changed = async {
                 match path_changes.as_mut() {
                     Some(changes) => changes.changed().await,
@@ -430,6 +886,7 @@ async fn pump(
                     let path = *changes.borrow();
                     tracing::info!(session = %ticket.session_id, ?path, "session media path changed");
                     wake(SessionEvent::Path(path.kind));
+                    wake(SessionEvent::Telemetry(metrics_event(&session, stats.size)));
                 }
                 if order.decode_failed().ask_for_keyframe
                     && !request_keyframe(&session, &mut seq).await
@@ -455,6 +912,7 @@ async fn pump(
                 // On a timer rather than per frame: a session receiving
                 // nothing at all is exactly the one worth knowing about, and
                 // it is the one that would never reach a per-frame report.
+                wake(SessionEvent::Telemetry(metrics_event(&session, stats.size)));
                 stats.report();
                 tracing::debug!(paths = ?session.path_stats(), "session path counters");
             }
@@ -469,7 +927,7 @@ async fn pump(
                     None => break,
                 };
                 if message.channel == Channel::Clipboard {
-                    if let Some(worker) = clipboard.as_ref() {
+                    if let Some(worker) = clipboard.as_ref().filter(|_| clipboard_enabled) {
                         match inbound_clipboard(message.header.kind, &message.payload) {
                             Ok(Some(message)) => worker.deliver(message),
                             Ok(None) => {}
@@ -514,7 +972,11 @@ async fn pump(
                     break;
                 }
                 let ask = decode_frames(decoder.as_mut(), &mut order, ready.frames, |picture| {
+                    let resized = stats.size != (picture.width, picture.height);
                     stats.decoded(picture.width, picture.height);
+                    if resized {
+                        wake(SessionEvent::Telemetry(metrics_event(&session, stats.size)));
+                    }
                     if let Ok(mut slot) = mailbox.lock() {
                         *slot = Some(picture);
                     }
@@ -535,6 +997,8 @@ async fn pump(
             } => {
                 let Some(action) = action else {
                     clipboard = None;
+                    wake(SessionEvent::Settings { audio: playback.is_some(), clipboard: false });
+                    wake(SessionEvent::Notice("Clipboard worker stopped".into()));
                     continue;
                 };
                 if let nebula_agent::clipboard::Action::Files(paths) = action {
@@ -542,6 +1006,7 @@ async fn pump(
                         for path in paths {
                             worker.deliver(nebula_agent::files::Inbound::Send(path));
                         }
+                        if !clipboard_enabled { continue; }
                     } else {
                         tracing::warn!("copied files cannot be sent: file transfer is unavailable");
                     }
@@ -582,6 +1047,7 @@ async fn pump(
 
             event = input.recv() => {
                 let Some(event) = event else { break };
+                if !ticket.policy.input { continue; }
                 // Drain whatever else is waiting and send it as one batch.
                 // Pointer moves in particular arrive far faster than they
                 // need to be delivered, and one message per move would spend
@@ -608,14 +1074,98 @@ async fn pump(
     }
 
     tracing::info!("the session ended");
-    wake(SessionEvent::Ended);
-    let _ = session
-        .send(Channel::Control, MsgHeader::new(MsgKind::Bye, seq, 0), b"")
-        .await;
+    if !matches!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            session.send(Channel::Control, MsgHeader::new(MsgKind::Bye, seq, 0), b"")
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
+        tracing::debug!("session goodbye could not be delivered");
+    }
     session.close(0, b"closed by the user");
     // Only now: while this is held the gateway believes the client is still
     // here, and saying goodbye properly matters more than releasing it early.
     drop(gateway);
+    if let Some(updates) = &mut transfer_updates {
+        while let Ok(update) = updates.try_recv() {
+            let event = transfer_event(update);
+            remember_transfer(&mut active_transfers, &event);
+            wake(SessionEvent::Telemetry(event));
+        }
+    }
+    for (_, mut event) in active_transfers {
+        if let Event::Transfer { state, error, .. } = &mut event {
+            *state = nebula_desktop_protocol::TransferState::Failed;
+            *error = Some("Session ended before transfer was confirmed".into());
+        }
+        wake(SessionEvent::Telemetry(event));
+    }
+    wake(SessionEvent::Telemetry(Event::State {
+        state: SessionState::Disconnected,
+        path: None,
+        error: None,
+    }));
+    wake(SessionEvent::Ended);
+}
+
+fn transfer_event(update: nebula_agent::files::TransferUpdate) -> Event {
+    use nebula_agent::files::{TransferDirection as Direction, TransferState as State};
+    let direction = match update.direction {
+        Direction::Send => nebula_desktop_protocol::TransferDirection::Send,
+        Direction::Receive => nebula_desktop_protocol::TransferDirection::Receive,
+    };
+    Event::Transfer {
+        id: format!(
+            "{}:{}",
+            if update.direction == Direction::Send {
+                "send"
+            } else {
+                "receive"
+            },
+            update.id
+        ),
+        name: update.name,
+        direction,
+        transferred: update.transferred,
+        total: update.total,
+        state: match update.state {
+            State::Offered => nebula_desktop_protocol::TransferState::Offered,
+            State::Transferring => nebula_desktop_protocol::TransferState::Transferring,
+            State::Complete => nebula_desktop_protocol::TransferState::Complete,
+            State::Failed => nebula_desktop_protocol::TransferState::Failed,
+        },
+        error: update.error,
+    }
+}
+
+fn metrics_event(session: &ndp_transport::Session, size: (u32, u32)) -> Event {
+    let rtt_ms = session
+        .path_stats()
+        .iter()
+        .find(|path| path.active)
+        .and_then(|path| path.end_to_end_rtt)
+        .map(|rtt| rtt.as_secs_f64() * 1000.0);
+    Event::Metrics {
+        rtt_ms,
+        width: size.0,
+        height: size.1,
+    }
+}
+
+fn remember_transfer(active: &mut std::collections::HashMap<String, Event>, event: &Event) {
+    if let Event::Transfer { id, state, .. } = event {
+        if matches!(
+            state,
+            nebula_desktop_protocol::TransferState::Complete
+                | nebula_desktop_protocol::TransferState::Failed
+        ) {
+            active.remove(id);
+        } else {
+            active.insert(id.clone(), event.clone());
+        }
+    }
 }
 
 async fn request_keyframe(session: &ndp_transport::Session, seq: &mut u32) -> bool {
@@ -695,7 +1245,9 @@ impl Stats {
             dropped = self.frames.saturating_sub(self.decoded),
             "video"
         );
+        let size = self.size;
         *self = Self::new();
+        self.size = size;
     }
 }
 
@@ -847,6 +1399,107 @@ fn inbound_clipboard(
 mod tests {
     use super::*;
     use ndp_proto::Modifiers;
+
+    async fn pump_before_handshake(stopped: bool) -> Vec<SessionEvent> {
+        let ticket = SessionTicket {
+            session_id: uuid::Uuid::nil(),
+            ticket: "SECRET_BEARER".into(),
+            gateway_addr: "localhost:1".into(),
+            gateway_pin: String::new(),
+            agent_key: "not-hex".into(),
+            policy: nebula_common::SessionPolicy::view_only(),
+        };
+        let (_input, input) = tokio::sync::mpsc::unbounded_channel();
+        let (_files, files) = tokio::sync::mpsc::channel(1);
+        let (_controls, controls) = tokio::sync::mpsc::channel(1);
+        let (_stop, stop) = tokio::sync::watch::channel(stopped);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::clone(&events);
+        pump(
+            ticket,
+            Arc::new(Mutex::new(None)),
+            input,
+            files,
+            controls,
+            stop,
+            move |event| received.lock().unwrap().push(event),
+        )
+        .await;
+        Arc::try_unwrap(events).ok().unwrap().into_inner().unwrap()
+    }
+
+    #[tokio::test]
+    async fn host_eof_cancels_before_handshake_without_connecting() {
+        let events = pump_before_handshake(true).await;
+        assert!(matches!(
+            events.as_slice(),
+            [
+                SessionEvent::Telemetry(Event::State {
+                    state: SessionState::Disconnected,
+                    ..
+                }),
+                SessionEvent::Ended,
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_handshake_never_emits_connected_or_the_ticket() {
+        let events = pump_before_handshake(false).await;
+        assert!(matches!(
+            events.as_slice(),
+            [
+                SessionEvent::Telemetry(Event::State {
+                    state: SessionState::Failed,
+                    ..
+                }),
+                SessionEvent::Ended,
+            ]
+        ));
+        for event in events {
+            if let SessionEvent::Telemetry(event) = event {
+                assert!(!serde_json::to_string(&event)
+                    .unwrap()
+                    .contains("SECRET_BEARER"));
+            }
+        }
+    }
+
+    #[test]
+    fn transfer_mapping_keeps_directions_distinct_and_only_terminal_events_finish() {
+        use nebula_agent::files::{TransferDirection, TransferState, TransferUpdate};
+        let update = |direction, state| {
+            transfer_event(TransferUpdate {
+                id: 1,
+                name: "file".into(),
+                direction,
+                transferred: 12,
+                total: 12,
+                state,
+                error: None,
+            })
+        };
+        let mut active = std::collections::HashMap::new();
+        remember_transfer(
+            &mut active,
+            &update(TransferDirection::Send, TransferState::Transferring),
+        );
+        remember_transfer(
+            &mut active,
+            &update(TransferDirection::Receive, TransferState::Offered),
+        );
+        assert_eq!(
+            active.len(),
+            2,
+            "all bytes reported is not a completion event"
+        );
+        remember_transfer(
+            &mut active,
+            &update(TransferDirection::Send, TransferState::Complete),
+        );
+        assert!(active.contains_key("receive:1"));
+        assert!(!active.contains_key("send:1"));
+    }
 
     #[test]
     fn decoder_failure_stops_the_ready_run_and_rate_limits_recovery() {

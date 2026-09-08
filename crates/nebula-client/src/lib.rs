@@ -10,7 +10,9 @@
 //! after that is media.
 
 pub mod audio;
+pub mod chrome;
 pub mod connect;
+pub mod desktop;
 mod direct;
 pub mod input;
 pub mod manager;
