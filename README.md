@@ -10,49 +10,42 @@ available. The gateway and relay cannot read session pixels, audio or keystrokes
 
 ## 当前产品界面
 
-桌面产品采用已确认的[四张设计稿](design/product-ui/README.md)。
 **管理主窗口负责资源和共享，独立 Session 窗口负责远程操作**，不是在管理页面里嵌入一块视频。
 
-| 界面 | 使用效果 | 设计稿 |
-| --- | --- | --- |
-| 我的资源 | 登录后看到自己的电脑和获得授权的应用；搜索、筛选、查看在线状态，已打开的连接可直接返回。 | [资源首页](design/product-ui/01-resources.svg) |
-| 本机共享 | 注册当前电脑、启停被控服务、查看系统权限，分别管理桌面和应用的访问授权。 | [本机共享](design/product-ui/02-local-sharing.svg) |
-| 设备详情 | 查看真实的设备信息、在线状态和允许使用的功能；所有者可以修改名称或移除设备。 | [设备详情](design/product-ui/03-device-details.svg) |
-| Session | 远程画面占据主区域，工具条提供声音、剪贴板、文件、全屏和断开操作；连接面板显示实际路径和测量数据。 | [会话窗口](design/product-ui/04-session.svg) |
+| 界面 | 使用效果 |
+| --- | --- |
+| 我的资源 | 登录后看到自己的电脑和获得授权的应用；搜索、筛选、查看在线状态，已打开的连接可直接返回。 |
+| 本机共享 | 注册当前电脑、启停被控服务、查看系统权限，分别管理桌面和应用的访问授权。 |
+| 设备详情 | 查看设备信息、在线状态和允许使用的功能；所有者可以修改名称或移除设备。 |
+| Session | 远程画面占据主区域，工具条提供声音、剪贴板、文件、全屏和断开操作；连接面板显示实际路径和测量数据。 |
 
-以下为 **2026-09-08 当前实现的运行截图**，不再以 SVG 设计稿代替实际界面。
-前三张来自管理前端的显式 `?demo=1` 入口，顶部保留演示标识：
-人名、电脑、应用、在线状态和权限均为示例，不是预置账号或真实设备状态。
-第四张来自实际原生 Session 窗口的离线预览，不连接远端，也不模拟远程画面。
+以下展示最新 UI，管理页面使用演示数据。
 
 ### 我的资源
 
 桌面与应用分开呈现，离线设备和暂不支持的单应用连接明确禁用。
 
-![当前管理界面：我的资源（演示数据）](design/product-ui/screenshots/01-resources.png)
+![我的资源](design/product-ui/screenshots/01-resources.png)
 
 ### 本机共享
 
 管理当前电脑的后台共享、桌面授权和应用发布配置；发布配置不代表已支持单应用串流。
 
-![当前管理界面：本机共享（演示数据）](design/product-ui/screenshots/02-local-sharing.png)
+![本机共享](design/product-ui/screenshots/02-local-sharing.png)
 
 ### 设备详情
 
 集中展示设备信息、连接入口、所有者操作和获准使用的功能。
 
-![当前管理界面：设备详情（演示数据）](design/product-ui/screenshots/03-device-details.png)
+![设备详情](design/product-ui/screenshots/03-device-details.png)
 
 ### 独立原生 Session
 
-工具条和连接面板直接渲染在原生窗口中。此图刻意展示连接失败状态：
-红色提示、不可用操作和空白画面均为真实离线预览行为，**不是连接成功的远程桌面截图**。
+工具条和连接面板直接渲染在原生窗口中，下图展示离线时的连接失败状态。
 
-![当前原生会话界面：离线预览与连接失败状态](design/product-ui/screenshots/04-session-offline.png)
+![独立 Session：连接失败状态](design/product-ui/screenshots/04-session-offline.png)
 
-原始四张 SVG 保留在[设计目录](design/product-ui/README.md)，用于比较布局和导入 Figma，
-不作为当前功能已全部实现的证明。正式界面从 Manager 和本地运行状态取数；
-未获系统权限、设备离线、连接失败、授权失效都有单独状态，不用样例数据掩盖错误。
+更多界面素材见[产品 UI 目录](design/product-ui/README.md)。
 
 ### 界面与运行边界
 

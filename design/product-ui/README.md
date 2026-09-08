@@ -1,29 +1,27 @@
 # NebulaDesk · 产品界面与设计基线
 
-这一版已确认，作为桌面产品的布局和操作基线。画稿与实现分开保存：
+本目录保存桌面产品的界面素材、布局和操作规范。
 管理前端位于 `apps/desktop-ui`，桌面宿主和原生会话位于 Rust crates。
 工程分层见[产品架构](../../docs/architecture/PRODUCT_ARCHITECTURE.md)。
 
-## 当前实现截图
+## 界面预览
 
-根 [README](../../README.md#当前产品界面) 直接展示以下四张运行截图。
-截图对应 2026-09-08 的实现；管理页由当前前端构建后在显式 `?demo=1` 模式下拍摄，
-保留顶部演示标识，不包含真实账号凭据或远程桌面内容。
+根 [README](../../README.md#当前产品界面) 展示以下四张界面图，更新于 2026-09-08。
+管理页面使用演示数据。
 
-| 文件 | 来源与状态 |
+| 文件 | 内容 |
 | --- | --- |
-| [01-resources.png](screenshots/01-resources.png) | 我的资源；管理前端运行截图，演示数据 |
-| [02-local-sharing.png](screenshots/02-local-sharing.png) | 本机共享；管理前端运行截图，演示数据 |
-| [03-device-details.png](screenshots/03-device-details.png) | 设备详情；管理前端运行截图，演示数据 |
-| [04-session-offline.png](screenshots/04-session-offline.png) | 原生 Session 离线预览；真实连接失败状态，没有远程画面 |
+| [01-resources.png](screenshots/01-resources.png) | 我的资源 |
+| [02-local-sharing.png](screenshots/02-local-sharing.png) | 本机共享 |
+| [03-device-details.png](screenshots/03-device-details.png) | 设备详情 |
+| [04-session-offline.png](screenshots/04-session-offline.png) | 独立 Session：连接失败状态 |
 
-更新 UI 后应重新拍摄受影响页面并同步根 README，不能只更新 SVG。
+更新 UI 后应同步本目录图片与根 README。
 管理页预览入口为 `npm --prefix apps/desktop-ui run dev` 后的
 `http://127.0.0.1:1420/?demo=1`；原生离线预览入口为
 `cargo run -p nebula-client --example session_preview`。
-离线预览不能当作连接成功或媒体传输的证明。
 
-## 原始批准画稿
+## SVG 素材
 
 | 文件 | 内容 |
 | --- | --- |
