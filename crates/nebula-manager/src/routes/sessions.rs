@@ -91,6 +91,13 @@ pub async fn create(
         return Err(ApiError::NotFound("resource"));
     };
 
+    if grant.kind != "DESKTOP" {
+        deny("app_streaming_unsupported").await;
+        return Err(ApiError::Conflict(
+            "isolated APP streaming is not supported; desktop fallback is forbidden".into(),
+        ));
+    }
+
     if grant.machine_status != "ONLINE" {
         deny("machine_offline").await;
         return Err(ApiError::Conflict(

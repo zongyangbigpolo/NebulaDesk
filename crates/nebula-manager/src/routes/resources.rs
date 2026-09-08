@@ -4,8 +4,8 @@
 //! offers *resources*: either its whole desktop, or one named application.
 //! An *entitlement* grants a user or a group access to one resource with a
 //! specific role and policy. A user's resource list is therefore the join of
-//! the two, which is exactly what the client renders as icons — with no
-//! notion of which machine anything runs on.
+//! the two, which is exactly what the client renders as icons. Applications
+//! hide their backing machines; desktops expose device details.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -19,6 +19,48 @@ use crate::audit::{Entry, Outcome};
 use crate::auth::extract::AuthUser;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+
+// Hold the machine lock until the mutation commits: an ownership transfer must
+// not race a former owner's publication or entitlement change.
+async fn lock_managed_machine(
+    db: &mut sqlx::PgConnection,
+    caller: &AuthUser,
+    machine: Uuid,
+) -> ApiResult<()> {
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM machines WHERE tenant_id = $1 AND id = $2
+         AND ($3 OR owner_user_id = $4) FOR SHARE",
+    )
+    .bind(caller.tenant.as_uuid())
+    .bind(machine)
+    .bind(caller.role.is_admin())
+    .bind(caller.id.as_uuid())
+    .fetch_optional(db)
+    .await?
+    .ok_or(ApiError::NotFound("machine"))?;
+    Ok(())
+}
+
+async fn lock_managed_resource(
+    db: &mut sqlx::PgConnection,
+    caller: &AuthUser,
+    resource: Uuid,
+) -> ApiResult<()> {
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT r.id FROM published_resources r
+         JOIN machines m ON m.id = r.machine_id AND m.tenant_id = r.tenant_id
+         WHERE r.tenant_id = $1 AND r.id = $2 AND ($3 OR m.owner_user_id = $4)
+         FOR SHARE OF m FOR UPDATE OF r",
+    )
+    .bind(caller.tenant.as_uuid())
+    .bind(resource)
+    .bind(caller.role.is_admin())
+    .bind(caller.id.as_uuid())
+    .fetch_optional(db)
+    .await?
+    .ok_or(ApiError::NotFound("resource"))?;
+    Ok(())
+}
 
 /// Request to publish a resource from a machine.
 #[derive(Debug, Deserialize)]
@@ -79,8 +121,6 @@ pub async fn publish(
     Path(machine): Path<Uuid>,
     Json(req): Json<CreateResource>,
 ) -> ApiResult<(StatusCode, Json<ResourceRow>)> {
-    caller.require_admin()?;
-
     let kind = req.kind.to_ascii_uppercase();
     // The schema enforces this too, but a clear 400 beats a constraint
     // violation surfacing as a 409.
@@ -99,6 +139,8 @@ pub async fn publish(
         other => return Err(ApiError::BadRequest(format!("unknown kind {other}"))),
     }
 
+    let mut tx = state.db.begin().await?;
+    lock_managed_machine(&mut tx, &caller, machine).await?;
     let id = ResourceId::new();
     let row = sqlx::query_as::<_, ResourceRow>(
         "INSERT INTO published_resources
@@ -123,7 +165,7 @@ pub async fn publish(
     } else {
         req.window_match.clone()
     })
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| match &e {
         sqlx::Error::Database(db) if db.is_unique_violation() => {
@@ -134,6 +176,7 @@ pub async fn publish(
     // The `WHERE EXISTS` guard returns no row when the machine is not ours,
     // which keeps another tenant's machine ids unguessable.
     .ok_or(ApiError::NotFound("machine"))?;
+    tx.commit().await?;
 
     Entry::new("resource.publish", Outcome::Allow)
         .tenant(caller.tenant)
@@ -152,16 +195,19 @@ pub async fn list_for_machine(
     caller: AuthUser,
     Path(machine): Path<Uuid>,
 ) -> ApiResult<Json<Vec<ResourceRow>>> {
-    caller.require_admin()?;
     let rows = sqlx::query_as::<_, ResourceRow>(
         "SELECT id, machine_id, kind, name, description, launch_path,
                 launch_args, working_dir, window_match, enabled, created_at
          FROM published_resources
          WHERE tenant_id = $1 AND machine_id = $2
+           AND ($3 OR EXISTS (SELECT 1 FROM machines m
+                WHERE m.id = machine_id AND m.tenant_id = $1 AND m.owner_user_id = $4))
          ORDER BY name",
     )
     .bind(caller.tenant.as_uuid())
     .bind(machine)
+    .bind(caller.role.is_admin())
+    .bind(caller.id.as_uuid())
     .fetch_all(&state.db)
     .await?;
     Ok(Json(rows))
@@ -182,6 +228,15 @@ pub struct UpdateResource {
     /// New window matcher.
     #[serde(default)]
     pub window_match: Option<serde_json::Value>,
+    /// Updated executable for an APP resource.
+    #[serde(default)]
+    pub launch_path: Option<String>,
+    /// Updated executable arguments.
+    #[serde(default)]
+    pub launch_args: Option<Vec<String>>,
+    /// Updated working directory.
+    #[serde(default)]
+    pub working_dir: Option<String>,
 }
 
 /// `PATCH /v1/resources/{id}`
@@ -191,13 +246,31 @@ pub async fn update(
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateResource>,
 ) -> ApiResult<StatusCode> {
-    caller.require_admin()?;
+    let mut tx = state.db.begin().await?;
+    lock_managed_resource(&mut tx, &caller, id).await?;
+    if let Some(path) = &req.launch_path {
+        let kind: String = sqlx::query_scalar(
+            "SELECT kind FROM published_resources WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(id)
+        .bind(caller.tenant.as_uuid())
+        .fetch_one(&mut *tx)
+        .await?;
+        if kind != "APP" || path.trim().is_empty() {
+            return Err(ApiError::BadRequest(
+                "launch_path must be nonempty and is only valid for APP resources".into(),
+            ));
+        }
+    }
     let result = sqlx::query(
         "UPDATE published_resources SET
            name         = COALESCE($3, name),
            description  = COALESCE($4, description),
            enabled      = COALESCE($5, enabled),
-           window_match = COALESCE($6, window_match)
+           window_match = COALESCE($6, window_match),
+           launch_path  = COALESCE($7, launch_path),
+           launch_args  = COALESCE($8, launch_args),
+           working_dir  = COALESCE($9, working_dir)
          WHERE id = $1 AND tenant_id = $2",
     )
     .bind(id)
@@ -206,11 +279,15 @@ pub async fn update(
     .bind(req.description.as_deref())
     .bind(req.enabled)
     .bind(req.window_match.as_ref())
-    .execute(&state.db)
+    .bind(req.launch_path.as_deref())
+    .bind(req.launch_args.as_ref())
+    .bind(req.working_dir.as_deref())
+    .execute(&mut *tx)
     .await?;
     if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("resource"));
     }
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -220,15 +297,17 @@ pub async fn delete(
     caller: AuthUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
-    caller.require_admin()?;
+    let mut tx = state.db.begin().await?;
+    lock_managed_resource(&mut tx, &caller, id).await?;
     let result = sqlx::query("DELETE FROM published_resources WHERE id = $1 AND tenant_id = $2")
         .bind(id)
         .bind(caller.tenant.as_uuid())
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
     if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("resource"));
     }
+    tx.commit().await?;
     Entry::new("resource.delete", Outcome::Allow)
         .tenant(caller.tenant)
         .actor(caller.id)
@@ -252,7 +331,7 @@ pub struct EntitledResource {
     /// Whether the machine is reachable right now.
     pub machine_status: String,
     /// The machine's operating system, so the client can hint at key mapping.
-    pub machine_os: String,
+    pub machine_os: Option<String>,
     /// Granted role.
     pub role: String,
     /// Whether clipboard sync is permitted.
@@ -261,6 +340,49 @@ pub struct EntitledResource {
     pub allow_file_transfer: bool,
     /// Whether audio is permitted.
     pub allow_audio: bool,
+    /// Display name of the publisher's current owner.
+    pub owner_name: Option<String>,
+    /// Only a desktop consumer is shown device ownership.
+    pub owned: bool,
+    /// Device metadata is deliberately absent for APP consumers.
+    pub machine_id: Option<Uuid>,
+    /// Desktop operating system.
+    pub os: Option<String>,
+    /// Desktop operating system version.
+    pub os_version: Option<String>,
+    /// Desktop agent's last contact.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub last_seen_at: Option<OffsetDateTime>,
+    /// Whether isolated streaming for this resource kind is implemented.
+    pub launch_supported: bool,
+}
+
+/// Consumer metadata plus the exact role-clamped admission policy.
+#[derive(Debug, Serialize)]
+pub struct ResourceView {
+    /// Backward-compatible resource fields.
+    #[serde(flatten)]
+    pub resource: EntitledResource,
+    /// Authoritative effective policy.
+    pub policy: SessionPolicy,
+}
+
+impl EntitledResource {
+    fn into_view(mut self) -> ApiResult<ResourceView> {
+        let (_, policy) = effective_policy(
+            &self.role,
+            self.allow_clipboard,
+            self.allow_file_transfer,
+            self.allow_audio,
+        )?;
+        self.allow_clipboard = policy.clipboard;
+        self.allow_file_transfer = policy.file_transfer;
+        self.allow_audio = policy.audio;
+        Ok(ResourceView {
+            resource: self,
+            policy,
+        })
+    }
 }
 
 /// How long a machine may go unheard-from before it counts as offline.
@@ -276,7 +398,8 @@ const LIVENESS_GRACE: &str = "90 seconds";
 fn live_status() -> String {
     format!(
         "CASE WHEN m.status = 'ONLINE'
-                   AND m.last_seen_at < now() - interval '{LIVENESS_GRACE}'
+                   AND (m.last_seen_at IS NULL OR
+                        m.last_seen_at < now() - interval '{LIVENESS_GRACE}')
               THEN 'OFFLINE' ELSE m.status END"
     )
 }
@@ -286,25 +409,47 @@ fn live_status() -> String {
 /// Kept in one place because both the resource list and the session-creation
 /// authorisation check must agree exactly; two subtly different queries here
 /// would be a privilege escalation waiting to happen.
+///
+/// Current machine owners have a full ADMIN session grant, not a directory
+/// role. Otherwise choose one complete grant: strongest role, direct before
+/// group, then stable id. Never assemble broader permissions from several rows.
 fn entitled_resources_sql() -> String {
     format!(
         "
-    SELECT r.id, r.kind, r.name, r.description,
-           {} AS machine_status, m.os AS machine_os,
-           e.role, e.allow_clipboard, e.allow_file_transfer, e.allow_audio
-    FROM entitlements e
-    JOIN published_resources r ON r.id = e.resource_id
-    JOIN machines m ON m.id = r.machine_id
-    WHERE e.tenant_id = $1
-      AND r.enabled
-      AND e.revoked_at IS NULL
-      AND (e.expires_at IS NULL OR e.expires_at > now())
-      AND (
-            (e.subject_kind = 'USER' AND e.subject_id = $2)
-         OR (e.subject_kind = 'GROUP' AND e.subject_id IN (
-                SELECT group_id FROM user_group_members
-                WHERE tenant_id = $1 AND user_id = $2))
-      )
+    SELECT r.id, r.kind, r.name, r.description, {} AS machine_status,
+           CASE WHEN r.kind = 'DESKTOP' THEN m.os END AS machine_os,
+           e.role, e.allow_clipboard, e.allow_file_transfer, e.allow_audio,
+           u.display_name AS owner_name,
+           (r.kind = 'DESKTOP' AND COALESCE(m.owner_user_id = $2, false)) AS owned,
+           CASE WHEN r.kind = 'DESKTOP' THEN m.id END AS machine_id,
+           CASE WHEN r.kind = 'DESKTOP' THEN m.os END AS os,
+           CASE WHEN r.kind = 'DESKTOP' THEN m.os_version END AS os_version,
+           CASE WHEN r.kind = 'DESKTOP' THEN m.last_seen_at END AS last_seen_at,
+           (r.kind = 'DESKTOP') AS launch_supported
+    FROM published_resources r
+    JOIN machines m ON m.id = r.machine_id AND m.tenant_id = r.tenant_id
+    LEFT JOIN users u ON u.id = m.owner_user_id AND u.tenant_id = m.tenant_id
+    JOIN LATERAL (
+        SELECT grants.* FROM (
+            SELECT e.id, e.role, e.allow_clipboard, e.allow_file_transfer, e.allow_audio,
+                   CASE WHEN e.subject_kind = 'USER' THEN 1 ELSE 2 END AS priority
+            FROM entitlements e
+            WHERE e.tenant_id = $1 AND e.resource_id = r.id
+              AND e.revoked_at IS NULL
+              AND (e.expires_at IS NULL OR e.expires_at > now())
+              AND ((e.subject_kind = 'USER' AND e.subject_id = $2)
+                OR (e.subject_kind = 'GROUP' AND e.subject_id IN (
+                    SELECT group_id FROM user_group_members
+                    WHERE tenant_id = $1 AND user_id = $2)))
+            UNION ALL
+            SELECT m.id, 'ADMIN', true, true, true, 0
+            WHERE m.owner_user_id = $2
+        ) grants
+        ORDER BY CASE grants.role WHEN 'ADMIN' THEN 0 WHEN 'CONTROLLER' THEN 1 ELSE 2 END,
+                 grants.priority, grants.id
+        LIMIT 1
+    ) e ON true
+    WHERE r.tenant_id = $1 AND r.enabled
 ",
         live_status()
     )
@@ -312,12 +457,12 @@ fn entitled_resources_sql() -> String {
 
 /// `GET /v1/resources`
 ///
-/// The client's home screen: everything this user may launch, with no
-/// indication of which machine serves it.
+/// The client's home screen: entitled resources, including unsupported APP
+/// publications clearly marked as not launchable.
 pub async fn list_mine(
     State(state): State<AppState>,
     caller: AuthUser,
-) -> ApiResult<Json<Vec<EntitledResource>>> {
+) -> ApiResult<Json<Vec<ResourceView>>> {
     let rows = sqlx::query_as::<_, EntitledResource>(&format!(
         "{} ORDER BY r.name",
         entitled_resources_sql()
@@ -326,12 +471,37 @@ pub async fn list_mine(
     .bind(caller.id.as_uuid())
     .fetch_all(&state.db)
     .await?;
-    Ok(Json(rows))
+    Ok(Json(
+        rows.into_iter()
+            .map(EntitledResource::into_view)
+            .collect::<ApiResult<Vec<_>>>()?,
+    ))
+}
+
+/// `GET /v1/resources/{id}`. Management metadata uses the separate owner API.
+pub async fn detail(
+    State(state): State<AppState>,
+    caller: AuthUser,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ResourceView>> {
+    let row = sqlx::query_as::<_, EntitledResource>(&format!(
+        "{} AND r.id = $3",
+        entitled_resources_sql()
+    ))
+    .bind(caller.tenant.as_uuid())
+    .bind(caller.id.as_uuid())
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(ApiError::NotFound("resource"))?;
+    Ok(Json(row.into_view()?))
 }
 
 /// The authorisation a user holds over one resource.
 #[derive(Debug, sqlx::FromRow)]
 pub struct ResolvedGrant {
+    /// Unsupported resource kinds must never fall back to desktop streaming.
+    pub kind: String,
     /// The machine serving the resource.
     pub machine_id: Uuid,
     /// Its connection status.
@@ -355,19 +525,33 @@ impl ResolvedGrant {
     /// misconfigured row — a VIEWER with `allow_clipboard` set — cannot widen
     /// access beyond the role.
     pub fn policy(&self) -> ApiResult<(SessionRole, SessionPolicy)> {
-        let role = SessionRole::from_db(&self.role)
-            .map_err(|_| ApiError::Internal(anyhow::anyhow!("bad role in entitlement")))?;
-        let ceiling = role.max_policy();
-        Ok((
-            role,
-            SessionPolicy {
-                clipboard: self.allow_clipboard && ceiling.clipboard,
-                file_transfer: self.allow_file_transfer && ceiling.file_transfer,
-                audio: self.allow_audio && ceiling.audio,
-                input: ceiling.input,
-            },
-        ))
+        effective_policy(
+            &self.role,
+            self.allow_clipboard,
+            self.allow_file_transfer,
+            self.allow_audio,
+        )
     }
+}
+
+fn effective_policy(
+    role: &str,
+    clipboard: bool,
+    file_transfer: bool,
+    audio: bool,
+) -> ApiResult<(SessionRole, SessionPolicy)> {
+    let role = SessionRole::from_db(role)
+        .map_err(|_| ApiError::Internal(anyhow::anyhow!("bad role in entitlement")))?;
+    let ceiling = role.max_policy();
+    Ok((
+        role,
+        SessionPolicy {
+            clipboard: clipboard && ceiling.clipboard,
+            file_transfer: file_transfer && ceiling.file_transfer,
+            audio: audio && ceiling.audio,
+            input: ceiling.input,
+        },
+    ))
 }
 
 /// Resolve what a user may do with one specific resource.
@@ -377,7 +561,7 @@ pub async fn resolve_grant(
     resource: Uuid,
 ) -> ApiResult<Option<ResolvedGrant>> {
     let sql = format!(
-        "SELECT m.id AS machine_id, {} AS machine_status, m.noise_public_key,
+        "SELECT g.kind, m.id AS machine_id, {} AS machine_status, m.noise_public_key,
                 g.role, g.allow_clipboard, g.allow_file_transfer, g.allow_audio
          FROM ({}) g
          JOIN published_resources r ON r.id = g.id
@@ -398,9 +582,20 @@ pub async fn resolve_grant(
 #[derive(Debug, Deserialize)]
 pub struct CreateEntitlement {
     /// `USER` or `GROUP`.
-    pub subject_kind: String,
+    #[serde(default)]
+    pub subject_kind: Option<String>,
     /// The user or group being granted access.
-    pub subject_id: Uuid,
+    #[serde(default)]
+    pub subject_id: Option<Uuid>,
+    /// Exact recipient email in the caller's tenant, instead of a subject id.
+    #[serde(default)]
+    pub email: Option<String>,
+    /// User-id shorthand, mutually exclusive with all other selectors.
+    #[serde(default)]
+    pub user_id: Option<Uuid>,
+    /// Group-id shorthand, mutually exclusive with all other selectors.
+    #[serde(default)]
+    pub group_id: Option<Uuid>,
     /// `VIEWER`, `CONTROLLER` or `ADMIN`.
     pub role: String,
     /// Permit clipboard synchronisation.
@@ -439,6 +634,12 @@ pub struct EntitlementRow {
     pub subject_kind: String,
     /// Subject identifier.
     pub subject_id: Uuid,
+    /// User recipient email, visible only to this resource's managers.
+    pub user_email: Option<String>,
+    /// User recipient display name, if the account still exists.
+    pub user_display_name: Option<String>,
+    /// Group recipient name, if the group still exists.
+    pub group_name: Option<String>,
     /// Granted role.
     pub role: String,
     /// Clipboard permission.
@@ -458,6 +659,19 @@ pub struct EntitlementRow {
     pub created_at: OffsetDateTime,
 }
 
+const ENTITLEMENT_SELECT: &str = "
+    SELECT e.id, e.resource_id, e.subject_kind, e.subject_id, e.role,
+           e.allow_clipboard, e.allow_file_transfer, e.allow_audio,
+           e.expires_at, e.revoked_at, e.created_at,
+           u.email AS user_email, u.display_name AS user_display_name,
+           g.name AS group_name
+    FROM entitlements e
+    LEFT JOIN users u ON e.subject_kind = 'USER'
+        AND u.id = e.subject_id AND u.tenant_id = e.tenant_id
+    LEFT JOIN user_groups g ON e.subject_kind = 'GROUP'
+        AND g.id = e.subject_id AND g.tenant_id = e.tenant_id
+";
+
 /// `POST /v1/resources/{id}/entitlements`
 pub async fn grant(
     State(state): State<AppState>,
@@ -465,17 +679,63 @@ pub async fn grant(
     Path(resource): Path<Uuid>,
     Json(req): Json<CreateEntitlement>,
 ) -> ApiResult<(StatusCode, Json<EntitlementRow>)> {
-    caller.require_admin()?;
-    let subject_kind = req.subject_kind.to_ascii_uppercase();
-    if !matches!(subject_kind.as_str(), "USER" | "GROUP") {
-        return Err(ApiError::BadRequest(
-            "subject_kind must be USER or GROUP".into(),
-        ));
+    let mut tx = state.db.begin().await?;
+    lock_managed_resource(&mut tx, &caller, resource).await?;
+    let (subject_kind, subject_id) =
+        match (
+            &req.email,
+            req.user_id,
+            req.group_id,
+            &req.subject_kind,
+            req.subject_id,
+        ) {
+            (Some(email), None, None, None, None) => {
+                let users = sqlx::query_scalar::<_, Uuid>(
+                    "SELECT id FROM users WHERE tenant_id = $1
+                 AND lower(email) = lower($2) AND NOT disabled LIMIT 2",
+                )
+                .bind(caller.tenant.as_uuid())
+                .bind(email.trim())
+                .fetch_all(&mut *tx)
+                .await?;
+                let user = match users.as_slice() {
+                    [user] => *user,
+                    [] => return Err(ApiError::NotFound("recipient")),
+                    _ => return Err(ApiError::Conflict("recipient email is ambiguous".into())),
+                };
+                ("USER".to_string(), user)
+            }
+            (None, Some(user), None, None, None) => ("USER".to_string(), user),
+            (None, None, Some(group), None, None) => ("GROUP".to_string(), group),
+            (None, None, None, Some(kind), Some(id)) => (kind.to_ascii_uppercase(), id),
+            _ => return Err(ApiError::BadRequest(
+                "provide exactly one of email, user_id, group_id, or subject_kind with subject_id"
+                    .into(),
+            )),
+        };
+    let subject_query = match subject_kind.as_str() {
+        "USER" => {
+            "SELECT EXISTS (SELECT 1 FROM users WHERE tenant_id = $1 AND id = $2 AND NOT disabled)"
+        }
+        "GROUP" => "SELECT EXISTS (SELECT 1 FROM user_groups WHERE tenant_id = $1 AND id = $2)",
+        _ => {
+            return Err(ApiError::BadRequest(
+                "subject_kind must be USER or GROUP".into(),
+            ))
+        }
+    };
+    if !sqlx::query_scalar::<_, bool>(subject_query)
+        .bind(caller.tenant.as_uuid())
+        .bind(subject_id)
+        .fetch_one(&mut *tx)
+        .await?
+    {
+        return Err(ApiError::NotFound("recipient"));
     }
     let role = SessionRole::from_db(&req.role.to_ascii_uppercase())
         .map_err(|_| ApiError::BadRequest(format!("unknown role {}", req.role)))?;
 
-    let row = sqlx::query_as::<_, EntitlementRow>(
+    let id = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO entitlements
            (id, tenant_id, resource_id, subject_kind, subject_id, role,
             allow_clipboard, allow_file_transfer, allow_audio, expires_at, created_by)
@@ -489,24 +749,30 @@ pub async fn grant(
            allow_audio         = EXCLUDED.allow_audio,
            expires_at          = EXCLUDED.expires_at,
            revoked_at          = NULL
-         RETURNING id, resource_id, subject_kind, subject_id, role,
-                   allow_clipboard, allow_file_transfer, allow_audio,
-                   expires_at, revoked_at, created_at",
+         RETURNING id",
     )
     .bind(Uuid::now_v7())
     .bind(caller.tenant.as_uuid())
     .bind(resource)
     .bind(&subject_kind)
-    .bind(req.subject_id)
+    .bind(subject_id)
     .bind(role.as_db())
     .bind(req.allow_clipboard)
     .bind(req.allow_file_transfer)
     .bind(req.allow_audio)
     .bind(req.expires_at)
     .bind(caller.id.as_uuid())
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or(ApiError::NotFound("resource"))?;
+    let row = sqlx::query_as::<_, EntitlementRow>(&format!(
+        "{ENTITLEMENT_SELECT} WHERE e.tenant_id = $1 AND e.id = $2"
+    ))
+    .bind(caller.tenant.as_uuid())
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
 
     Entry::new("entitlement.grant", Outcome::Allow)
         .tenant(caller.tenant)
@@ -515,7 +781,7 @@ pub async fn grant(
         .detail(serde_json::json!({
             "resource_id": resource,
             "subject_kind": subject_kind,
-            "subject_id": req.subject_id,
+            "subject_id": subject_id,
             "role": role.as_db(),
         }))
         .write(&state.db)
@@ -530,17 +796,20 @@ pub async fn list_grants(
     caller: AuthUser,
     Path(resource): Path<Uuid>,
 ) -> ApiResult<Json<Vec<EntitlementRow>>> {
-    caller.require_admin()?;
-    let rows = sqlx::query_as::<_, EntitlementRow>(
-        "SELECT id, resource_id, subject_kind, subject_id, role,
-                allow_clipboard, allow_file_transfer, allow_audio,
-                expires_at, revoked_at, created_at
-         FROM entitlements
-         WHERE tenant_id = $1 AND resource_id = $2
-         ORDER BY created_at",
-    )
+    let rows = sqlx::query_as::<_, EntitlementRow>(&format!(
+        "{ENTITLEMENT_SELECT}
+         WHERE e.tenant_id = $1 AND e.resource_id = $2
+           AND EXISTS (
+               SELECT 1 FROM published_resources r
+               JOIN machines m ON m.id = r.machine_id AND m.tenant_id = r.tenant_id
+               WHERE r.id = e.resource_id AND r.tenant_id = $1
+                 AND ($3 OR m.owner_user_id = $4))
+         ORDER BY e.created_at"
+    ))
     .bind(caller.tenant.as_uuid())
     .bind(resource)
+    .bind(caller.role.is_admin())
+    .bind(caller.id.as_uuid())
     .fetch_all(&state.db)
     .await?;
     Ok(Json(rows))
@@ -555,18 +824,28 @@ pub async fn revoke(
     caller: AuthUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
-    caller.require_admin()?;
+    let mut tx = state.db.begin().await?;
+    let resource = sqlx::query_scalar::<_, Uuid>(
+        "SELECT resource_id FROM entitlements WHERE id = $1 AND tenant_id = $2",
+    )
+    .bind(id)
+    .bind(caller.tenant.as_uuid())
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::NotFound("entitlement"))?;
+    lock_managed_resource(&mut tx, &caller, resource).await?;
     let result = sqlx::query(
         "UPDATE entitlements SET revoked_at = now()
          WHERE id = $1 AND tenant_id = $2 AND revoked_at IS NULL",
     )
     .bind(id)
     .bind(caller.tenant.as_uuid())
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
     if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("entitlement"));
     }
+    tx.commit().await?;
     Entry::new("entitlement.revoke", Outcome::Allow)
         .tenant(caller.tenant)
         .actor(caller.id)
@@ -582,6 +861,7 @@ mod tests {
 
     fn grant_with(role: &str, clipboard: bool, files: bool) -> ResolvedGrant {
         ResolvedGrant {
+            kind: "DESKTOP".into(),
             machine_id: Uuid::now_v7(),
             machine_status: "ONLINE".into(),
             noise_public_key: vec![0; 32],

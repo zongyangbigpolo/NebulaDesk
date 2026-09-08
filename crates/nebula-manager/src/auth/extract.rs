@@ -15,7 +15,7 @@ use super::tokens::parse_machine_credential;
 /// machine. An ADMIN may publish resources without being entitled to use any.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum UserRole {
-    /// Ordinary user: may list and launch what they are entitled to.
+    /// Ordinary user: manages owned devices and launches entitled resources.
     User,
     /// May manage users, machines, resources and entitlements.
     Admin,

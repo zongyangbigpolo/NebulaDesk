@@ -123,10 +123,14 @@ impl App {
 
     /// Enrol a machine and return `(machine id, credential)`.
     async fn machine(&self, name: &str) -> (Uuid, String) {
+        self.machine_as(name, &self.owner_token).await
+    }
+
+    async fn machine_as(&self, name: &str, caller: &str) -> (Uuid, String) {
         let token = self
             .post(
                 "/v1/machines/enrollment-tokens",
-                Some(&self.owner_token),
+                Some(caller),
                 json!({ "machine_name": name }),
             )
             .await
@@ -458,7 +462,14 @@ async fn a_plain_user_cannot_administer_the_tenant() {
     app.get("/v1/users", Some(&user_token))
         .await
         .expect_status(StatusCode::FORBIDDEN);
-    app.get("/v1/machines", Some(&user_token))
+    app.machine("not-owned-by-user").await;
+    let machines = app
+        .get("/v1/machines", Some(&user_token))
+        .await
+        .expect_status(StatusCode::OK)
+        .json();
+    assert!(machines.as_array().unwrap().is_empty());
+    app.get("/v1/groups", Some(&user_token))
         .await
         .expect_status(StatusCode::FORBIDDEN);
     app.post(
@@ -467,7 +478,7 @@ async fn a_plain_user_cannot_administer_the_tenant() {
         json!({}),
     )
     .await
-    .expect_status(StatusCode::FORBIDDEN);
+    .expect_status(StatusCode::BAD_REQUEST);
 
     // But their own identity and resource list are always available.
     app.get("/v1/auth/me", Some(&user_token))
@@ -652,7 +663,7 @@ async fn published_resources_must_be_coherent() {
 #[tokio::test]
 async fn a_user_only_sees_resources_they_are_entitled_to() {
     let app = App::start().await;
-    let (_, resource) = app.online_machine_with_desktop("mac-studio", None).await;
+    let (machine, resource) = app.online_machine_with_desktop("mac-studio", None).await;
     let (alice_id, alice) = app.user("alice@acme.test", "USER").await;
     let (_, bob) = app.user("bob@acme.test", "USER").await;
 
@@ -679,8 +690,9 @@ async fn a_user_only_sees_resources_they_are_entitled_to() {
     assert_eq!(mine.as_array().unwrap().len(), 1);
     assert_eq!(mine[0]["name"], "Desktop");
     assert_eq!(mine[0]["role"], "CONTROLLER");
-    // The point of the whole design: no machine identity is exposed.
-    assert!(mine[0].get("machine_id").is_none());
+    // Desktop details may identify the device; APP consumers remain independent.
+    assert_eq!(mine[0]["machine_id"], machine.to_string());
+    assert_eq!(mine[0]["owned"], false);
 
     // Bob was never granted anything.
     assert_eq!(list_len(&app, &bob).await, 0);
@@ -1080,6 +1092,690 @@ async fn list_len(app: &App, token: &str) -> usize {
         .as_array()
         .unwrap()
         .len()
+}
+
+#[tokio::test]
+async fn owners_manage_only_their_current_same_tenant_devices() {
+    let app = App::start().await;
+    let other = App::start().await;
+    let (alice_id, alice) = app.user("device-owner@acme.test", "USER").await;
+    let (_, bob) = app.user("nonowner@acme.test", "USER").await;
+    let (_, foreign_user) = other.user("foreign@acme.test", "USER").await;
+    let (machine, credential) = app.machine_as("owned", &alice).await;
+    app.machine("unassigned").await;
+    let path = format!("/v1/machines/{machine}");
+    let publications = format!("{path}/resources");
+
+    let mine = app
+        .get("/v1/machines", Some(&alice))
+        .await
+        .expect_status(StatusCode::OK)
+        .json();
+    assert_eq!(mine.as_array().unwrap().len(), 1);
+    assert_eq!(mine[0]["owner_user_id"], alice_id.to_string());
+    assert_eq!(mine[0]["id"], machine.to_string());
+    assert!(mine[0].get("credential_hash").is_none());
+    assert_eq!(
+        app.get("/v1/machines", Some(&app.owner_token))
+            .await
+            .json()
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    app.patch(&path, Some(&alice), json!({"name": "renamed"}))
+        .await
+        .expect_status(StatusCode::NO_CONTENT);
+    app.patch(&path, Some(&alice), json!({"name": "unassigned"}))
+        .await
+        .expect_status(StatusCode::CONFLICT);
+    app.patch(&path, Some(&alice), json!({"name": " "}))
+        .await
+        .expect_status(StatusCode::BAD_REQUEST);
+    app.patch(
+        &path,
+        Some(&alice),
+        json!({"name": "x", "owner_user_id": app.owner_id}),
+    )
+    .await
+    .expect_status(StatusCode::UNPROCESSABLE_ENTITY);
+    let resource = app
+        .post(
+            &publications,
+            Some(&alice),
+            json!({"kind": "DESKTOP", "name": "Desktop"}),
+        )
+        .await
+        .expect_status(StatusCode::CREATED)
+        .json();
+    let resource_path = format!("/v1/resources/{}", resource["id"].as_str().unwrap());
+    let grants = format!("{resource_path}/entitlements");
+    let entitlement = app
+        .post(
+            &grants,
+            Some(&alice),
+            json!({"email":"nonowner@acme.test", "role":"VIEWER"}),
+        )
+        .await
+        .expect_status(StatusCode::CREATED)
+        .json();
+    let revoke = format!("/v1/entitlements/{}", entitlement["id"].as_str().unwrap());
+
+    for outsider in [&bob, &foreign_user, &other.owner_token] {
+        app.patch(&path, Some(outsider), json!({"name":"stolen"}))
+            .await
+            .expect_status(StatusCode::NOT_FOUND);
+        app.delete(&path, Some(outsider))
+            .await
+            .expect_status(StatusCode::NOT_FOUND);
+        app.post(
+            &publications,
+            Some(outsider),
+            json!({"kind":"DESKTOP","name":"stolen"}),
+        )
+        .await
+        .expect_status(StatusCode::NOT_FOUND);
+        assert!(app
+            .get(&publications, Some(outsider))
+            .await
+            .expect_status(StatusCode::OK)
+            .json()
+            .as_array()
+            .unwrap()
+            .is_empty());
+        app.patch(&resource_path, Some(outsider), json!({"enabled":false}))
+            .await
+            .expect_status(StatusCode::NOT_FOUND);
+        app.delete(&resource_path, Some(outsider))
+            .await
+            .expect_status(StatusCode::NOT_FOUND);
+        app.post(
+            &grants,
+            Some(outsider),
+            json!({"email":"device-owner@acme.test","role":"ADMIN"}),
+        )
+        .await
+        .expect_status(StatusCode::NOT_FOUND);
+        assert!(app
+            .get(&grants, Some(outsider))
+            .await
+            .expect_status(StatusCode::OK)
+            .json()
+            .as_array()
+            .unwrap()
+            .is_empty());
+        app.delete(&revoke, Some(outsider))
+            .await
+            .expect_status(StatusCode::NOT_FOUND);
+    }
+    assert_eq!(
+        app.get(&publications, Some(&alice))
+            .await
+            .json()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        app.get(&grants, Some(&alice))
+            .await
+            .json()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    app.patch(
+        &resource_path,
+        Some(&alice),
+        json!({"name":"New desktop","description":"Updated"}),
+    )
+    .await
+    .expect_status(StatusCode::NO_CONTENT);
+    app.delete(&revoke, Some(&alice))
+        .await
+        .expect_status(StatusCode::NO_CONTENT);
+    app.delete(&resource_path, Some(&alice))
+        .await
+        .expect_status(StatusCode::NO_CONTENT);
+    app.delete(&path, Some(&alice))
+        .await
+        .expect_status(StatusCode::NO_CONTENT);
+    app.post("/v1/machines/heartbeat", None, json!({"status":"ONLINE"}))
+        .with_machine(&credential)
+        .await
+        .expect_status(StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn self_enrollment_is_pinned_to_self_and_default_region() {
+    let app = App::start().await;
+    let (owner, token) = app.user("self@acme.test", "USER").await;
+    for body in [
+        json!({}),
+        json!({"machine_name":""}),
+        json!({"machine_name":"  "}),
+    ] {
+        app.post("/v1/machines/enrollment-tokens", Some(&token), body)
+            .await
+            .expect_status(StatusCode::BAD_REQUEST);
+    }
+    for body in [
+        json!({"machine_name":"self","owner_user_id":app.owner_id}),
+        json!({"machine_name":"self","region":"default"}),
+        json!({"machine_name":"self","region":"elsewhere"}),
+    ] {
+        app.post("/v1/machines/enrollment-tokens", Some(&token), body)
+            .await
+            .expect_status(StatusCode::FORBIDDEN);
+    }
+    let enrollment = app
+        .post(
+            "/v1/machines/enrollment-tokens",
+            Some(&token),
+            json!({"machine_name":"self","owner_user_id":owner}),
+        )
+        .await
+        .expect_status(StatusCode::CREATED)
+        .json();
+    app.post("/v1/machines/enroll", None, json!({
+        "token":enrollment["token"],"name":"impostor","os":"MACOS","noise_public_key":hex::encode(rand_key())
+    })).await.expect_status(StatusCode::FORBIDDEN);
+    let machine = app.post("/v1/machines/enroll", None, json!({
+        "token":enrollment["token"],"name":"self","os":"MACOS","noise_public_key":hex::encode(rand_key())
+    })).await.expect_status(StatusCode::CREATED).json();
+    app.post("/v1/machines/enroll", None, json!({
+        "token":enrollment["token"],"name":"self","os":"MACOS","noise_public_key":hex::encode(rand_key())
+    })).await.expect_status(StatusCode::UNAUTHORIZED);
+    let pool = sqlx::PgPool::connect(&database_url()).await.unwrap();
+    let row: (Uuid, String) =
+        sqlx::query_as("SELECT owner_user_id, region FROM machines WHERE id=$1")
+            .bind(
+                machine["machine_id"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<Uuid>()
+                    .unwrap(),
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row, (owner, "default".to_string()));
+    app.patch(
+        &format!("/v1/users/{owner}"),
+        Some(&app.owner_token),
+        json!({"disabled":true}),
+    )
+    .await
+    .expect_status(StatusCode::NO_CONTENT);
+    app.post(
+        "/v1/machines/enrollment-tokens",
+        Some(&token),
+        json!({"machine_name":"disabled"}),
+    )
+    .await
+    .expect_status(StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn owner_grants_use_exact_enabled_same_tenant_recipients_without_directory_access() {
+    let app = App::start().await;
+    let other = App::start().await;
+    let (_, owner) = app.user("publisher@acme.test", "USER").await;
+    let (recipient_id, recipient) = app.user("Recipient@acme.test", "USER").await;
+    let (foreign_id, _) = other.user("Recipient@acme.test", "USER").await;
+    other.user("foreign-only@acme.test", "USER").await;
+    let (machine, _) = app.machine_as("grant-device", &owner).await;
+    let resource = app
+        .post(
+            &format!("/v1/machines/{machine}/resources"),
+            Some(&owner),
+            json!({"kind":"DESKTOP","name":"Desktop"}),
+        )
+        .await
+        .expect_status(StatusCode::CREATED)
+        .json();
+    let path = format!(
+        "/v1/resources/{}/entitlements",
+        resource["id"].as_str().unwrap()
+    );
+    let grant = app
+        .post(
+            &path,
+            Some(&owner),
+            json!({"email":" recipient@acme.test ","role":"CONTROLLER","allow_file_transfer":true}),
+        )
+        .await
+        .expect_status(StatusCode::CREATED)
+        .json();
+    assert_eq!(grant["subject_id"], recipient_id.to_string());
+    assert_eq!(grant["subject_kind"], "USER");
+    assert_eq!(grant["user_email"], "Recipient@acme.test");
+    assert_eq!(grant["user_display_name"], "Recipient@acme.test");
+    assert!(grant["group_name"].is_null());
+    let grants = app
+        .get(&path, Some(&owner))
+        .await
+        .expect_status(StatusCode::OK)
+        .json();
+    assert_eq!(grants[0], grant);
+    assert!(app
+        .get(&path, Some(&other.owner_token))
+        .await
+        .expect_status(StatusCode::OK)
+        .json()
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(list_len(&app, &recipient).await, 1);
+    for body in [
+        json!({"email":"Recipient","role":"ADMIN"}),
+        json!({"email":"foreign-only@acme.test","role":"ADMIN"}),
+        json!({"user_id":foreign_id,"role":"ADMIN"}),
+        json!({"subject_kind":"USER","subject_id":foreign_id,"role":"ADMIN"}),
+        json!({"group_id":Uuid::now_v7(),"role":"ADMIN"}),
+    ] {
+        app.post(&path, Some(&owner), body)
+            .await
+            .expect_status(StatusCode::NOT_FOUND);
+    }
+    for body in [
+        json!({"email":"Recipient@acme.test","user_id":recipient_id,"role":"ADMIN"}),
+        json!({"subject_kind":"USER","role":"ADMIN"}),
+    ] {
+        app.post(&path, Some(&owner), body)
+            .await
+            .expect_status(StatusCode::BAD_REQUEST);
+    }
+    app.post(
+        &path,
+        Some(&owner),
+        json!({"user_id":recipient_id,"role":"VIEWER"}),
+    )
+    .await
+    .expect_status(StatusCode::CREATED);
+    app.get("/v1/users", Some(&owner))
+        .await
+        .expect_status(StatusCode::FORBIDDEN);
+    app.get("/v1/groups", Some(&owner))
+        .await
+        .expect_status(StatusCode::FORBIDDEN);
+    app.delete(
+        &format!("/v1/entitlements/{}", grant["id"].as_str().unwrap()),
+        Some(&owner),
+    )
+    .await
+    .expect_status(StatusCode::NO_CONTENT);
+    assert_eq!(list_len(&app, &recipient).await, 0);
+    app.get(
+        &format!("/v1/resources/{}", resource["id"].as_str().unwrap()),
+        Some(&recipient),
+    )
+    .await
+    .expect_status(StatusCode::NOT_FOUND);
+    app.post(
+        "/v1/sessions",
+        Some(&recipient),
+        json!({"resource_id":resource["id"]}),
+    )
+    .await
+    .expect_status(StatusCode::NOT_FOUND);
+    app.patch(
+        &format!("/v1/users/{recipient_id}"),
+        Some(&app.owner_token),
+        json!({"disabled":true}),
+    )
+    .await
+    .expect_status(StatusCode::NO_CONTENT);
+    app.post(
+        &path,
+        Some(&owner),
+        json!({"email":"recipient@acme.test","role":"CONTROLLER"}),
+    )
+    .await
+    .expect_status(StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn owner_access_and_mutations_follow_live_ownership_not_stale_tokens() {
+    let app = App::start().await;
+    let (_, alice) = app.user("old-owner@acme.test", "USER").await;
+    let (bob_id, bob) = app.user("new-owner@acme.test", "USER").await;
+    let (gateway, _) = app.infrastructure().await;
+    let (machine, credential) = app.machine_as("transfer-owner", &alice).await;
+    app.post(
+        "/v1/machines/heartbeat",
+        None,
+        json!({"status":"ONLINE","gateway_id":gateway}),
+    )
+    .with_machine(&credential)
+    .await
+    .expect_status(StatusCode::NO_CONTENT);
+    let resource = app
+        .post(
+            &format!("/v1/machines/{machine}/resources"),
+            Some(&alice),
+            json!({"kind":"DESKTOP","name":"Desktop"}),
+        )
+        .await
+        .expect_status(StatusCode::CREATED)
+        .json();
+    let path = format!("/v1/resources/{}", resource["id"].as_str().unwrap());
+    let detail = app
+        .get(&path, Some(&alice))
+        .await
+        .expect_status(StatusCode::OK)
+        .json();
+    assert_eq!(detail["owned"], true);
+    assert_eq!(detail["owner_name"], "old-owner@acme.test");
+    assert_eq!(detail["role"], "ADMIN");
+    assert_eq!(
+        detail["policy"],
+        json!({"input":true,"audio":true,"clipboard":true,"file_transfer":true})
+    );
+    let ticket = app
+        .post(
+            "/v1/sessions",
+            Some(&alice),
+            json!({"resource_id":resource["id"]}),
+        )
+        .await
+        .expect_status(StatusCode::CREATED)
+        .json();
+    assert_eq!(ticket["policy"], detail["policy"]);
+    assert_eq!(
+        decode_claims(ticket["ticket"].as_str().unwrap())["policy"],
+        detail["policy"]
+    );
+    assert_eq!(
+        list_len(&app, &app.owner_token).await,
+        0,
+        "tenant admin is not automatically entitled"
+    );
+    app.post(
+        "/v1/sessions",
+        Some(&app.owner_token),
+        json!({"resource_id":resource["id"]}),
+    )
+    .await
+    .expect_status(StatusCode::NOT_FOUND);
+    let entitlement = app
+        .post(
+            &format!("{path}/entitlements"),
+            Some(&alice),
+            json!({"user_id":app.owner_id,"role":"VIEWER"}),
+        )
+        .await
+        .expect_status(StatusCode::CREATED)
+        .json();
+    let pool = sqlx::PgPool::connect(&database_url()).await.unwrap();
+    sqlx::query("UPDATE machines SET owner_user_id=$2 WHERE id=$1")
+        .bind(machine)
+        .bind(bob_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(list_len(&app, &alice).await, 0);
+    assert_eq!(list_len(&app, &bob).await, 1);
+    app.get(&path, Some(&alice))
+        .await
+        .expect_status(StatusCode::NOT_FOUND);
+    app.post(
+        "/v1/sessions",
+        Some(&alice),
+        json!({"resource_id":resource["id"]}),
+    )
+    .await
+    .expect_status(StatusCode::NOT_FOUND);
+    app.patch(
+        &format!("/v1/machines/{machine}"),
+        Some(&alice),
+        json!({"name":"stolen"}),
+    )
+    .await
+    .expect_status(StatusCode::NOT_FOUND);
+    app.delete(&format!("/v1/machines/{machine}"), Some(&alice))
+        .await
+        .expect_status(StatusCode::NOT_FOUND);
+    app.post(
+        &format!("/v1/machines/{machine}/resources"),
+        Some(&alice),
+        json!({"kind":"DESKTOP","name":"Stolen"}),
+    )
+    .await
+    .expect_status(StatusCode::NOT_FOUND);
+    app.patch(&path, Some(&alice), json!({"enabled":false}))
+        .await
+        .expect_status(StatusCode::NOT_FOUND);
+    app.delete(&path, Some(&alice))
+        .await
+        .expect_status(StatusCode::NOT_FOUND);
+    app.post(
+        &format!("{path}/entitlements"),
+        Some(&alice),
+        json!({"user_id":bob_id,"role":"ADMIN"}),
+    )
+    .await
+    .expect_status(StatusCode::NOT_FOUND);
+    app.delete(
+        &format!("/v1/entitlements/{}", entitlement["id"].as_str().unwrap()),
+        Some(&alice),
+    )
+    .await
+    .expect_status(StatusCode::NOT_FOUND);
+    app.patch(&path, Some(&bob), json!({"enabled":false}))
+        .await
+        .expect_status(StatusCode::NO_CONTENT);
+    assert_eq!(list_len(&app, &bob).await, 0);
+    app.post(
+        "/v1/sessions",
+        Some(&bob),
+        json!({"resource_id":resource["id"]}),
+    )
+    .await
+    .expect_status(StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn app_consumers_never_receive_launch_metadata_or_a_desktop_session() {
+    let app = App::start().await;
+    let (_, owner) = app.user("app-owner@acme.test", "USER").await;
+    let (_, consumer) = app.user("app-consumer@acme.test", "USER").await;
+    let (machine, credential) = app.machine_as("secret-machine", &owner).await;
+    app.post("/v1/machines/heartbeat", None, json!({"status":"ONLINE"}))
+        .with_machine(&credential)
+        .await
+        .expect_status(StatusCode::NO_CONTENT);
+    let publications = format!("/v1/machines/{machine}/resources");
+    let resource = app
+        .post(
+            &publications,
+            Some(&owner),
+            json!({
+                "kind":"APP","name":"Editor","launch_path":"/private/editor",
+                "launch_args":["--private-argument"],"working_dir":"/private/project",
+                "window_match":{"title":"private-title"}
+            }),
+        )
+        .await
+        .expect_status(StatusCode::CREATED)
+        .json();
+    let path = format!("/v1/resources/{}", resource["id"].as_str().unwrap());
+    app.patch(&path,Some(&owner),json!({"launch_path":"/private/new-editor","launch_args":["--new"],"working_dir":"/private/new"}))
+        .await.expect_status(StatusCode::NO_CONTENT);
+    let managed = app
+        .get(&publications, Some(&owner))
+        .await
+        .expect_status(StatusCode::OK)
+        .json();
+    assert_eq!(managed[0]["launch_path"], "/private/new-editor");
+    assert!(app
+        .get(&publications, Some(&consumer))
+        .await
+        .expect_status(StatusCode::OK)
+        .json()
+        .as_array()
+        .unwrap()
+        .is_empty());
+    app.patch(&path, Some(&consumer), json!({"launch_path":"/bin/sh"}))
+        .await
+        .expect_status(StatusCode::NOT_FOUND);
+    app.post(
+        &format!("{path}/entitlements"),
+        Some(&owner),
+        json!({"email":"app-consumer@acme.test","role":"CONTROLLER"}),
+    )
+    .await
+    .expect_status(StatusCode::CREATED);
+    for caller in [&consumer, &owner] {
+        let list = app
+            .get("/v1/resources", Some(caller))
+            .await
+            .expect_status(StatusCode::OK)
+            .json();
+        let detail = app
+            .get(&path, Some(caller))
+            .await
+            .expect_status(StatusCode::OK)
+            .json();
+        assert_eq!(list[0], detail);
+        assert_eq!(detail["owned"], false);
+        assert_eq!(detail["launch_supported"], false);
+        for field in [
+            "machine_id",
+            "os",
+            "machine_os",
+            "os_version",
+            "last_seen_at",
+        ] {
+            assert!(detail.get(field).unwrap().is_null(), "{field} leaked");
+        }
+        for field in [
+            "launch_path",
+            "launch_args",
+            "working_dir",
+            "window_match",
+            "capabilities",
+            "noise_public_key",
+        ] {
+            assert!(detail.get(field).is_none(), "{field} leaked");
+        }
+        let error = app
+            .post(
+                "/v1/sessions",
+                Some(caller),
+                json!({"resource_id":resource["id"]}),
+            )
+            .await
+            .expect_status(StatusCode::CONFLICT)
+            .json();
+        assert!(error.to_string().contains("isolated APP streaming"));
+    }
+    assert!(app
+        .get("/v1/machines", Some(&consumer))
+        .await
+        .json()
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let pool = sqlx::PgPool::connect(&database_url()).await.unwrap();
+    let sessions: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions WHERE resource_id=$1")
+        .bind(resource["id"].as_str().unwrap().parse::<Uuid>().unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(sessions, 0);
+}
+
+#[tokio::test]
+async fn overlapping_grants_resolve_once_and_match_list_detail_and_admission() {
+    let app = App::start().await;
+    let (gateway, _) = app.infrastructure().await;
+    let (_, resource) = app
+        .online_machine_with_desktop("overlapping", Some(gateway))
+        .await;
+    let (user_id, user) = app.user("multiple@acme.test", "USER").await;
+    let group = app
+        .post(
+            "/v1/groups",
+            Some(&app.owner_token),
+            json!({"name":"Group"}),
+        )
+        .await
+        .expect_status(StatusCode::CREATED)
+        .json();
+    app.post(
+        &format!("/v1/groups/{}/members", group["id"].as_str().unwrap()),
+        Some(&app.owner_token),
+        json!({"user_id":user_id}),
+    )
+    .await
+    .expect_status(StatusCode::NO_CONTENT);
+    let path = format!("/v1/resources/{resource}");
+    let group_grant = app.post(&format!("{path}/entitlements"),Some(&app.owner_token),json!({
+        "group_id":group["id"],"role":"CONTROLLER","allow_clipboard":false,"allow_file_transfer":true
+    })).await.expect_status(StatusCode::CREATED).json();
+    let direct = app.post(&format!("{path}/entitlements"),Some(&app.owner_token),json!({
+        "subject_kind":"USER","subject_id":user_id,"role":"CONTROLLER","allow_clipboard":true,"allow_file_transfer":false
+    })).await.expect_status(StatusCode::CREATED).json();
+    for (role, clipboard, files) in [
+        ("CONTROLLER", true, false),
+        ("CONTROLLER", false, true),
+        ("VIEWER", false, false),
+    ] {
+        let list = app
+            .get("/v1/resources", Some(&user))
+            .await
+            .expect_status(StatusCode::OK)
+            .json();
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        let detail = app
+            .get(&path, Some(&user))
+            .await
+            .expect_status(StatusCode::OK)
+            .json();
+        assert_eq!(detail, list[0]);
+        assert_eq!(detail["role"], role);
+        assert_eq!(detail["allow_clipboard"], clipboard);
+        assert_eq!(detail["allow_file_transfer"], files);
+        let session = app
+            .post("/v1/sessions", Some(&user), json!({"resource_id":resource}))
+            .await
+            .expect_status(StatusCode::CREATED)
+            .json();
+        assert_eq!(group_grant["group_name"], "Group");
+        assert!(group_grant["user_email"].is_null());
+        assert!(group_grant["user_display_name"].is_null());
+        assert_eq!(session["policy"], detail["policy"]);
+        assert_eq!(
+            decode_claims(session["ticket"].as_str().unwrap())["policy"],
+            detail["policy"]
+        );
+        if clipboard {
+            app.delete(
+                &format!("/v1/entitlements/{}", direct["id"].as_str().unwrap()),
+                Some(&app.owner_token),
+            )
+            .await
+            .expect_status(StatusCode::NO_CONTENT);
+        } else if files {
+            app.post(&format!("{path}/entitlements"),Some(&app.owner_token),json!({
+                "group_id":group["id"],"role":"VIEWER","allow_clipboard":true,"allow_file_transfer":true,"allow_audio":true
+            })).await.expect_status(StatusCode::CREATED);
+        }
+    }
+    app.delete(
+        &format!("/v1/entitlements/{}", group_grant["id"].as_str().unwrap()),
+        Some(&app.owner_token),
+    )
+    .await
+    .expect_status(StatusCode::NO_CONTENT);
+    assert_eq!(list_len(&app, &user).await, 0);
+    app.get(&path, Some(&user))
+        .await
+        .expect_status(StatusCode::NOT_FOUND);
 }
 
 /// Decode a JWT payload without verifying: the signature is checked by

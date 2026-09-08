@@ -119,7 +119,10 @@ pub fn router(state: AppState) -> Router {
             post(machines::create_enrollment_token),
         )
         .route("/v1/machines", get(machines::list_machines))
-        .route("/v1/machines/{id}", delete(machines::delete_machine))
+        .route(
+            "/v1/machines/{id}",
+            patch(machines::rename_machine).delete(machines::delete_machine),
+        )
         .route(
             "/v1/machines/{id}/resources",
             post(resources::publish).get(resources::list_for_machine),
@@ -127,7 +130,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/resources", get(resources::list_mine))
         .route(
             "/v1/resources/{id}",
-            patch(resources::update).delete(resources::delete),
+            get(resources::detail)
+                .patch(resources::update)
+                .delete(resources::delete),
         )
         .route(
             "/v1/resources/{id}/entitlements",

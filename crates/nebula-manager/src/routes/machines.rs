@@ -71,9 +71,42 @@ pub struct EnrollmentTokenCreated {
 pub async fn create_enrollment_token(
     State(state): State<AppState>,
     caller: AuthUser,
-    Json(req): Json<CreateEnrollmentToken>,
+    Json(mut req): Json<CreateEnrollmentToken>,
 ) -> ApiResult<(StatusCode, Json<EnrollmentTokenCreated>)> {
-    caller.require_admin()?;
+    if !caller.role.is_admin() {
+        if req
+            .owner_user_id
+            .is_some_and(|id| id != caller.id.as_uuid())
+            || req.region.is_some()
+        {
+            return Err(ApiError::Forbidden(
+                "self-service enrollment cannot choose another owner or a region".into(),
+            ));
+        }
+        if req
+            .machine_name
+            .as_deref()
+            .is_none_or(|name| name.trim().is_empty())
+        {
+            return Err(ApiError::BadRequest(
+                "self-service enrollment requires a nonempty machine_name".into(),
+            ));
+        }
+        req.owner_user_id = Some(caller.id.as_uuid());
+    }
+    if let Some(owner) = req.owner_user_id {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM users
+             WHERE tenant_id = $1 AND id = $2 AND NOT disabled)",
+        )
+        .bind(caller.tenant.as_uuid())
+        .bind(owner)
+        .fetch_one(&state.db)
+        .await?;
+        if !exists {
+            return Err(ApiError::NotFound("owner"));
+        }
+    }
     let ttl = match req.ttl_secs {
         Some(s) if s > 0 && s <= 30 * 24 * 3600 => Duration::seconds(s),
         Some(_) => {
@@ -297,7 +330,7 @@ pub async fn enroll(
     ))
 }
 
-/// A machine as seen by an administrator.
+/// A machine as seen by its owner or an administrator.
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct MachineRow {
     /// Identifier.
@@ -331,16 +364,66 @@ pub async fn list_machines(
     State(state): State<AppState>,
     caller: AuthUser,
 ) -> ApiResult<Json<Vec<MachineRow>>> {
-    caller.require_admin()?;
     let rows = sqlx::query_as::<_, MachineRow>(
         "SELECT id, name, os, os_version, arch, agent_version, status,
                 last_seen_at, owner_user_id, capabilities, created_at
-         FROM machines WHERE tenant_id = $1 ORDER BY name",
+         FROM machines WHERE tenant_id = $1 AND ($2 OR owner_user_id = $3)
+         ORDER BY name",
     )
     .bind(caller.tenant.as_uuid())
+    .bind(caller.role.is_admin())
+    .bind(caller.id.as_uuid())
     .fetch_all(&state.db)
     .await?;
     Ok(Json(rows))
+}
+
+/// Fields owners may change without changing device identity or placement.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenameMachine {
+    /// New display name.
+    pub name: String,
+}
+
+/// `PATCH /v1/machines/{id}`
+pub async fn rename_machine(
+    State(state): State<AppState>,
+    caller: AuthUser,
+    Path(id): Path<Uuid>,
+    Json(req): Json<RenameMachine>,
+) -> ApiResult<StatusCode> {
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::BadRequest("name must not be empty".into()));
+    }
+    let result = sqlx::query(
+        "UPDATE machines SET name = $4
+         WHERE id = $1 AND tenant_id = $2 AND ($3 OR owner_user_id = $5)",
+    )
+    .bind(id)
+    .bind(caller.tenant.as_uuid())
+    .bind(caller.role.is_admin())
+    .bind(name)
+    .bind(caller.id.as_uuid())
+    .execute(&state.db)
+    .await
+    .map_err(|e| match &e {
+        sqlx::Error::Database(db) if db.is_unique_violation() => {
+            ApiError::Conflict("a machine with that name already exists".into())
+        }
+        _ => ApiError::Database(e),
+    })?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::NotFound("machine"));
+    }
+    Entry::new("machine.rename", Outcome::Allow)
+        .tenant(caller.tenant)
+        .actor(caller.id)
+        .target("machine", id)
+        .write(&state.db)
+        .await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `DELETE /v1/machines/{id}`
@@ -349,12 +432,16 @@ pub async fn delete_machine(
     caller: AuthUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
-    caller.require_admin()?;
-    let result = sqlx::query("DELETE FROM machines WHERE id = $1 AND tenant_id = $2")
-        .bind(id)
-        .bind(caller.tenant.as_uuid())
-        .execute(&state.db)
-        .await?;
+    let result = sqlx::query(
+        "DELETE FROM machines WHERE id = $1 AND tenant_id = $2
+         AND ($3 OR owner_user_id = $4)",
+    )
+    .bind(id)
+    .bind(caller.tenant.as_uuid())
+    .bind(caller.role.is_admin())
+    .bind(caller.id.as_uuid())
+    .execute(&state.db)
+    .await?;
     if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("machine"));
     }
