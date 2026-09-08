@@ -144,6 +144,31 @@ Linux additionally needs WebKitGTK 4.1, Ayatana AppIndicator and librsvg
 development packages; Windows uses WebView2, and macOS uses the system WebKit.
 GUI bundling does not replace the native media prerequisites below.
 
+To build a self-contained macOS application for local use:
+
+```sh
+npm --prefix apps/desktop-host ci
+npm --prefix apps/desktop-host run build -- --debug --bundles app
+# target/debug/bundle/macos/NebulaDesk.app
+```
+
+Run the sidecar preparation above first. For a release bundle, prepare sidecars
+without `--debug` and build without `--debug`; signing and notarization still
+need the distributor's credentials. The installed bundle does not need Node
+or a running Vite server. Windows/Linux use their native Tauri bundle targets;
+see the [desktop host guide](crates/nebula-desktop/README.md).
+
+For the standalone management preview:
+
+```sh
+npm --prefix apps/desktop-ui run dev
+# Open http://127.0.0.1:1420/?demo=1 (labelled sample data, no real sessions).
+```
+
+The native window can also be inspected without connecting to a machine:
+`cargo run -p nebula-client --example session_preview`. It deliberately shows
+the disconnected/error state, not a simulated remote desktop.
+
 Tests that exercise the manager need PostgreSQL 16 or newer:
 
 ```sh
