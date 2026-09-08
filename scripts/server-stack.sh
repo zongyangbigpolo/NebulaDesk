@@ -19,6 +19,7 @@ DATABASE_URL="${NEBULA_DATABASE_URL:-postgres://nebula:nebuladev@127.0.0.1/nebul
 MANAGER_PORT="${NEBULA_MANAGER_PORT:-8080}"
 GATEWAY_PORT="${NEBULA_GATEWAY_PORT:-7443}"
 RELAY_PORT="${NEBULA_RELAY_PORT:-7444}"
+REGION="${NEBULA_REGION:-local}"
 BOOTSTRAP="${NEBULA_BOOTSTRAP_TOKEN:-devbootstrap}"
 TENANT="${NEBULA_TENANT:-acme}"
 EMAIL="${NEBULA_EMAIL:-me@acme.test}"
@@ -76,7 +77,7 @@ NEBULA_PAIR_SECRET="${PAIR}" "${BIN}/nebula-relay" \
   --advertise "${HOST}:${RELAY_PORT}" \
   --manager-url "http://127.0.0.1:${MANAGER_PORT}" \
   --bootstrap-secret "${BOOTSTRAP}" \
-  --region local >"${STATE}/relay.log" 2>&1 &
+  --region "${REGION}" >"${STATE}/relay.log" 2>&1 &
 echo $! >>"${STATE}/pids"
 wait_for relay "grep -q 'relay listening' ${STATE}/relay.log"
 
@@ -86,7 +87,7 @@ NEBULA_PAIR_SECRET="${PAIR}" "${BIN}/nebula-gateway" \
   --manager-url "http://127.0.0.1:${MANAGER_PORT}" \
   --ticket-issuer "${MANAGER_URL}" \
   --bootstrap-secret "${BOOTSTRAP}" \
-  --region local >"${STATE}/gateway.log" 2>&1 &
+  --region "${REGION}" >"${STATE}/gateway.log" 2>&1 &
 echo $! >>"${STATE}/pids"
 wait_for gateway "grep -q 'gateway listening' ${STATE}/gateway.log"
 

@@ -152,6 +152,12 @@ prints the commands for everything else:
 scripts/dev-stack.sh          # stop it again with: scripts/dev-stack.sh stop
 ```
 
+For a fresh stack using desktop self-enrollment, set
+`NEBULA_REGION=default scripts/dev-stack.sh`. Self-enrollment uses the
+operator-controlled `default` region; it cannot select another region.
+The scripts retain `local` as their default for existing CLI deployments.
+Use the same region when restarting an existing deployment.
+
 It binds to loopback by default. To let a second machine reach it, give it
 this machine's address on the network:
 

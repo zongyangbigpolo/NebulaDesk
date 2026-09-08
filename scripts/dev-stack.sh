@@ -22,6 +22,7 @@ DB="${NEBULA_DEV_DATABASE:-nebula_dev}"
 MANAGER_PORT="${NEBULA_MANAGER_PORT:-8080}"
 GATEWAY_PORT="${NEBULA_GATEWAY_PORT:-7443}"
 RELAY_PORT="${NEBULA_RELAY_PORT:-7444}"
+REGION="${NEBULA_REGION:-local}"
 BOOTSTRAP="${NEBULA_BOOTSTRAP_TOKEN:-devbootstrap}"
 TENANT="${NEBULA_TENANT:-acme}"
 EMAIL="${NEBULA_EMAIL:-me@acme.test}"
@@ -36,7 +37,8 @@ fi
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Release by default: a debug build's encoder is fast enough for a test on
 # one machine and visibly not fast enough across a network.
-bin="${root}/target/${NEBULA_PROFILE:-release}"
+PROFILE="${NEBULA_PROFILE:-release}"
+bin="${root}/target/${PROFILE}"
 
 stop() {
   if [[ -f "${STATE}/pids" ]]; then
@@ -59,7 +61,11 @@ command -v createdb >/dev/null || {
 }
 
 mkdir -p "${STATE}"
-cargo build --manifest-path "${root}/Cargo.toml" --workspace --bins
+case "${PROFILE}" in
+  release) cargo build --manifest-path "${root}/Cargo.toml" --workspace --bins --release ;;
+  debug) cargo build --manifest-path "${root}/Cargo.toml" --workspace --bins ;;
+  *) echo "NEBULA_PROFILE must be debug or release" >&2; exit 1 ;;
+esac
 
 createdb "${DB}" 2>/dev/null || true
 
@@ -100,7 +106,7 @@ NEBULA_PAIR_SECRET="${PAIR}" "${bin}/nebula-relay" \
   --advertise "${HOST}:${RELAY_PORT}" \
   --manager-url "${MANAGER_URL}" \
   --bootstrap-secret "${BOOTSTRAP}" \
-  --region local >"${STATE}/relay.log" 2>&1 &
+  --region "${REGION}" >"${STATE}/relay.log" 2>&1 &
 echo $! >>"${STATE}/pids"
 wait_for relay "grep -q 'relay listening' ${STATE}/relay.log"
 
@@ -109,7 +115,7 @@ NEBULA_PAIR_SECRET="${PAIR}" "${bin}/nebula-gateway" \
   --advertise "${HOST}:${GATEWAY_PORT}" \
   --manager-url "${MANAGER_URL}" \
   --bootstrap-secret "${BOOTSTRAP}" \
-  --region local >"${STATE}/gateway.log" 2>&1 &
+  --region "${REGION}" >"${STATE}/gateway.log" 2>&1 &
 echo $! >>"${STATE}/pids"
 wait_for gateway "grep -q 'gateway listening' ${STATE}/gateway.log"
 
@@ -140,7 +146,7 @@ cat <<EOF
     TOKEN=\$(curl -s -X POST ${MANAGER_URL}/v1/machines/enrollment-tokens \\
       -H "Authorization: Bearer \$(cat ${STATE}/token)" \\
       -H 'content-type: application/json' \\
-      -d "{\"machine_name\":\"\${MACHINE}\",\"region\":\"local\"}" |
+      -d "{\"machine_name\":\"\${MACHINE}\",\"region\":\"${REGION}\"}" |
       python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])')
     nebula-agent enroll --manager-url ${MANAGER_URL} --token "\${TOKEN}" \\
       --name "\${MACHINE}" --state ~/.nebula-agent
