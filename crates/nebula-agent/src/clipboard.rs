@@ -1093,10 +1093,17 @@ mod tests {
 
     #[test]
     fn copied_file_urls_preserve_unicode_and_reject_remote_or_nonfile_paths() {
-        assert_eq!(
-            local_file_url("file:///Users/local/a%20b-%E4%B8%AD.txt").unwrap(),
-            PathBuf::from("/Users/local/a b-中.txt")
+        #[cfg(windows)]
+        let (url, path) = (
+            "file:///C:/Users/local/a%20b-%E4%B8%AD.txt",
+            PathBuf::from(r"C:\Users\local\a b-中.txt"),
         );
+        #[cfg(not(windows))]
+        let (url, path) = (
+            "file:///Users/local/a%20b-%E4%B8%AD.txt",
+            PathBuf::from("/Users/local/a b-中.txt"),
+        );
+        assert_eq!(local_file_url(url).unwrap(), path);
         for value in [
             "file://other-host/Users/local/private.txt",
             "https://example.invalid/file.txt",
