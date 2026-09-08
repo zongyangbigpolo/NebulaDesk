@@ -127,7 +127,13 @@ impl Desktop {
             Request::Machines => value(self.api::<Vec<Machine>>(Method::GET, "v1/machines", None).await?),
             Request::CreateEnrollment { name } => {
                 nonempty(&name, 255)?;
-                value(self.api::<Enrollment>(Method::POST, "v1/machines/enrollment-tokens", Some(&json!({"machine_name":name}))).await?)
+                let (account, cancelled) = self.context().await?;
+                let body = enrollment_body(&name, account.user.id);
+                tokio::select! {
+                    biased;
+                    _ = cancelled.cancelled() => Err(DesktopError::cancelled()),
+                    enrollment = account.request::<Enrollment>(Method::POST, "v1/machines/enrollment-tokens", Some(&body)) => value(enrollment?),
+                }
             }
             Request::RenameMachine { machine_id, name } => {
                 nonempty(&name, 255)?;
@@ -178,10 +184,21 @@ impl Desktop {
                 };
                 // Serialize the final spawn with invalidation. A cancelled login cannot launch later.
                 let auth = self.auth.lock().await;
-                if cancelled.is_cancelled() { return Err(DesktopError::cancelled()); }
-                let session = self.sessions.start(resource, ticket).await?;
+                let id = ticket.session_id;
+                if cancelled.is_cancelled() {
+                    drop(auth);
+                    close_unused_ticket(account, id);
+                    return Err(DesktopError::cancelled());
+                }
+                let session = self.sessions.start(resource, ticket).await;
                 drop(auth);
-                value(session)
+                match session {
+                    Ok(session) => value(session),
+                    Err(error) => {
+                        close_unused_ticket(account, id);
+                        Err(error)
+                    }
+                }
             }
             Request::Sessions => value(self.sessions.list().await),
             Request::Transfers => value(self.sessions.transfers().await),
@@ -228,6 +245,21 @@ fn nonempty(input: &str, max: usize) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn enrollment_body(name: &str, user_id: uuid::Uuid) -> Value {
+    json!({"machine_name":name, "owner_user_id":user_id})
+}
+
+fn close_unused_ticket(account: Arc<Account>, session: uuid::Uuid) {
+    tokio::spawn(async move {
+        let result = account
+            .request::<Value>(Method::DELETE, &format!("v1/sessions/{session}"), None)
+            .await;
+        if result.is_err_and(|error| error.code != "unavailable") {
+            eprintln!("The unused session admission could not be closed remotely.");
+        }
+    });
 }
 
 fn value<T: Serialize>(value: T) -> Result<Value> {
@@ -280,5 +312,31 @@ mod tests {
         assert_eq!(generation, 2);
         assert!(desktop.context().await.is_err());
         assert!(desktop.sessions.list().await.is_empty());
+    }
+
+    #[test]
+    fn desktop_enrollment_always_assigns_the_current_account() {
+        let id = uuid::Uuid::new_v4();
+        let body = enrollment_body("Office Mac", id);
+        assert_eq!(body["owner_user_id"], id.to_string());
+        assert_eq!(body["machine_name"], "Office Mac");
+    }
+
+    #[test]
+    fn historical_grant_lifecycle_and_labels_survive_normalization() {
+        let user = uuid::Uuid::new_v4();
+        let grant: Entitlement = serde_json::from_value(json!({
+            "id":uuid::Uuid::new_v4(),"resource_id":uuid::Uuid::new_v4(),
+            "subject_kind":"USER","subject_id":user,"role":"VIEWER",
+            "allow_clipboard":false,"allow_audio":false,"allow_file_transfer":false,
+            "user_email":"person@example.test","user_display_name":"Person","group_name":null,
+            "expires_at":"2026-09-08T12:00:00Z","revoked_at":"2026-09-07T12:00:00Z"
+        }))
+        .unwrap();
+        let grant = value(Grant::from(grant)).unwrap();
+        assert_eq!(grant["user_id"], user.to_string());
+        assert_eq!(grant["user_email"], "person@example.test");
+        assert_eq!(grant["expires_at"], "2026-09-08T12:00:00Z");
+        assert_eq!(grant["revoked_at"], "2026-09-07T12:00:00Z");
     }
 }

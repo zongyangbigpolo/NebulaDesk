@@ -1,0 +1,8 @@
+[package]
+name = "nebula-desktop-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nebula-desktop = { path = ".." }

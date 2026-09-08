@@ -4167,6 +4167,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nebula-desktop-agent"
+version = "0.1.0"
+dependencies = [
+ "nebula-desktop",
+]
+
+[[package]]
 name = "nebula-desktop-protocol"
 version = "0.1.0"
 dependencies = [

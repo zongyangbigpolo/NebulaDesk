@@ -24,10 +24,21 @@ use crate::{
 struct Exiting {
     confirmed: AtomicBool,
     prompting: AtomicBool,
+    stop_prompting: AtomicBool,
 }
 
 #[tauri::command]
-async fn desktop_request(host: tauri::State<'_, Arc<Desktop>>, request: Request) -> Result<Value> {
+async fn desktop_request(
+    host: tauri::State<'_, Arc<Desktop>>,
+    exiting: tauri::State<'_, Exiting>,
+    request: Request,
+) -> Result<Value> {
+    if exiting.prompting.load(Ordering::SeqCst) {
+        return Err(DesktopError::new(
+            "closing",
+            "The application is preparing to exit.",
+        ));
+    }
     if let Request::OpenPermissionSettings { permission } = request {
         return open_permission_settings(permission)
             .await
@@ -192,6 +203,40 @@ fn request_exit(app: &tauri::AppHandle) {
     });
 }
 
+fn stop_local_sharing(app: &tauri::AppHandle) {
+    if app
+        .state::<Exiting>()
+        .stop_prompting
+        .swap(true, Ordering::SeqCst)
+    {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let confirmed = rfd::AsyncMessageDialog::new()
+            .set_title("Stop local sharing?")
+            .set_description("Stop the local Agent and end all incoming sessions to this computer? Your outgoing native sessions will remain open. No manager login is required.")
+            .set_buttons(rfd::MessageButtons::OkCancel)
+            .set_level(rfd::MessageLevel::Warning)
+            .show().await;
+        if confirmed == rfd::MessageDialogResult::Ok {
+            let host = app.state::<Arc<Desktop>>().inner().clone();
+            if let Err(error) = host.local_agent.set_enabled(false).await {
+                rfd::AsyncMessageDialog::new()
+                    .set_title("Local sharing could not be stopped")
+                    .set_description(error.message)
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_buttons(rfd::MessageButtons::Ok)
+                    .show()
+                    .await;
+            }
+        }
+        app.state::<Exiting>()
+            .stop_prompting
+            .store(false, Ordering::SeqCst);
+    });
+}
+
 pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let app = tauri::Builder::default()
         .manage(Exiting::default())
@@ -207,12 +252,19 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             };
             app.manage(Arc::new(Desktop::new(
                 sidecar("nebula-client")?,
-                sidecar("nebula-agent")?,
+                sidecar("nebula-desktop-agent")?,
                 path,
             )));
             let open = MenuItem::with_id(app, "open", "Open NebulaDesk", true, None::<&str>)?;
+            let stop = MenuItem::with_id(
+                app,
+                "stop-sharing",
+                "Stop local sharing",
+                true,
+                None::<&str>,
+            )?;
             let quit = MenuItem::with_id(app, "quit", "Quit NebulaDesk", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open, &quit])?;
+            let menu = Menu::with_items(app, &[&open, &stop, &quit])?;
             let pixels: Vec<u8> = (0..16 * 16).flat_map(|_| [41, 118, 255, 255]).collect();
             TrayIconBuilder::new()
                 .tooltip("NebulaDesk")
@@ -220,6 +272,7 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 .icon(tauri::image::Image::new_owned(pixels, 16, 16))
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "open" => show(app),
+                    "stop-sharing" => stop_local_sharing(app),
                     "quit" => request_exit(app),
                     _ => {}
                 })
@@ -247,7 +300,7 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         })
         .build(tauri::generate_context!())?;
     app.run(|app, event| {
-        if let tauri::RunEvent::ExitRequested { api, .. } = event {
+        if let tauri::RunEvent::ExitRequested { ref api, .. } = event {
             if !app.state::<Exiting>().confirmed.load(Ordering::SeqCst) {
                 api.prevent_exit();
                 request_exit(app);

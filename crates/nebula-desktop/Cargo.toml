@@ -1,5 +1,6 @@
 [package]
 name = "nebula-desktop"
+autobins = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,6 +8,7 @@ license.workspace = true
 [features]
 default = []
 gui = ["dep:tauri", "dep:tauri-build", "dep:rfd"]
+custom-protocol = ["tauri/custom-protocol"]
 
 [dependencies]
 tokio.workspace = true
@@ -28,7 +30,7 @@ tauri = { version = "2", optional = true, features = ["tray-icon"] }
 rfd = { version = "0.15", optional = true }
 
 [build-dependencies]
-tauri-build = { version = "2", optional = true }
+tauri-build = { version = "2", optional = true , features = [] }
 
 [dev-dependencies]
 http.workspace = true

@@ -178,10 +178,6 @@ impl Sessions {
                 loop {
                     tokio::select! {
                         _ = stop.cancelled() => break,
-                        status = child.wait() => {
-                            failed = !status.is_ok_and(|s| s.success());
-                            break;
-                        },
                         event = event_rx.recv() => {
                             match event {
                                 Some(Ok(Some(event))) => {

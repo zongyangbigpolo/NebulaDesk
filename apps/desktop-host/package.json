@@ -1,0 +1,13 @@
+{
+  "name": "@nebuladesk/desktop-host-build",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "cd ../../crates/nebula-desktop && tauri dev",
+    "build": "cd ../../crates/nebula-desktop && tauri build",
+    "icons": "tauri icon ../../crates/nebula-desktop/icon.svg -o ../../crates/nebula-desktop/icons"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.10.0"
+  }
+}

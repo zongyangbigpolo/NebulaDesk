@@ -13,6 +13,7 @@ members = [
     "crates/nebula-client",
     "crates/nebula-desktop-protocol",
     "crates/nebula-desktop",
+    "crates/nebula-desktop/agent-host",
 ]
 
 [workspace.package]

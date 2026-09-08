@@ -6,8 +6,8 @@
   "build": {
     "devUrl": "http://localhost:1420",
     "frontendDist": "../../apps/desktop-ui/dist",
-    "beforeDevCommand": "npm --prefix ../../apps/desktop-ui run dev",
-    "beforeBuildCommand": "npm --prefix ../../apps/desktop-ui run build",
+    "beforeDevCommand": { "script": "npm run dev", "cwd": "../../apps/desktop-ui" },
+    "beforeBuildCommand": { "script": "npm run build", "cwd": "../../apps/desktop-ui" },
     "features": ["gui"]
   },
   "app": {
@@ -30,9 +30,10 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "externalBin": ["binaries/nebula-client", "binaries/nebula-agent"],
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
+    "externalBin": ["binaries/nebula-client", "binaries/nebula-agent", "binaries/nebula-desktop-agent"],
     "macOS": {
-      "minimumSystemVersion": "12.0",
+      "minimumSystemVersion": "26.0",
       "infoPlist": "Info.plist"
     }
   }
