@@ -62,6 +62,18 @@ const PERMISSION: &str = "cannot capture this display. Grant Screen Recording to
      agent again. If it is already listed, remove it and re-add it: the permission is tied to \
      the exact binary and a rebuild invalidates it";
 
+/// Check the calling process's current grant without showing a consent prompt.
+#[must_use]
+pub fn screen_capture_allowed() -> bool {
+    // SAFETY: this public CoreGraphics query takes no arguments or ownership.
+    unsafe { CGPreflightScreenCaptureAccess() }
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGPreflightScreenCaptureAccess() -> bool;
+}
+
 /// Captures the main display and encodes it in hardware.
 pub struct MacVideo {
     keyframe: Arc<AtomicBool>,

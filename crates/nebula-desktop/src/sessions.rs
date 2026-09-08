@@ -1,7 +1,9 @@
 use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 
 pub use nebula_desktop_protocol::Command as ChildCommand;
-use nebula_desktop_protocol::{Event, Launch, LaunchTicket, MAX_LINE_BYTES, VERSION};
+use nebula_desktop_protocol::{
+    Event, Launch, LaunchTicket, MAX_LINE_BYTES, REMOTE_SESSION_ENDED, VERSION,
+};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -230,8 +232,13 @@ impl Sessions {
                     if entry.view.state.active() {
                         entry.view.state = state;
                         entry.view.path = path;
-                        entry.view.error =
-                            error.map(|_| "The native session reported an error.".into());
+                        entry.view.error = error.map(|message| {
+                            if message == REMOTE_SESSION_ENDED {
+                                REMOTE_SESSION_ENDED.into()
+                            } else {
+                                "The native session reported an error.".into()
+                            }
+                        });
                     }
                 }
                 !state.active()
@@ -292,7 +299,11 @@ impl Sessions {
                 } else {
                     SessionState::Disconnected
                 };
-                entry.view.error = failed.then(|| "The native session ended unexpectedly.".into());
+                if failed && entry.view.error.is_none() {
+                    entry.view.error = Some("The native session ended unexpectedly.".into());
+                } else if !failed {
+                    entry.view.error = None;
+                }
             }
         }
         for transfer in registry
@@ -424,6 +435,15 @@ mod tests {
 
     #[tokio::test]
     async fn active_resource_dedup_and_terminal_snapshot_are_truthful() {
+        terminal_snapshot("SECRET").await;
+    }
+
+    #[tokio::test]
+    async fn fixed_remote_failure_guidance_survives_child_exit() {
+        terminal_snapshot(REMOTE_SESSION_ENDED).await;
+    }
+
+    async fn terminal_snapshot(message: &str) {
         let sessions = Sessions::new("unused-client".into());
         let id = Uuid::new_v4();
         let resource = Uuid::new_v4();
@@ -456,7 +476,7 @@ mod tests {
                 Event::State {
                     state: SessionState::Failed,
                     path: None,
-                    error: Some("SECRET".into()),
+                    error: Some(message.into()),
                 },
             )
             .await;
@@ -477,6 +497,16 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains("SECRET"));
+        let expected = if message == REMOTE_SESSION_ENDED {
+            REMOTE_SESSION_ENDED
+        } else {
+            "The native session reported an error."
+        };
+        sessions.finish(id, true).await;
+        assert_eq!(sessions.list().await[0].error.as_deref(), Some(expected));
+        sessions.finish(id, false).await;
+        assert_eq!(sessions.list().await[0].state, SessionState::Failed);
+        assert_eq!(sessions.list().await[0].error.as_deref(), Some(expected));
         done.cancel();
         sessions.stop_all().await;
         assert!(sessions.list().await.is_empty());

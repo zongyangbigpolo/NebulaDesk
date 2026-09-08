@@ -509,7 +509,7 @@ const ACCESSIBILITY: &str = "cannot inject input. Grant Accessibility to this bi
      to the binary, so if it is already listed after a rebuild, remove it and add it again.";
 
 /// Whether this process may post events to the window server.
-fn trusted() -> bool {
+pub fn trusted() -> bool {
     // SAFETY: a plain query with no arguments and no ownership transfer.
     unsafe { AXIsProcessTrusted() }
 }

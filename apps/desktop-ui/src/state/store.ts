@@ -106,7 +106,14 @@ export class DesktopStore {
       const [sessions, transfers] = await Promise.all([
         this.api.request({ op: 'sessions' }), this.api.request({ op: 'transfers' }),
       ]);
-      if (epoch === this.epoch && read === this.reads) this.set({ sessions, transfers });
+      if (epoch === this.epoch && read === this.reads) {
+        const failures = sessions.filter(session => session.state === 'failed'
+          && !this.state.sessions.some(previous => previous.session_id === session.session_id && previous.state === 'failed'));
+        this.set({
+          sessions, transfers,
+          ...(failures.length ? { error: failures.map(session => `${session.name}：${session.error ?? '连接失败，请检查远端共享服务和系统权限。'}`).join('；') } : {}),
+        });
+      }
     } catch (error) {
       if (epoch === this.epoch && read === this.reads) this.set({ error: errorMessage(error) });
     } finally { this.pollPending = false; }

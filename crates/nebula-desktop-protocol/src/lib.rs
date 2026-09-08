@@ -7,6 +7,9 @@ pub const VERSION: u32 = 1;
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
 pub const MAX_FILES: usize = 64;
 
+/// Fixed, non-sensitive guidance; never substitute a peer's raw error text.
+pub const REMOTE_SESSION_ENDED: &str = "The remote session ended unexpectedly. Check screen recording permission and sharing on the remote computer.";
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {

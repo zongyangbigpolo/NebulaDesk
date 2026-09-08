@@ -47,6 +47,34 @@ pub struct Permissions {
     pub audio: &'static str,
 }
 
+impl Permissions {
+    fn current() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            use nebula_agent::platform::macos::{capture, input};
+            Self {
+                screen: if capture::screen_capture_allowed() {
+                    "granted"
+                } else {
+                    "denied"
+                },
+                input: if input::trusted() {
+                    "granted"
+                } else {
+                    "denied"
+                },
+                audio: "unknown",
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        Self {
+            screen: "unknown",
+            input: "unknown",
+            audio: "unknown",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct StoredIdentity {
     #[serde(flatten)]
@@ -137,11 +165,7 @@ impl LocalAgent {
                 .map(|m| m.name.clone()),
             running,
             connection_state: "unknown",
-            permissions: Permissions {
-                screen: "unknown",
-                input: "unknown",
-                audio: "unknown",
-            },
+            permissions: Permissions::current(),
             error: error.map(str::to_owned),
         })
     }
@@ -1005,8 +1029,16 @@ mod tests {
         let status = host.snapshot().await.unwrap();
         assert!(!status.enrolled && !status.running);
         assert_eq!(status.connection_state, "unknown");
-        assert_eq!(status.permissions.screen, "unknown");
-        assert_eq!(status.permissions.input, "unknown");
+        #[cfg(target_os = "macos")]
+        {
+            assert!(matches!(status.permissions.screen, "granted" | "denied"));
+            assert!(matches!(status.permissions.input, "granted" | "denied"));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(status.permissions.screen, "unknown");
+            assert_eq!(status.permissions.input, "unknown");
+        }
         assert_eq!(status.permissions.audio, "unknown");
         assert!(status.machine_id.is_none());
         assert!(status.error.is_none());

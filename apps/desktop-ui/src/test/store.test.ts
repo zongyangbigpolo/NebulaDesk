@@ -4,6 +4,26 @@ import { account, deferred, fakeApi, resource, session } from './fixtures';
 import type { Account, AuthenticationRequest, Resource, Session as SessionType } from '../api/types';
 
 describe('desktop state boundary', () => {
+  it('surfaces asynchronous session failures once and retains a dismissed notice as dismissed', async () => {
+    let current: SessionType[] = [session];
+    const store = new DesktopStore(fakeApi({ sessions: () => current }));
+    await store.start();
+    await store.poll();
+    expect(store.snapshot().error).toBeNull();
+    current = [{ ...session, state: 'failed', error: 'Check remote screen recording permission.' }];
+    await store.poll();
+    expect(store.snapshot().error).toContain('Check remote screen recording permission.');
+    expect(store.snapshot().error).toContain(session.name);
+    store.clearError();
+    await store.poll();
+    expect(store.snapshot().error).toBeNull();
+  });
+  it('does not show failure notices for a normal disconnection', async () => {
+    const store = new DesktopStore(fakeApi({ sessions: () => [{ ...session, state: 'disconnected' }] }));
+    await store.start();
+    await store.poll();
+    expect(store.snapshot().error).toBeNull();
+  });
   it.each(['register', 'accept_invitation'] as const)('isolates %s authentication from older private reads and refreshes after success', async op => {
     const oldPoll = deferred<SessionType[]>();
     const newAccount = deferred<Account>();
@@ -21,9 +41,10 @@ describe('desktop state boundary', () => {
     const pending = store.authenticate(request);
     expect(store.snapshot()).toMatchObject({ account: null, busy: true, sessions: [], resources: [], machines: [], host: null });
     expect(await store.authenticate(request)).toBe(false);
-    oldPoll.resolve([session]);
+    oldPoll.resolve([{ ...session, state: 'failed', error: 'old private failure' }]);
     await poll;
     expect(store.snapshot().sessions).toEqual([]);
+    expect(store.snapshot().error).toBeNull();
     newAccount.resolve(next);
     expect(await pending).toBe(true);
     expect(store.snapshot().account).toEqual(next);
@@ -59,11 +80,12 @@ describe('desktop state boundary', () => {
     const poll = store.poll();
     const refresh = store.refresh();
     await store.logout();
-    pending.resolve([session]); reads.resolve([resource]);
+    pending.resolve([{ ...session, state: 'failed', error: 'old private failure' }]); reads.resolve([resource]);
     await Promise.all([poll, refresh]);
     expect(store.snapshot().account).toBeNull();
     expect(store.snapshot().resources).toEqual([]);
     expect(store.snapshot().sessions).toEqual([]);
+    expect(store.snapshot().error ?? '').not.toContain('old private failure');
   });
   it('clears account-scoped data when host cleared auth before remote logout rejected', async () => {
     let signedIn = true;
@@ -107,8 +129,9 @@ describe('desktop state boundary', () => {
     await store.start();
     const poll = store.poll();
     await store.action(() => Promise.resolve(null), false);
-    pending.resolve([session]);
+    pending.resolve([{ ...session, state: 'failed', error: 'stale failure' }]);
     await poll;
     expect(store.snapshot().sessions).toEqual([]);
+    expect(store.snapshot().error).toBeNull();
   });
 });

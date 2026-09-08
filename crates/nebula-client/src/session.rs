@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ndp_proto::{Channel, InputEvent, InputKind, MouseButton, MsgFlags, MsgHeader, MsgKind};
-use nebula_desktop_protocol::{Command, ConnectionPath, Event, SessionState};
+use nebula_desktop_protocol::{Command, ConnectionPath, Event, SessionState, REMOTE_SESSION_ENDED};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -1147,6 +1147,8 @@ async fn pump(
         }
     }
 
+    // Snapshot intent before asynchronous cleanup can receive a late stop.
+    let completion = completion_state(*stop.borrow());
     tracing::info!("the session ended");
     if !matches!(
         tokio::time::timeout(
@@ -1158,7 +1160,7 @@ async fn pump(
     ) {
         tracing::debug!("session goodbye could not be delivered");
     }
-    session.close(0, b"closed by the user");
+    session.close(0, b"session ended");
     // Only now: while this is held the gateway believes the client is still
     // here, and saying goodbye properly matters more than releasing it early.
     drop(gateway);
@@ -1176,12 +1178,20 @@ async fn pump(
         }
         wake(SessionEvent::Telemetry(event));
     }
-    wake(SessionEvent::Telemetry(Event::State {
-        state: SessionState::Disconnected,
-        path: None,
-        error: None,
-    }));
+    wake(SessionEvent::Telemetry(completion));
     wake(SessionEvent::Ended);
+}
+
+fn completion_state(user_stopped: bool) -> Event {
+    Event::State {
+        state: if user_stopped {
+            SessionState::Disconnected
+        } else {
+            SessionState::Failed
+        },
+        path: None,
+        error: (!user_stopped).then(|| REMOTE_SESSION_ENDED.to_owned()),
+    }
 }
 
 fn transfer_event(update: nebula_agent::files::TransferUpdate) -> Event {
@@ -1473,6 +1483,23 @@ fn inbound_clipboard(
 mod tests {
     use super::*;
     use ndp_proto::Modifiers;
+
+    #[test]
+    fn unexpected_remote_end_is_not_reported_as_a_user_disconnect() {
+        assert!(matches!(
+            completion_state(false),
+            Event::State { state: SessionState::Failed, error: Some(message), .. }
+                if message == REMOTE_SESSION_ENDED
+        ));
+        assert!(matches!(
+            completion_state(true),
+            Event::State {
+                state: SessionState::Disconnected,
+                error: None,
+                ..
+            }
+        ));
+    }
 
     async fn pump_before_handshake(stopped: bool) -> Vec<SessionEvent> {
         let ticket = SessionTicket {

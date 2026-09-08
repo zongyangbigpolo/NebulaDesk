@@ -49,6 +49,18 @@ describe('desktop presentation and actions', () => {
     expect(api.calls).toContainEqual({ op: 'connect', resource_id: resource.id });
     expect(screen.queryByText('已连接')).not.toBeInTheDocument();
   });
+  it('keeps an asynchronous native failure visible after its window has closed', async () => {
+    const user = userEvent.setup();
+    let attempted = false;
+    const api = fakeApi({
+      connect: () => { attempted = true; return { ...session, state: 'connecting' }; },
+      sessions: () => attempted ? [{ ...session, state: 'failed', error: 'Check screen recording permission on the remote computer.' }] : [],
+    });
+    render(<App api={api} />);
+    await user.click(await screen.findByRole('button', { name: '打开' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Check screen recording permission on the remote computer.');
+    expect(screen.getByRole('alert')).toHaveTextContent(resource.name);
+  });
   it('keeps permissions unknown and requires stop confirmation', async () => {
     const user = userEvent.setup();
     const api = fakeApi({ set_host_enabled: () => ({ ...host, running: false }) });

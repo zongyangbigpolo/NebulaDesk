@@ -115,6 +115,11 @@ Unknown metadata stays null/unknown, never fabricated. Application publication
 metadata is supported separately from native single-application streaming;
 an unsupported APP must be clearly disabled, never silently open the whole desktop.
 Permission checks that cannot establish an OS grant report unknown, not granted.
+On macOS the desktop host queries Screen Recording and Accessibility through
+non-prompting public APIs in its own application context. A denied preflight
+means access is not currently granted, not that the user can never authorize it.
+Audio remains unknown unless independently established. Resource policy flags
+are permissions granted by the workspace, not evidence of an OS privacy grant.
 Normal resource consumers must not receive another user's executable paths.
 Grant roles are `VIEWER`, `CONTROLLER` and `ADMIN`; the last is a resource role,
 not tenant directory administration. VIEWER cannot enable any optional channel.
@@ -186,6 +191,11 @@ Events are tagged by `event`:
 The child emits connected only after the real handshake. Path changes update
 an already connected session. Final state and child exit both clear supervision;
 error output must be bounded and must not include launch secrets.
+Unexpected post-handshake termination is a failure, not a user disconnect.
+The management window keeps a one-time failure notice after the native window
+closes. Only fixed, recognized diagnostic text may pass through the host;
+raw peer/parser errors remain redacted, and child-exit cleanup must not replace
+an already recorded safe failure explanation.
 
 ## Manager additions
 
