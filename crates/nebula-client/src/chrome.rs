@@ -15,6 +15,21 @@ const INK: Color32 = Color32::from_rgb(53, 68, 83);
 const MUTED: Color32 = Color32::from_rgb(91, 113, 132);
 const GREEN: Color32 = Color32::from_rgb(60, 118, 93);
 
+fn status_colors(state: SessionState) -> (Color32, Color32) {
+    match state {
+        SessionState::Connected => (GREEN, Color32::from_rgb(228, 235, 231)),
+        SessionState::Connecting => (
+            Color32::from_rgb(133, 103, 51),
+            Color32::from_rgb(245, 241, 232),
+        ),
+        SessionState::Failed => (
+            Color32::from_rgb(146, 77, 72),
+            Color32::from_rgb(248, 232, 230),
+        ),
+        SessionState::Disconnected => (MUTED, Color32::from_rgb(226, 232, 237)),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Audio(bool),
@@ -260,12 +275,13 @@ impl Chrome {
                                 ui.label(RichText::new("/ NebulaDesk").size(11.0).color(MUTED));
                             }
                             if title_width > 180.0 {
+                                let (text, background) = status_colors(self.connection);
                                 egui::Frame::new()
-                                    .fill(Color32::from_rgb(228, 235, 231))
+                                    .fill(background)
                                     .corner_radius(12)
                                     .inner_margin(egui::Margin::symmetric(9, 4))
                                     .show(ui, |ui| {
-                                        ui.label(RichText::new(badge).size(11.0).color(GREEN));
+                                        ui.label(RichText::new(badge).size(11.0).color(text));
                                     });
                             }
                         },
@@ -288,8 +304,12 @@ impl Chrome {
                             .connected_at
                             .map_or(Duration::ZERO, |start| start.elapsed());
                     ui.label(
-                        RichText::new(format!("{} {}", self.path_label(), duration_label(elapsed)))
-                            .size(11.0),
+                        RichText::new(format!(
+                            "{} · {}",
+                            self.path_label(),
+                            duration_label(elapsed)
+                        ))
+                        .size(11.0),
                     );
                     ui.label(
                         RichText::new(if self.policy.input {
@@ -432,7 +452,7 @@ impl Chrome {
             });
         });
         ui.add_space(6.0);
-        ui.label(RichText::new(self.path_label()).color(GREEN));
+        ui.label(RichText::new(self.path_label()).color(status_colors(self.connection).0));
         if let Some(error) = &self.error {
             ui.label(RichText::new(error).color(Color32::from_rgb(146, 77, 72)));
         }
@@ -757,6 +777,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_connected_status_uses_the_ready_palette() {
+        assert_eq!(status_colors(SessionState::Connected).0, GREEN);
+        for state in [
+            SessionState::Connecting,
+            SessionState::Failed,
+            SessionState::Disconnected,
+        ] {
+            assert_ne!(status_colors(state).0, GREEN);
+            assert_ne!(
+                status_colors(state).1,
+                status_colors(SessionState::Connected).1
+            );
+        }
+        assert_eq!(
+            status_colors(SessionState::Failed).0,
+            Color32::from_rgb(146, 77, 72)
+        );
+        assert_eq!(status_colors(SessionState::Disconnected).0, MUTED);
+    }
+
+    #[test]
     fn viewport_and_pointer_guards_follow_scale_and_panel_visibility() {
         let mut chrome = Chrome::new("Desktop".into(), SessionPolicy::full());
         chrome.physical_size = (2560, 1640);
@@ -876,5 +917,44 @@ mod tests {
             assert!(actions.is_empty());
             assert!(panel_rect(size).max.y <= size.y - FOOTER_HEIGHT as f32);
         }
+    }
+
+    #[test]
+    fn local_tab_navigates_native_controls_without_a_remote_key() {
+        let focus = crate::input::KeyboardFocus::Chrome;
+        let mut chrome = Chrome::new("Desktop".into(), SessionPolicy::full());
+        chrome.context.set_fonts(FontDefinitions::default());
+        chrome.cjk = false;
+        let context = chrome.context.clone();
+        for tab in [false, true] {
+            let mut actions = Vec::new();
+            let mut input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 820.0))),
+                ..Default::default()
+            };
+            if tab && focus.accepts_chrome_keyboard() {
+                input.events.push(egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: Some(egui::Key::Tab),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            let _ = context.run(input, |ctx| chrome.ui(ctx, &mut actions));
+            assert!(
+                actions.is_empty(),
+                "Tab navigates rather than activating a control"
+            );
+        }
+        assert!(context.memory(|memory| memory.focused()).is_some());
+        assert!(focus
+            .remote_key(
+                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Tab),
+                winit::event::ElementState::Pressed,
+                None,
+                ndp_proto::Modifiers::NONE,
+            )
+            .is_none());
     }
 }

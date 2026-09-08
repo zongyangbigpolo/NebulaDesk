@@ -164,6 +164,8 @@ fn run_inner(ticket: SessionTicket, resource_name: &str, managed: bool) -> anyho
         commands: commands_rx,
         next_ui_tick: Instant::now(),
         closing_deadline: None,
+        keyboard_focus: input::KeyboardFocus::Remote,
+        window_focused: true,
     };
     let result = event_loop.run_app(&mut app);
 
@@ -220,6 +222,8 @@ struct App {
     commands: std::sync::mpsc::Receiver<Command>,
     next_ui_tick: Instant,
     closing_deadline: Option<Instant>,
+    keyboard_focus: input::KeyboardFocus,
+    window_focused: bool,
 }
 
 impl App {
@@ -243,11 +247,24 @@ impl App {
     }
 
     fn release_input(&mut self) {
+        self.release_held_input();
+        self.modifiers = ndp_proto::Modifiers::NONE;
+    }
+
+    fn release_held_input(&mut self) {
         for event in self.held.release_all() {
             self.send(event);
         }
-        self.modifiers = ndp_proto::Modifiers::NONE;
         self.pointer = None;
+    }
+
+    fn focus_keyboard(&mut self, focus: input::KeyboardFocus) {
+        if self.keyboard_focus != focus {
+            for event in self.keyboard_focus.switch_to(focus, &mut self.held) {
+                self.send(event);
+            }
+            self.pointer = None;
+        }
     }
 
     fn leave_pointer(&mut self) {
@@ -381,7 +398,8 @@ impl App {
                 if self.picker_open || !self.policy.file_transfer {
                     return;
                 }
-                self.release_input();
+                self.focus_keyboard(input::KeyboardFocus::Chrome);
+                self.release_held_input();
                 self.picker_open = true;
                 let proxy = self.proxy.clone();
                 if let Err(error) = std::thread::Builder::new()
@@ -531,11 +549,70 @@ impl ApplicationHandler<SessionEvent> for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
-        let consumed = self
-            .window
-            .as_ref()
-            .is_some_and(|window| self.chrome.on_window_event(window, &event));
+        if let WindowEvent::Focused(focused) = &event {
+            self.window_focused = *focused;
+        }
+        let keyboard = matches!(
+            event,
+            WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_)
+        );
+        let remote_at = self.cursor.and_then(|(x, y)| {
+            self.window.as_ref().and_then(|window| {
+                (!self.chrome.blocks_pointer(x, y, window.scale_factor()))
+                    .then(|| self.viewport.normalise(x, y))
+                    .flatten()
+            })
+        });
+        if matches!(
+            event,
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                ..
+            }
+        ) && !self.picker_open
+        {
+            if remote_at.is_some() {
+                self.focus_keyboard(input::KeyboardFocus::Remote);
+                self.pointer = remote_at;
+            } else if self.cursor.is_some_and(|(x, y)| {
+                self.window
+                    .as_ref()
+                    .is_some_and(|window| self.chrome.blocks_pointer(x, y, window.scale_factor()))
+            }) {
+                self.focus_keyboard(input::KeyboardFocus::Chrome);
+            }
+        }
+        if matches!(event, WindowEvent::MouseWheel { .. })
+            && self.cursor.is_some_and(|(x, y)| {
+                self.window
+                    .as_ref()
+                    .is_some_and(|window| self.chrome.blocks_pointer(x, y, window.scale_factor()))
+            })
+        {
+            self.focus_keyboard(input::KeyboardFocus::Chrome);
+        }
+        // egui-winit consumes Tab even without a focused widget. Remote keys
+        // must not enter egui at all; local keys must never fall through.
+        let consumed = if keyboard
+            && (!self.keyboard_focus.accepts_chrome_keyboard()
+                || !self.window_focused
+                || self.picker_open)
+        {
+            false
+        } else {
+            self.window
+                .as_ref()
+                .is_some_and(|window| self.chrome.on_window_event(window, &event))
+        };
+        if keyboard
+            && (self.keyboard_focus != input::KeyboardFocus::Remote
+                || !self.window_focused
+                || self.picker_open)
+        {
+            return;
+        }
         if consumed
+            && remote_at.is_none()
             && matches!(
                 event,
                 WindowEvent::MouseInput { .. }
@@ -544,7 +621,7 @@ impl ApplicationHandler<SessionEvent> for App {
                     | WindowEvent::Ime(_)
             )
         {
-            self.release_input();
+            self.release_held_input();
             return;
         }
         match event {
@@ -662,9 +739,6 @@ impl ApplicationHandler<SessionEvent> for App {
                 is_synthetic,
                 ..
             } => {
-                if self.picker_open || self.chrome.wants_keyboard_input() {
-                    return;
-                }
                 tracing::trace!(
                     target: "nebula_client::input_trace",
                     physical_key = ?event.physical_key,
@@ -677,7 +751,7 @@ impl ApplicationHandler<SessionEvent> for App {
                 if is_synthetic && event.state == ElementState::Pressed {
                     return;
                 }
-                if let Some(translated) = input::key(
+                if let Some(translated) = self.keyboard_focus.remote_key(
                     event.physical_key,
                     event.state,
                     event.text.as_deref(),

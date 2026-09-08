@@ -14,6 +14,41 @@ use ndp_proto::{InputEvent, InputKind, KeyCode as Hid, Modifiers, MouseButton};
 use winit::event::{ElementState, MouseButton as WinitButton, MouseScrollDelta};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 
+/// Keyboard ownership is independent of egui's transient capture flags.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeyboardFocus {
+    #[default]
+    Remote,
+    Chrome,
+}
+
+impl KeyboardFocus {
+    pub fn accepts_chrome_keyboard(self) -> bool {
+        self == Self::Chrome
+    }
+
+    pub fn switch_to(&mut self, focus: Self, held: &mut HeldInput) -> Vec<InputEvent> {
+        if *self == focus {
+            return Vec::new();
+        }
+        *self = focus;
+        held.release_all()
+    }
+
+    pub fn remote_key(
+        self,
+        physical: PhysicalKey,
+        state: ElementState,
+        text: Option<&str>,
+        modifiers: Modifiers,
+    ) -> Option<InputEvent> {
+        match self {
+            Self::Remote => key(physical, state, text, modifiers),
+            Self::Chrome => None,
+        }
+    }
+}
+
 /// Tracks only presses actually forwarded to the agent.
 #[derive(Default)]
 pub struct HeldInput {
@@ -403,6 +438,90 @@ pub fn hid(code: KeyCode) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_tab_and_shift_tab_bypass_chrome_and_keep_key_transitions() {
+        let focus = KeyboardFocus::default();
+        assert!(!focus.accepts_chrome_keyboard());
+        for modifiers in [Modifiers::NONE, Modifiers::SHIFT] {
+            let mut held = HeldInput::default();
+            for (state, kind) in [
+                (ElementState::Pressed, InputKind::KeyDown),
+                (ElementState::Released, InputKind::KeyUp),
+            ] {
+                let event = focus
+                    .remote_key(
+                        PhysicalKey::Code(KeyCode::Tab),
+                        state,
+                        Some("\t"),
+                        modifiers,
+                    )
+                    .unwrap();
+                let event = held.keyboard(event, false).unwrap();
+                assert_eq!(event.key, Hid(0x2b));
+                assert_eq!(event.kind, kind);
+                assert_eq!(event.modifiers, modifiers);
+            }
+            assert!(held.release_all().is_empty());
+        }
+    }
+
+    #[test]
+    fn local_keyboard_ownership_does_not_leak_tab_or_activation_keys() {
+        assert!(KeyboardFocus::Chrome.accepts_chrome_keyboard());
+        for code in [KeyCode::Tab, KeyCode::Enter, KeyCode::Space, KeyCode::KeyA] {
+            for modifiers in [Modifiers::NONE, Modifiers::SHIFT] {
+                assert!(KeyboardFocus::Chrome
+                    .remote_key(
+                        PhysicalKey::Code(code),
+                        ElementState::Pressed,
+                        None,
+                        modifiers,
+                    )
+                    .is_none());
+            }
+        }
+        assert!(KeyboardFocus::Remote
+            .remote_key(
+                PhysicalKey::Code(KeyCode::Tab),
+                ElementState::Pressed,
+                None,
+                Modifiers::SHIFT,
+            )
+            .is_some());
+    }
+
+    #[test]
+    fn switching_focus_releases_remote_holds_without_changing_modifier_snapshot() {
+        let mut focus = KeyboardFocus::Remote;
+        let mut held = HeldInput::default();
+        let modifiers = Modifiers::SHIFT;
+        for key in [KeyCode::ShiftLeft, KeyCode::Tab] {
+            let event = focus
+                .remote_key(
+                    PhysicalKey::Code(key),
+                    ElementState::Pressed,
+                    None,
+                    modifiers,
+                )
+                .unwrap();
+            held.keyboard(event, false).unwrap();
+        }
+        assert!(focus.switch_to(KeyboardFocus::Remote, &mut held).is_empty());
+        let releases = focus.switch_to(KeyboardFocus::Chrome, &mut held);
+        assert_eq!(releases.len(), 2);
+        assert!(releases.iter().all(|event| event.kind == InputKind::KeyUp));
+        assert!(focus.switch_to(KeyboardFocus::Remote, &mut held).is_empty());
+        let tab = focus
+            .remote_key(
+                PhysicalKey::Code(KeyCode::Tab),
+                ElementState::Pressed,
+                None,
+                modifiers,
+            )
+            .unwrap();
+        assert_eq!(tab.modifiers, Modifiers::SHIFT);
+    }
 
     #[test]
     fn held_buttons_turn_moves_into_drags_until_released() {
