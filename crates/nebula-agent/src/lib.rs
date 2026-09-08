@@ -99,7 +99,7 @@ impl Agent {
                     backoff = BACKOFF_MIN;
                 }
                 Err(error) => {
-                    tracing::warn!(%error, retry_in = ?backoff, "could not hold a control tunnel");
+                    tracing::warn!(error = %format!("{error:#}"), retry_in = ?backoff, "could not hold a control tunnel");
                 }
             }
             tokio::time::sleep(jitter(backoff)).await;

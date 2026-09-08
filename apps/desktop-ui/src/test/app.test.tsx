@@ -5,6 +5,25 @@ import { App } from '../App';
 import { account, fakeApi, host, resource, session } from './fixtures';
 
 describe('desktop presentation and actions', () => {
+  it('preserves exact login identifiers instead of applying native spelling corrections', async () => {
+    const user = userEvent.setup();
+    const api = fakeApi({ account: () => null, login: () => account });
+    render(<App api={api} />);
+    const tenant = await screen.findByLabelText('工作空间标识');
+    const form = tenant.closest('form');
+    expect(form).toHaveAttribute('autocapitalize', 'none');
+    expect(form).toHaveAttribute('autocorrect', 'off');
+    expect(form).toHaveAttribute('spellcheck', 'false');
+    await user.type(screen.getByLabelText('工作空间地址'), 'https://manager.test');
+    await user.type(tenant, 'acme');
+    await user.type(screen.getByLabelText('邮箱'), 'exact@example.test');
+    await user.type(screen.getByLabelText('密码'), 'test-password');
+    await user.click(screen.getByRole('button', { name: '登录' }));
+    await waitFor(() => expect(api.calls).toContainEqual({
+      op: 'login', manager_url: 'https://manager.test', tenant: 'acme',
+      email: 'exact@example.test', password: 'test-password', allow_insecure_http: false,
+    }));
+  });
   it('renders empty resources without fabricated examples', async () => {
     render(<App api={fakeApi({ resources: () => [] })} />);
     expect(await screen.findByText('还没有可连接的资源')).toBeInTheDocument();
