@@ -53,6 +53,10 @@ opt-in for login/enrollment. Grant roles are `VIEWER`, `CONTROLLER`, `ADMIN`.
 versions reject stale responses after logout or mutations. Component queries
 ignore replies after unmount/selection changes. Login passwords are cleared on
 submit; enrollment tokens remain transient. No local/session storage is used.
+Even if logout rejects, the UI clears account-scoped state and returns to login
+with a warning: the host may have already cleared local authentication before a
+remote revocation timeout, while an IPC failure leaves the actual host outcome
+unconfirmed. A failed logout is never presented as successful server revocation.
 
 `src/ui` contains typed view components and dialogs without Tauri imports;
 `App.tsx` wires intent callbacks to the API/store. Locally bundled Lucide SVGs
@@ -69,6 +73,13 @@ The layout uses the actual native frame, not simulated traffic lights.
   metadata, with `user_id`/`group_id` as fallback for older replies. New grants
   use an exact complete email, not a directory. VIEWER disallows all capability
   flags; the form resets and disables them when switching to this role.
+  Optional `revoked_at` and `expires_at` identify inactive historical rows.
+  Revoked/expired grants cannot be revoked again in the UI, and expiration is
+  reevaluated while the access dialog is open. The demo preserves revoked rows.
+- Revoking grants, disabling resources and removing devices block future
+  admission, not already established sessions. The affected dialogs explain
+  that immediately interrupting existing inbound sessions requires stopping
+  sharing on the controlled computer.
 - Recent use comes from observed session history, not fabricated timestamps.
   The contract has no persisted recents or host access audit endpoint.
 - No remote image/audio payload, bearer token, session ticket or executable path

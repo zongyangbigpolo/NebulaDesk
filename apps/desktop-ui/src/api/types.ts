@@ -18,6 +18,7 @@ export type Grant = {
   id: string; resource_id: string; user_id: string | null; group_id: string | null;
   role: string; allow_clipboard: boolean; allow_file_transfer: boolean; allow_audio: boolean;
   user_email?: string | null; user_display_name?: string | null; group_name?: string | null;
+  revoked_at?: string | null; expires_at?: string | null;
 };
 export type Session = {
   session_id: string; resource_id: string; name: string;

@@ -10,3 +10,4 @@ dialog{border:1px solid #dce3eb;border-radius:14px;padding:0;width:min(540px,cal
 .demo-badge+.app-shell{height:calc(100dvh - 26px)}
 .demo-badge+.login-page{min-height:calc(100dvh - 26px)}
 form select{min-height:38px}
+.grant-inactive strong{color:#7c8894}

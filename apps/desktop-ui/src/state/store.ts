@@ -63,7 +63,12 @@ export class DesktopStore {
       if (epoch === this.epoch) { this.state = { ...empty(), ready: true }; this.set({}); }
       return true;
     } catch (error) {
-      if (epoch === this.epoch) this.set({ error: errorMessage(error) });
+      if (epoch === this.epoch) {
+        this.set({
+          ...empty(), ready: true, busy: true,
+          error: `已清除当前界面的账号数据，但未能确认退出操作或服务器会话撤销。${errorMessage(error)}`,
+        });
+      }
       return false;
     } finally {
       this.mutationPending = false;

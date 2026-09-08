@@ -1,9 +1,9 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import { ActionDialog, type DialogState } from '../ui/dialogs';
 import { account, fakeApi, machine, type Handlers } from './fixtures';
-import type { PublishedResource } from '../api/types';
+import type { Grant, PublishedResource } from '../api/types';
 
 const published: PublishedResource = { id: 'published', machine_id: machine.id, kind: 'APP', name: '测试应用', description: '原描述', enabled: true, launch_path: '/Applications/Example.app' };
 function mount(dialog: DialogState, handlers: Handlers, success = true) {
@@ -31,6 +31,7 @@ describe('management command dialogs', () => {
     await user.clear(screen.getByLabelText('资源名称'));
     await user.type(screen.getByLabelText('资源名称'), '新名称');
     await user.click(screen.getByLabelText('允许发布此资源'));
+    expect(screen.getByText(/已建立的连接不会立即断开/)).toBeVisible();
     await user.click(screen.getByRole('button', { name: '保存' }));
     expect(api.calls).toContainEqual({ op: 'update_resource', resource_id: published.id, changes: { name: '新名称', description: '原描述', enabled: false } });
   });
@@ -44,20 +45,46 @@ describe('management command dialogs', () => {
   it('only removes a machine after explicit confirmation', async () => {
     const user = userEvent.setup();
     const { api } = mount({ kind: 'remove', machine }, { remove_machine: () => null });
+    expect(screen.getByText(/已建立的连接不会立即断开/)).toBeVisible();
     expect(api.calls).toEqual([]);
     await user.click(screen.getByRole('button', { name: '确认移除' }));
     expect(api.calls).toContainEqual({ op: 'remove_machine', machine_id: machine.id });
   });
   it('confirms and revokes the exact entitlement id', async () => {
     const user = userEvent.setup();
+    let revokedAt: string | null = null;
     const { api } = mount({ kind: 'access', resourceId: published.id, name: published.name }, {
-      grants: () => [{ id: 'entitlement', resource_id: published.id, user_id: 'recipient', group_id: null, role: 'VIEWER', allow_audio: false, allow_clipboard: false, allow_file_transfer: false }],
-      revoke_access: () => null,
+      grants: () => [{ id: 'entitlement', resource_id: published.id, user_id: 'recipient', group_id: null, role: 'VIEWER', allow_audio: false, allow_clipboard: false, allow_file_transfer: false, revoked_at: revokedAt, expires_at: null }],
+      revoke_access: () => { revokedAt = new Date().toISOString(); return null; },
     });
     await user.click(await screen.findByRole('button', { name: '撤销' }));
+    expect(screen.getByText(/已建立的连接不会立即断开/)).toBeVisible();
     expect(api.calls.some(r => r.op === 'revoke_access')).toBe(false);
     await user.click(screen.getByRole('button', { name: '确认撤销' }));
     await waitFor(() => expect(api.calls).toContainEqual({ op: 'revoke_access', entitlement_id: 'entitlement' }));
+    expect(await screen.findByText('已撤销')).toBeVisible();
+    expect(screen.getByText(/历史授权/)).toBeVisible();
+    expect(screen.queryByRole('button', { name: '撤销' })).not.toBeInTheDocument();
+    expect(screen.queryByText(/当前授权/)).not.toBeInTheDocument();
+  });
+  it('marks expired grants as historical with no revoke action', async () => {
+    mount({ kind: 'access', resourceId: published.id, name: published.name }, {
+      grants: () => [{ id: 'expired', resource_id: published.id, user_id: 'recipient', group_id: null, role: 'VIEWER', allow_audio: false, allow_clipboard: false, allow_file_transfer: false, revoked_at: null, expires_at: '2020-01-01T00:00:00Z' }],
+    });
+    expect(await screen.findByText('已过期')).toBeVisible();
+    expect(screen.queryByRole('button', { name: '撤销' })).not.toBeInTheDocument();
+  });
+  it('expires a grant while the access dialog remains open', async () => {
+    vi.useFakeTimers();
+    try {
+      const grant: Grant = { id: 'expiring', resource_id: published.id, user_id: 'recipient', group_id: null, role: 'VIEWER', allow_audio: false, allow_clipboard: false, allow_file_transfer: false, revoked_at: null, expires_at: new Date(Date.now() + 500).toISOString() };
+      mount({ kind: 'access', resourceId: published.id, name: published.name }, { grants: () => [grant] });
+      await act(async () => { await Promise.resolve(); });
+      expect(screen.getByRole('button', { name: '撤销' })).toBeVisible();
+      await act(async () => { vi.advanceTimersByTime(1000); });
+      expect(screen.getByText('已过期')).toBeVisible();
+      expect(screen.queryByRole('button', { name: '撤销' })).not.toBeInTheDocument();
+    } finally { vi.useRealTimers(); }
   });
   it('resets and disables all capability flags when switching to VIEWER', async () => {
     const user = userEvent.setup();

@@ -1,7 +1,7 @@
-import { useCallback, useState, type FormEvent, type ReactNode } from 'react';
+import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from 'react';
 import type { Account, DesktopApi, Machine, PublishedResource } from '../api/types';
 import { useQuery } from '../state/useQuery';
-import { Empty, ErrorNotice, Loading, Modal } from './common';
+import { dateLabel, Empty, ErrorNotice, grantStatus, Loading, Modal } from './common';
 
 export type DialogState =
   | { kind: 'enroll' }
@@ -15,6 +15,7 @@ export type DialogState =
   | { kind: 'edit'; resource: PublishedResource };
 type Run = (work: () => Promise<unknown>, refresh?: boolean) => Promise<boolean>;
 type Props = { dialog: DialogState; account: Account; api: DesktopApi; busy: boolean; error: string | null; run: Run; onClose: () => void; onCompleted?: () => void; onLogout: () => Promise<boolean> };
+const admissionNotice = '授权变更会阻止后续连接；已建立的连接不会立即断开。需要立即断开时，请停止被控端共享。';
 
 function Actions({ busy, onClose, label = '保存', danger = false }: { busy: boolean; onClose: () => void; label?: string; danger?: boolean }) {
   return <footer className="modal-actions"><button type="button" disabled={busy} onClick={onClose}>取消</button><button type="submit" className={danger ? 'danger' : 'primary'} disabled={busy}>{busy ? '正在处理…' : label}</button></footer>;
@@ -48,7 +49,7 @@ export function ActionDialog(props: Props) {
       label = dialog.kind === 'publish' ? '发布' : '保存';
       body = <>{dialog.kind === 'publish' && <div className="notice">{dialog.resourceKind === 'APP' ? '这里只发布应用信息；独立应用串流尚不支持，不会改为连接整个桌面。' : '发布完整桌面后，可通过访问权限添加指定用户。'}</div>}<label>资源名称<input autoFocus required value={name} onChange={e => setName(e.target.value)} maxLength={120} /></label><label>描述<textarea value={description} onChange={e => setDescription(e.target.value)} maxLength={1000} rows={3} /></label>{dialog.kind === 'publish' && dialog.resourceKind === 'APP' && <><label>应用启动路径<input required value={path} onChange={e => setPath(e.target.value)} placeholder="本机应用的完整路径" /></label><label>启动参数（每行一个，可选）<textarea value={args} onChange={e => setArgs(e.target.value)} rows={3} /></label></>}{dialog.kind === 'edit' && <label className="checkbox"><input type="checkbox" checked={enabled} onChange={e => setEnabled(e.target.checked)} />允许发布此资源</label>}</>;
       break;
-    case 'remove': danger = true; label = '确认移除'; body = <p>移除“{dialog.machine.name}”将撤销该设备的共享资源。之后需要重新注册才能加入工作空间。此操作无法撤销。</p>; break;
+    case 'remove': danger = true; label = '确认移除'; body = <><p>移除“{dialog.machine.name}”将撤销该设备的共享资源。之后需要重新注册才能加入工作空间。此操作无法撤销。</p><p className="notice">{admissionNotice}</p></>; break;
     case 'stop': danger = true; label = '停止共享'; body = <p>停止本机后台服务后，其他设备无法再连接这台电脑，现有的入站连接也会中断。你的其他远程会话不受影响。</p>; break;
     case 'disconnect': danger = true; label = '断开'; body = <p>断开“{dialog.name}”的独立会话窗口？未完成的文件传输可能被中断。</p>; break;
     case 'logout': danger = true; label = '退出登录'; body = <p>退出将关闭当前账号的所有远程会话并清除登录凭据。本机共享服务不会随之停止；如需停止，请先前往“本机共享”。</p>; break;
@@ -72,7 +73,7 @@ export function ActionDialog(props: Props) {
     }
     if (ok) { setToken(''); props.onCompleted?.(); onClose(); }
   }
-  return <Modal title={titles[dialog.kind]} onClose={onClose} busy={busy}><form onSubmit={submit}><div className="modal-body"><ErrorNotice message={error} />{body}</div><Actions busy={busy} onClose={onClose} label={label} danger={danger} /></form></Modal>;
+  return <Modal title={titles[dialog.kind]} onClose={onClose} busy={busy}><form onSubmit={submit}><div className="modal-body"><ErrorNotice message={error} />{body}{dialog.kind === 'edit' && !enabled && <p className="notice">{admissionNotice}</p>}</div><Actions busy={busy} onClose={onClose} label={label} danger={danger} /></form></Modal>;
 }
 
 function AccessDialog({ name, resourceId, api, busy, error, run, onClose }: Props & { name: string; resourceId: string }) {
@@ -84,13 +85,35 @@ function AccessDialog({ name, resourceId, api, busy, error, run, onClose }: Prop
   const [files, setFiles] = useState(false);
   const [audio, setAudio] = useState(false);
   const [revoke, setRevoke] = useState<string | null>(null);
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
   const viewer = role === 'VIEWER';
   async function grant(event: FormEvent) {
     event.preventDefault();
     const ok = await run(() => api.request({ op: 'grant_access', resource_id: resourceId, email: email.trim(), role, allow_clipboard: !viewer && clipboard, allow_file_transfer: !viewer && files, allow_audio: !viewer && audio }), false);
     if (ok) { setEmail(''); query.reload(); }
   }
-  return <Modal title="管理访问权限" onClose={onClose} busy={busy}><div className="modal-body"><p className="muted">{name} · 仅向同一工作空间中的指定用户授权</p><ErrorNotice message={error ?? query.error} />{query.loading ? <Loading /> : query.error ? <button onClick={query.reload}>重新加载授权</button> : !query.data?.length ? <Empty title="暂无额外授权">没有额外授权记录不代表资源所有者没有权限。</Empty> : <div className="grant-list">{query.data.map(item => <div className="grant-row" key={item.id}><div className="grow"><strong>{item.user_display_name || item.user_email || item.group_name || (item.user_id ? `用户 ${item.user_id}` : item.group_id ? `用户组 ${item.group_id}` : '未知授权对象')}</strong>{item.user_email && item.user_display_name && <p>{item.user_email}</p>}<p>{item.role} · 剪贴板{item.allow_clipboard ? '允许' : '禁止'} · 文件{item.allow_file_transfer ? '允许' : '禁止'} · 音频{item.allow_audio ? '允许' : '禁止'}</p></div>{revoke === item.id ? <><button disabled={busy} className="danger" onClick={async () => { if (await run(() => api.request({ op: 'revoke_access', entitlement_id: item.id }), false)) { setRevoke(null); query.reload(); } }}>确认撤销</button><button disabled={busy} onClick={() => setRevoke(null)}>取消</button></> : <button className="text-button danger-text" disabled={busy} onClick={() => setRevoke(item.id)}>撤销</button>}</div>)}</div>}
+  return <Modal title="管理访问权限" onClose={onClose} busy={busy}><div className="modal-body"><p className="muted">{name} · 仅向同一工作空间中的指定用户授权</p><ErrorNotice message={error ?? query.error} />{query.loading ? <Loading /> : query.error ? <button onClick={query.reload}>重新加载授权</button> : !query.data?.length ? <Empty title="暂无额外授权">没有额外授权记录不代表资源所有者没有权限。</Empty> : <div className="grant-list">{query.data.map(item => {
+    const status = grantStatus(item, now);
+    const current = status === 'active';
+    return <div className={`grant-row ${current ? '' : 'grant-inactive'}`} key={item.id}>
+      <div className="grow">
+        <strong>{item.user_display_name || item.user_email || item.group_name || (item.user_id ? `用户 ${item.user_id}` : item.group_id ? `用户组 ${item.group_id}` : '未知授权对象')}</strong>
+        {item.user_email && item.user_display_name && <p>{item.user_email}</p>}
+        <p>{current ? '当前授权' : '历史授权'} · {item.role} · 剪贴板{item.allow_clipboard ? '允许' : '禁止'} · 文件{item.allow_file_transfer ? '允许' : '禁止'} · 音频{item.allow_audio ? '允许' : '禁止'}</p>
+        {item.expires_at && <p>到期时间：{dateLabel(item.expires_at)}</p>}
+      </div>
+      {!current ? <span className="muted">{status === 'revoked' ? '已撤销' : status === 'expired' ? '已过期' : '有效期未知'}</span> : revoke === item.id ? <>
+        <button disabled={busy} className="danger" onClick={async () => {
+          if (await run(() => api.request({ op: 'revoke_access', entitlement_id: item.id }), false)) { setRevoke(null); query.reload(); }
+        }}>确认撤销</button>
+        <button disabled={busy} onClick={() => setRevoke(null)}>取消</button>
+      </> : <button className="text-button danger-text" disabled={busy} onClick={() => setRevoke(item.id)}>撤销</button>}
+    </div>;
+  })}</div>}<p className="notice">{admissionNotice}</p>
       <form onSubmit={grant} className="grant-form"><h3>添加访问用户</h3><label>用户完整邮箱<input autoFocus type="email" required value={email} onChange={e => setEmail(e.target.value)} placeholder="name@company.com" autoComplete="off" /></label><label>访问角色<select value={role} onChange={e => { setRole(e.target.value); if (e.target.value === 'VIEWER') { setClipboard(false); setFiles(false); setAudio(false); } }}><option value="VIEWER">仅查看</option><option value="CONTROLLER">控制桌面</option><option value="ADMIN">资源管理员</option></select></label><div className="policy-options"><label className="checkbox"><input type="checkbox" disabled={viewer || busy} checked={clipboard} onChange={e => setClipboard(e.target.checked)} />剪贴板</label><label className="checkbox"><input type="checkbox" disabled={viewer || busy} checked={files} onChange={e => setFiles(e.target.checked)} />文件传输</label><label className="checkbox"><input type="checkbox" disabled={viewer || busy} checked={audio} onChange={e => setAudio(e.target.checked)} />音频</label></div>{viewer && <p className="muted">仅查看角色不允许输入、剪贴板、文件传输和音频。</p>}{role === 'ADMIN' && <p className="muted">此角色仅作用于当前资源，不授予工作空间用户目录管理权限。</p>}<p className="muted">精确匹配已启用的账号邮箱，不搜索或展示用户目录。</p><button className="primary" disabled={busy || query.loading} type="submit">{busy ? '正在处理…' : '添加授权'}</button></form>
     </div></Modal>;
 }

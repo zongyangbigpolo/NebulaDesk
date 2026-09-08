@@ -16,11 +16,11 @@ describe('desktop state boundary', () => {
     await first;
     expect(store.snapshot().sessions).toEqual([session]);
   });
-  it('ignores a stale poll and refresh after logout', async () => {
+  it.each([false, true])('ignores stale poll and refresh after logout (reject=%s)', async reject => {
     const pending = deferred<SessionType[]>();
     const reads = deferred<Resource[]>();
     let count = 0;
-    const api = fakeApi({ sessions: () => pending.promise, resources: () => ++count === 1 ? [resource] : reads.promise });
+    const api = fakeApi({ logout: () => reject ? Promise.reject(new Error('IPC interrupted')) : null, sessions: () => pending.promise, resources: () => ++count === 1 ? [resource] : reads.promise });
     const store = new DesktopStore(api);
     await store.start();
     const poll = store.poll();
@@ -32,12 +32,23 @@ describe('desktop state boundary', () => {
     expect(store.snapshot().resources).toEqual([]);
     expect(store.snapshot().sessions).toEqual([]);
   });
-  it('keeps current account and exposes structured error on logout failure', async () => {
-    const store = new DesktopStore(fakeApi({ logout: () => Promise.reject({ code: 'process_error', message: '会话关闭失败' }) }));
+  it('clears account-scoped data when host cleared auth before remote logout rejected', async () => {
+    let signedIn = true;
+    const api = fakeApi({
+      account: () => signedIn ? account : null,
+      sessions: () => [session],
+      logout: () => { signedIn = false; return Promise.reject({ code: 'timeout', message: '服务器撤销超时' }); },
+    });
+    const store = new DesktopStore(api);
     await store.start();
+    await store.poll();
+    expect(store.snapshot().resources).toEqual([resource]);
+    expect(store.snapshot().sessions).toEqual([session]);
     expect(await store.logout()).toBe(false);
-    expect(store.snapshot().account).toEqual(account);
-    expect(store.snapshot().error).toContain('会话关闭失败');
+    expect(await api.request({ op: 'account' })).toBeNull();
+    expect(store.snapshot()).toMatchObject({ account: null, resources: [], machines: [], host: null, sessions: [], transfers: [], busy: false });
+    expect(store.snapshot().error).toContain('服务器撤销超时');
+    expect(store.snapshot().error).toContain('未能确认');
   });
   it('never substitutes demonstration resources on API failure', async () => {
     const store = new DesktopStore(fakeApi({ resources: () => Promise.reject(new Error('连接工作空间失败')) }));

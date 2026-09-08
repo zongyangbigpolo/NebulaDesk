@@ -118,4 +118,18 @@ describe('desktop presentation and actions', () => {
     expect(await screen.findByRole('heading', { name: '登录工作空间' })).toBeVisible();
     expect(screen.queryByRole('navigation')).not.toBeInTheDocument();
   });
+  it('returns to login with a warning, not stale private data, when logout rejects', async () => {
+    const user = userEvent.setup();
+    const api = fakeApi({ logout: () => Promise.reject({ code: 'timeout', message: '退出请求超时' }) });
+    render(<App api={api} />);
+    await user.click(await screen.findByRole('button', { name: /账号与设置/ }));
+    await user.click(screen.getByRole('button', { name: '退出登录' }));
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '退出登录' }));
+    expect(await screen.findByRole('heading', { name: '登录工作空间' })).toBeVisible();
+    expect(screen.getByRole('alert')).toHaveTextContent('未能确认退出操作或服务器会话撤销');
+    expect(screen.getByRole('alert')).toHaveTextContent('退出请求超时');
+    expect(screen.queryByRole('navigation')).not.toBeInTheDocument();
+    expect(screen.queryByText(resource.name)).not.toBeInTheDocument();
+    expect(screen.queryByText(account.email)).not.toBeInTheDocument();
+  });
 });
