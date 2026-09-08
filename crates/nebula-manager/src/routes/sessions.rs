@@ -309,8 +309,8 @@ pub async fn list(
 
 /// `DELETE /v1/sessions/{id}`
 ///
-/// Marks the session closed. The gateway notices and tears down the
-/// connection; the manager has no path to the media itself.
+/// Marks the session closed in the control-plane record. This does not yet
+/// notify the gateway or terminate an already established data path.
 pub async fn close(
     State(state): State<AppState>,
     caller: AuthUser,

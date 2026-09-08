@@ -13,7 +13,7 @@
 
 | 维度 | 决策 |
 |------|------|
-| 语言 | **Rust 全栈**，单一 cargo workspace，三平台同一套代码 |
+| 语言 | 控制面与原生会话使用 **Rust workspace**；管理界面使用独立的 React/TypeScript 前端 |
 | 传输 | **仅 QUIC**（`quinn` + `rustls`），不做 TCP 兼容 |
 | 平台 | Windows 11 (22H2/24H2+)、macOS 26+、Linux（Ubuntu 24.04/26.04 或等价 glibc 2.39+） |
 | 编解码 | **平台原生硬件 FFI**：VideoToolbox / Media Foundation+D3D11VA / VA-API+NVENC。无 GPL 依赖 |
@@ -79,7 +79,9 @@ flowchart TB
 
 直连选中后，视频、音频、输入、剪贴板和文件走直连；Relay 保留低流量热备探测，
 不持续复制视频。直连断开或探测超时会切回可用 Relay，保留逻辑会话、窗口、采集和
-输入上下文。Gateway 仍保持授权撤销和会话存活控制，不能在直连后随意断开。
+输入上下文。Gateway 仍保持会话控制连接，不能在直连后随意断开。
+授权变更会阻止新会话申请，但实时撤销已建立连接的 Manager → Gateway 执行链尚未实现；
+立即终止被控端连接需要停止 Agent，不能把授权记录变更视为对端已经退出。
 
 当前候选覆盖直接可达的 IPv4 与无接口 scope 的 IPv6 host 地址；没有 STUN/UDP
 打洞实现，跨 NAT 不可直达时使用 Relay。旧版本对端未协商多路径时仍使用原单 Relay

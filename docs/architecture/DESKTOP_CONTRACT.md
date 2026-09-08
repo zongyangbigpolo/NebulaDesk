@@ -23,12 +23,12 @@ stored in browser storage or passed as process command-line arguments.
 
 One Tauri command: `desktop_request`, with `{ request }`.
 The `request` is an object tagged by `op` (snake_case). Successful replies are
-JSON values with the following shapes; failures reject with a readable error.
+JSON values with the following shapes; failures reject with `{code,message}`.
 The frontend catches and displays errors and does not replace them with demo data.
 
 | Request | Reply |
 | --- | --- |
-| `{op:"login",manager_url,tenant,email,password}` | `Account` |
+| `{op:"login",manager_url,tenant,email,password,allow_insecure_http?}` | `Account` |
 | `{op:"logout"}` | `null` |
 | `{op:"account"}` | `Account \| null` |
 | `{op:"resources"}` | `Resource[]` |
@@ -40,8 +40,9 @@ The frontend catches and displays errors and does not replace them with demo dat
 | `{op:"disconnect_session",session_id}` | `null` |
 | `{op:"local_host"}` | `LocalHost` |
 | `{op:"create_enrollment",name}` | `{token:string,expires_at:string}` (single-use, never persisted by the UI) |
-| `{op:"enroll_local",manager_url,token,name}` | `LocalHost` |
+| `{op:"enroll_local",manager_url,token,name,allow_insecure_http?}` | `LocalHost` |
 | `{op:"set_host_enabled",enabled}` | `LocalHost` |
+| `{op:"open_permission_settings",permission:"screen" \| "input" \| "audio"}` | `null` (fixed OS settings target; unsupported platforms return an explanatory error) |
 | `{op:"rename_machine",machine_id,name}` | `null` |
 | `{op:"remove_machine",machine_id}` | `null` |
 | `{op:"machine_resources",machine_id}` | `PublishedResource[]` |
@@ -73,7 +74,9 @@ type PublishedResource = { id: string; machine_id: string; kind: "DESKTOP" | "AP
   name: string; description: string; enabled: boolean; launch_path: string | null };
 type Grant = { id: string; resource_id: string; user_id: string | null;
   group_id: string | null; role: string; allow_clipboard: boolean;
-  allow_file_transfer: boolean; allow_audio: boolean };
+  allow_file_transfer: boolean; allow_audio: boolean;
+  user_email?: string | null; user_display_name?: string | null; group_name?: string | null;
+  expires_at?: string | null; revoked_at?: string | null };
 type Session = { session_id: string; resource_id: string; name: string;
   state: "connecting" | "connected" | "disconnected" | "failed";
   path: "direct" | "relay" | null; started_at: string; error: string | null;
@@ -93,6 +96,11 @@ metadata is supported separately from native single-application streaming;
 an unsupported APP must be clearly disabled, never silently open the whole desktop.
 Permission checks that cannot establish an OS grant report unknown, not granted.
 Normal resource consumers must not receive another user's executable paths.
+Grant roles are `VIEWER`, `CONTROLLER` and `ADMIN`; the last is a resource role,
+not tenant directory administration. VIEWER cannot enable any optional channel.
+Grant history retains expiry and revocation fields; inactive rows are not shown
+as usable or offered another revoke operation. Non-loopback plaintext HTTP requires an
+explicit user acknowledgement (`allow_insecure_http`), not a hidden retry.
 
 The UI can be previewed in a normal browser using an **explicit** demo switch.
 The demo adapter is a separate module, visibly identified, and never selected

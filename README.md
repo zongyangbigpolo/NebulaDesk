@@ -85,12 +85,18 @@ direct QUIC connection. The session selects direct only when its measured path
 RTT is better. The relay stays warm, carrying small liveness probes rather than
 duplicated media, so a failed direct path can fall back without reopening the
 resource or restarting capture. The client title shows the actual `Relay` or
-`Direct` route. Gateway signalling remains connected for revocation and session
-lifetime; it is not part of the media path.
+`Direct` route. Gateway signalling remains connected for session lifetime and
+endpoint control; it is not part of the media path.
 
 Direct negotiation currently covers reachable IPv4 and unscoped IPv6 host
 addresses, not STUN/NAT hole punching. Blocked or slower candidates leave the
 relay session running. Older peers retain the single-relay protocol.
+
+Revoking a grant, disabling a resource or removing a device prevents new
+Manager-authorized session requests. It does not immediately recall a previously
+issued ticket or force an established session to close. Stop sharing on the
+controlled machine when an immediate cutoff is required; live authorization
+revocation still needs a Manager-to-Gateway enforcement path.
 
 For a controlled routing check against an authorised resource, the headless
 probe can close just its direct connection and require a relay round trip and
@@ -122,6 +128,21 @@ GPU requirements and permission setup are documented in
 ```sh
 cargo build --workspace
 ```
+
+The management WebView is an opt-in build (`nebula-desktop --features gui`);
+server-only builds do not need Node or WebKit. Its frontend is built separately:
+
+```sh
+npm --prefix apps/desktop-ui ci
+npm --prefix apps/desktop-ui run build
+node scripts/desktop-sidecars.mjs --debug
+cargo build -p nebula-desktop --features gui
+```
+
+The GUI build also needs the native session and Agent executables as sidecars.
+Linux additionally needs WebKitGTK 4.1, Ayatana AppIndicator and librsvg
+development packages; Windows uses WebView2, and macOS uses the system WebKit.
+GUI bundling does not replace the native media prerequisites below.
 
 Tests that exercise the manager need PostgreSQL 16 or newer:
 

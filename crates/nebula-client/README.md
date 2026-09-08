@@ -45,3 +45,14 @@ Chinese labels use an installed OS CJK font (PingFang/Heiti/Songti on macOS,
 Microsoft YaHei/SimSun on Windows, Noto CJK/WenQuanYi on Linux). Fonts are read
 locally, not redistributed. If none is available, the window visibly explains
 that it is using English labels.
+
+## Offline window preview
+
+```sh
+cargo run -p nebula-client --example session_preview
+```
+
+This opens the actual native window in its disconnected/error state. Its
+deliberately invalid key is rejected before network access. It does not capture
+a display, connect to a machine, or substitute a fake remote desktop. Close the
+window to exit; this is a UI preview, not a streaming demonstration.
