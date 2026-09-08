@@ -62,13 +62,41 @@ resolved. Back up again after the approved correction and rerun the preflight.
 
 ## Install services
 
-Build the three native Linux server programs from the same source revision:
+**Prefer building on a workstation and uploading the finished Linux release.**
+An Apple Silicon Mac produces macOS/ARM executables by default; those cannot run
+on this Linux/x86_64 server. Use the installed Rust Linux target, Zig and
+`cargo-zigbuild` to cross-compile instead:
+
+```sh
+# Prerequisites, only if missing:
+# rustup target add x86_64-unknown-linux-gnu
+# Install Zig and cargo-zigbuild through your workstation's package manager.
+bash scripts/build-cloud-release.sh
+```
+
+The script requires a clean committed checkout and builds only Manager, Gateway
+and Relay, not desktop/media dependencies. It produces
+`target/cloud-releases/<commit>-linux-x86_64.tar.gz` with optimized executables,
+source/toolchain metadata and `SHA256SUMS`. The glibc baseline is 2.28.
+No deployment environment, database, password, TLS key or macOS archive metadata
+is included. Keep each version rather than replacing a running executable.
+
+Upload that archive to the server, extract it into a new
+`/opt/nebula/releases/<commit>/` directory, and run `sha256sum -c SHA256SUMS`
+there. Inspect `ldd bin/nebula-manager` for missing runtime libraries.
+After the database backup/preflight, atomically replace the
+`/opt/nebula/current` symlink with the new release and restart the appropriate
+services. Schedule Gateway/Relay restarts when no users are connected.
+Keep the previous binaries and database backup for recovery; a binary rollback
+alone is not a database rollback.
+
+Alternatively, build on a **separate Linux build machine** from the same source revision:
 
 ```sh
 cargo build --locked --release -p nebula-manager -p nebula-gateway -p nebula-relay
 ```
 
-On a small shared host, build with `--jobs 1` and, if LLVM exceeds available
+If a small build host must be used, build with `--jobs 1` and, if LLVM exceeds available
 memory, set `CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`.
 This keeps optimized release code while avoiding whole-program link-time
 optimization. Do not stop unrelated applications to make room for the compiler.
