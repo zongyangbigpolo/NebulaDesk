@@ -11,6 +11,7 @@ members = [
     "crates/nebula-gateway",
     "crates/nebula-agent",
     "crates/nebula-client",
+    "crates/nebula-desktop-protocol",
 ]
 
 [workspace.package]
@@ -32,6 +33,7 @@ nebula-gateway = { path = "crates/nebula-gateway" }
 nebula-manager = { path = "crates/nebula-manager" }
 nebula-agent = { path = "crates/nebula-agent" }
 nebula-client = { path = "crates/nebula-client" }
+nebula-desktop-protocol = { path = "crates/nebula-desktop-protocol" }
 nebula-media-core = { path = "crates/nebula-media-core" }
 nebula-media-macos = { path = "crates/nebula-media-macos" }
 nebula-render = { path = "crates/nebula-render" }

@@ -1,0 +1,12 @@
+[package]
+name = "nebula-desktop-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bounded control-only IPC for native NebulaDesk session processes"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
