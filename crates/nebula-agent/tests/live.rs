@@ -327,17 +327,17 @@ async fn the_real_agent_serves_a_real_client() {
         )
         .await;
 
-    // From here on this is the client, which knows a password and a resource
-    // id and nothing else.
+    // The client selects a resource; desktop details include its machine ID,
+    // but connecting still uses the resource rather than a machine address.
     let available = deployment
         .get("/v1/resources", &deployment.owner_token)
         .await;
     assert_eq!(available.as_array().unwrap().len(), 1);
     assert_eq!(available[0]["machine_status"], "ONLINE");
-    assert!(
-        available[0].get("machine_id").is_none(),
-        "the client is never told which machine serves a resource"
-    );
+    assert_eq!(available[0]["machine_id"], machine.to_string());
+    assert_eq!(available[0]["owned"], false);
+    assert!(available[0].get("credential").is_none());
+    assert!(available[0].get("launch_path").is_none());
 
     let ticket = deployment
         .post(

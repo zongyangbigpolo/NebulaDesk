@@ -1,9 +1,9 @@
 //! The NebulaDesk workspace app.
 //!
-//! A user signs in, sees what they may reach, and picks one. What serves it
-//! is not their concern and is never told to them: the manager resolves a
-//! resource to a machine, the gateway reaches that machine over a tunnel it
-//! opened outbound, and the relay carries bytes neither of them can read.
+//! A user signs in, sees what they may reach, and picks a resource. Desktop
+//! details may identify its machine, but connection uses a manager-issued
+//! resource ticket, not a machine address. The gateway reaches the agent over
+//! its outbound tunnel, and the relay carries end-to-end encrypted bytes.
 //!
 //! The layering here follows that: [`manager`] is the only part that speaks
 //! HTTP, [`connect`] turns a ticket into an encrypted session, and everything
