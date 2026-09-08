@@ -322,6 +322,7 @@ pub async fn delete_user(
 
 /// Request to create a group.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateGroup {
     /// Group name, unique within the tenant.
     pub name: String,
@@ -346,6 +347,12 @@ pub async fn create_group(
     Json(req): Json<CreateGroup>,
 ) -> ApiResult<(StatusCode, Json<GroupRow>)> {
     caller.require_admin()?;
+    if req.name.trim().is_empty() || req.name.len() > 200 || req.name.chars().any(char::is_control)
+    {
+        return Err(ApiError::BadRequest(
+            "group name must contain 1–200 bytes of text".into(),
+        ));
+    }
     let row = sqlx::query_as::<_, GroupRow>(
         "INSERT INTO user_groups (id, tenant_id, name) VALUES ($1, $2, $3)
          RETURNING id, name, created_at",
@@ -359,14 +366,23 @@ pub async fn create_group(
     Ok((StatusCode::CREATED, Json(row)))
 }
 
+/// A group directory summary.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct GroupSummary {
+    /// Identifier.
+    pub id: Uuid,
+    /// Name.
+    pub name: String,
+}
+
 /// `GET /v1/groups`
 pub async fn list_groups(
     State(state): State<AppState>,
     caller: AuthUser,
-) -> ApiResult<Json<Vec<GroupRow>>> {
+) -> ApiResult<Json<Vec<GroupSummary>>> {
     caller.require_admin()?;
-    let rows = sqlx::query_as::<_, GroupRow>(
-        "SELECT id, name, created_at FROM user_groups WHERE tenant_id = $1 ORDER BY name",
+    let rows = sqlx::query_as::<_, GroupSummary>(
+        "SELECT id, name FROM user_groups WHERE tenant_id = $1 ORDER BY name, id",
     )
     .bind(caller.tenant.as_uuid())
     .fetch_all(&state.db)
@@ -374,8 +390,87 @@ pub async fn list_groups(
     Ok(Json(rows))
 }
 
+/// A member in the administrator's group directory.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct GroupMember {
+    /// Identifier.
+    pub id: Uuid,
+    /// Email address.
+    pub email: String,
+    /// Display name.
+    pub display_name: String,
+    /// Directory role.
+    pub role: String,
+    /// Whether the account is suspended.
+    pub disabled: bool,
+}
+
+/// `GET /v1/groups/{id}/members`
+pub async fn list_group_members(
+    State(state): State<AppState>,
+    caller: AuthUser,
+    Path(group): Path<Uuid>,
+) -> ApiResult<Json<Vec<GroupMember>>> {
+    caller.require_admin()?;
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM user_groups WHERE id = $1 AND tenant_id = $2)",
+    )
+    .bind(group)
+    .bind(caller.tenant.as_uuid())
+    .fetch_one(&state.db)
+    .await?;
+    if !exists {
+        return Err(ApiError::NotFound("group"));
+    }
+    let members = sqlx::query_as::<_, GroupMember>(
+        "SELECT u.id, u.email, u.display_name, u.role, u.disabled
+         FROM user_group_members m JOIN users u ON u.id = m.user_id AND u.tenant_id = m.tenant_id
+         WHERE m.group_id = $1 AND m.tenant_id = $2 ORDER BY u.display_name, u.id",
+    )
+    .bind(group)
+    .bind(caller.tenant.as_uuid())
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(members))
+}
+
+/// `DELETE /v1/groups/{id}`
+pub async fn delete_group(
+    State(state): State<AppState>,
+    caller: AuthUser,
+    Path(group): Path<Uuid>,
+) -> ApiResult<StatusCode> {
+    caller.require_admin()?;
+    let mut tx = state.db.begin().await?;
+    let deleted = sqlx::query("DELETE FROM user_groups WHERE id = $1 AND tenant_id = $2")
+        .bind(group)
+        .bind(caller.tenant.as_uuid())
+        .execute(&mut *tx)
+        .await?;
+    if deleted.rows_affected() == 0 {
+        return Err(ApiError::NotFound("group"));
+    }
+    sqlx::query(
+        "UPDATE entitlements SET revoked_at = COALESCE(revoked_at, now())
+         WHERE tenant_id = $1 AND subject_kind = 'GROUP' AND subject_id = $2",
+    )
+    .bind(caller.tenant.as_uuid())
+    .bind(group)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Entry::new("group.delete", Outcome::Allow)
+        .tenant(caller.tenant)
+        .actor(caller.id)
+        .target("group", group)
+        .write(&state.db)
+        .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Request to add a member to a group.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AddMember {
     /// The user to add.
     pub user_id: Uuid,
@@ -389,18 +484,29 @@ pub async fn add_group_member(
     Json(req): Json<AddMember>,
 ) -> ApiResult<StatusCode> {
     caller.require_admin()?;
-    // The composite foreign keys make a cross-tenant membership impossible,
-    // so a violation here means one of the two ids is not ours.
-    sqlx::query(
+    // Resolve both objects inside the caller's tenant before checking for an
+    // existing membership, so a foreign membership cannot mask a denial.
+    let added = sqlx::query(
         "INSERT INTO user_group_members (tenant_id, group_id, user_id)
-         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+         SELECT $1, g.id, u.id FROM user_groups g
+         JOIN users u ON u.tenant_id = g.tenant_id
+         WHERE g.tenant_id = $1 AND g.id = $2 AND u.id = $3
+         ON CONFLICT (group_id, user_id) DO UPDATE SET user_id = EXCLUDED.user_id",
     )
     .bind(caller.tenant.as_uuid())
     .bind(group)
     .bind(req.user_id)
     .execute(&state.db)
     .await
-    .map_err(|_| ApiError::NotFound("group or user"))?;
+    .map_err(|e| match &e {
+        sqlx::Error::Database(db) if db.is_foreign_key_violation() => {
+            ApiError::NotFound("group or user")
+        }
+        _ => ApiError::Database(e),
+    })?;
+    if added.rows_affected() == 0 {
+        return Err(ApiError::NotFound("group or user"));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -423,7 +529,7 @@ pub async fn remove_group_member(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn validate_slug(slug: &str) -> ApiResult<()> {
+pub(crate) fn validate_slug(slug: &str) -> ApiResult<()> {
     let ok = !slug.is_empty()
         && slug.len() <= 63
         && slug

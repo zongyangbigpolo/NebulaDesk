@@ -266,7 +266,7 @@ pub(crate) async fn issue_pair(
     })
 }
 
-fn new_refresh(state: &AppState) -> (tokens::OpaqueToken, OffsetDateTime) {
+pub(crate) fn new_refresh(state: &AppState) -> (tokens::OpaqueToken, OffsetDateTime) {
     let ttl = time::Duration::try_from(state.config.refresh_token_ttl)
         .unwrap_or(time::Duration::days(30));
     (tokens::generate_opaque(), OffsetDateTime::now_utc() + ttl)

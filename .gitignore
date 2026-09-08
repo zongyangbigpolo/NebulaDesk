@@ -18,3 +18,5 @@ target/
 *.pem
 *.key
 .env
+*.secrets.env
+deploy/cloud/deployment.env

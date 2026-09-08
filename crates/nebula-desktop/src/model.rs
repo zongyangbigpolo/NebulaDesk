@@ -7,6 +7,62 @@ use uuid::Uuid;
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    ConnectionSettings,
+    Users,
+    SetUserDisabled {
+        user_id: Uuid,
+        disabled: bool,
+    },
+    Groups,
+    CreateGroup {
+        name: String,
+    },
+    DeleteGroup {
+        group_id: Uuid,
+    },
+    GroupMembers {
+        group_id: Uuid,
+    },
+    AddGroupMember {
+        group_id: Uuid,
+        user_id: Uuid,
+    },
+    RemoveGroupMember {
+        group_id: Uuid,
+        user_id: Uuid,
+    },
+    RegistrationOptions {
+        manager_url: String,
+        #[serde(default)]
+        allow_insecure_http: bool,
+    },
+    Register {
+        manager_url: String,
+        workspace_slug: String,
+        workspace_name: String,
+        workspace_kind: WorkspaceKind,
+        display_name: String,
+        email: String,
+        password: String,
+        #[serde(default)]
+        allow_insecure_http: bool,
+    },
+    AcceptInvitation {
+        manager_url: String,
+        token: String,
+        display_name: String,
+        email: String,
+        password: String,
+        #[serde(default)]
+        allow_insecure_http: bool,
+    },
+    CreateInvitation {
+        email: String,
+    },
+    Invitations,
+    RevokeInvitation {
+        id: Uuid,
+    },
     Login {
         manager_url: String,
         tenant: String,
@@ -85,6 +141,63 @@ pub enum Request {
     SendFiles {
         session_id: Uuid,
     },
+}
+
+#[derive(Deserialize, Serialize, Clone, PartialEq, Debug)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum WorkspaceKind {
+    Personal,
+    Organization,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct Workspace {
+    pub id: Uuid,
+    pub slug: String,
+    pub name: String,
+    pub kind: WorkspaceKind,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct RegistrationOptions {
+    pub self_registration_enabled: bool,
+}
+
+#[derive(Serialize)]
+pub struct ConnectionSettings {
+    pub manager_url: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct DirectoryUser {
+    pub id: Uuid,
+    pub email: String,
+    pub display_name: String,
+    pub role: String,
+    pub disabled: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct Group {
+    pub id: Uuid,
+    pub name: String,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct Invitation {
+    pub id: Uuid,
+    pub email: String,
+    pub expires_at: String,
+    pub created_at: String,
+    pub revoked_at: Option<String>,
+    pub accepted_at: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct CreatedInvitation {
+    #[serde(flatten)]
+    pub invitation: Invitation,
+    pub token: String,
 }
 
 #[derive(Deserialize)]
@@ -239,6 +352,7 @@ pub struct AccountView {
     pub role: String,
     pub tenant: String,
     pub manager_url: String,
+    pub workspace: Workspace,
 }
 
 pub trait StateExt {

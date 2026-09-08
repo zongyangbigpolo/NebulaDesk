@@ -30,6 +30,9 @@ pub struct Config {
     /// These are operator actions with no tenant to authenticate against, so
     /// they are gated by a deployment-wide secret rather than a user session.
     pub bootstrap_token: String,
+    /// Permit public creation of a new workspace and its administrator.
+    #[serde(default)]
+    pub allow_self_registration: bool,
     /// Maximum accepted request body.
     pub max_body_bytes: usize,
 }
@@ -72,6 +75,9 @@ impl Config {
                 30 * 24 * 3600,
             )?),
             bootstrap_token: std::env::var("NEBULA_BOOTSTRAP_TOKEN")?,
+            allow_self_registration: std::env::var("NEBULA_ALLOW_SELF_REGISTRATION")
+                .unwrap_or_else(|_| "false".into())
+                .parse()?,
             max_body_bytes: 2 * 1024 * 1024,
         })
     }
@@ -87,6 +93,7 @@ impl Config {
             access_token_ttl: Duration::from_secs(900),
             refresh_token_ttl: Duration::from_secs(3600),
             bootstrap_token: "test-bootstrap-token".into(),
+            allow_self_registration: false,
             max_body_bytes: 2 * 1024 * 1024,
         }
     }
@@ -120,5 +127,6 @@ mod tests {
         let c = Config::for_test("postgres://x".into());
         assert!(c.access_token_ttl < c.refresh_token_ttl);
         assert!(c.max_body_bytes > 0);
+        assert!(!c.allow_self_registration);
     }
 }

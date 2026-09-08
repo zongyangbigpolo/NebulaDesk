@@ -1,0 +1,19 @@
+[Unit]
+Description=NebulaDesk HTTPS management endpoint
+After=network-online.target nebula-manager.service
+Wants=network-online.target nebula-manager.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/sbin/nginx -t -c /etc/nebula/nginx.conf
+ExecStart=/usr/sbin/nginx -c /etc/nebula/nginx.conf -g "daemon off;"
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGQUIT
+TimeoutStopSec=20
+Restart=on-failure
+RestartSec=3
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

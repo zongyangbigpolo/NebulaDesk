@@ -1,0 +1,9 @@
+[Unit]
+Description=Renew NebulaDesk short-lived IP certificate
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/nebula/certbot/bin/certbot renew --cert-name nebula-manager --non-interactive --no-random-sleep-on-renew --config-dir /opt/nebula/tls --work-dir /opt/nebula/tls-work --logs-dir /opt/nebula/tls-logs --deploy-hook "/usr/bin/systemctl reload nebula-web.service"
+TimeoutStartSec=300

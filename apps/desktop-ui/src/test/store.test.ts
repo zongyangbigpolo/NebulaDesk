@@ -1,9 +1,42 @@
 import { describe, expect, it } from 'vitest';
 import { DesktopStore } from '../state/store';
 import { account, deferred, fakeApi, resource, session } from './fixtures';
-import type { Resource, Session as SessionType } from '../api/types';
+import type { Account, AuthenticationRequest, Resource, Session as SessionType } from '../api/types';
 
 describe('desktop state boundary', () => {
+  it.each(['register', 'accept_invitation'] as const)('isolates %s authentication from older private reads and refreshes after success', async op => {
+    const oldPoll = deferred<SessionType[]>();
+    const newAccount = deferred<Account>();
+    const next = { ...account, id: 'new-member', workspace: { ...account.workspace, id: 'new-workspace' } };
+    const api = fakeApi({
+      sessions: () => oldPoll.promise,
+      register: () => newAccount.promise, accept_invitation: () => newAccount.promise,
+      resources: () => [], machines: () => [],
+    });
+    const store = new DesktopStore(api);
+    await store.start();
+    const poll = store.poll();
+    const identity = { manager_url: account.manager_url, email: account.email, display_name: 'New', password: 'long-password-123' };
+    const request: AuthenticationRequest = op === 'register' ? { op, ...identity, workspace_slug: 'new-space', workspace_name: 'New', workspace_kind: 'PERSONAL' } : { op, ...identity, token: 'exact-invite' };
+    const pending = store.authenticate(request);
+    expect(store.snapshot()).toMatchObject({ account: null, busy: true, sessions: [], resources: [], machines: [], host: null });
+    expect(await store.authenticate(request)).toBe(false);
+    oldPoll.resolve([session]);
+    await poll;
+    expect(store.snapshot().sessions).toEqual([]);
+    newAccount.resolve(next);
+    expect(await pending).toBe(true);
+    expect(store.snapshot().account).toEqual(next);
+    expect(store.snapshot().busy).toBe(false);
+    expect(api.calls.filter(call => call.op === op)).toHaveLength(1);
+  });
+  it('does not restore the old account when registration fails', async () => {
+    const store = new DesktopStore(fakeApi({ register: () => Promise.reject(new Error('workspace already exists')) }));
+    await store.start();
+    expect(await store.authenticate({ op: 'register', manager_url: account.manager_url, workspace_slug: 'acme', workspace_name: 'Acme', workspace_kind: 'PERSONAL', display_name: 'New', email: account.email, password: 'long-password-123' })).toBe(false);
+    expect(store.snapshot()).toMatchObject({ account: null, busy: false, sessions: [], resources: [], machines: [], host: null });
+    expect(store.snapshot().error).toContain('already exists');
+  });
   it('does not overlap session/transfer polls', async () => {
     const pending = deferred<SessionType[]>();
     const api = fakeApi({ sessions: () => pending.promise });

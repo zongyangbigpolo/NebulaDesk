@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
 use crate::error::{DesktopError, Result};
+use crate::model::Workspace;
 
 const MAX_RESPONSE: usize = 2 * 1024 * 1024;
 
@@ -39,6 +40,7 @@ struct TokenPair {
 pub struct Account {
     pub manager: Manager,
     pub user: User,
+    pub workspace: Workspace,
     credentials: Mutex<Credentials>,
 }
 
@@ -126,19 +128,52 @@ impl Manager {
         parse_response(request.send().await.map_err(DesktopError::network)?).await
     }
 
-    pub async fn login(self, tenant: String, email: String, password: String) -> Result<Account> {
-        let password = Zeroizing::new(password);
-        let pair: TokenPair = self.request(
-            Method::POST, "v1/auth/login", None,
-            Some(&serde_json::json!({"tenant":tenant,"email":email,"password":password.as_str()})),
-        ).await?;
+    pub async fn authenticate(self, path: &str, body: &serde_json::Value) -> Result<Account> {
+        let pair: TokenPair = self.request(Method::POST, path, None, Some(body)).await
+            .map_err(|error| {
+                if path == "v1/auth/accept-invitation" && error.code == "unauthorized" {
+                    DesktopError::new(
+                        "invalid_invitation",
+                        "The invitation is invalid, expired, used, revoked, or does not match the email. Ask your organization administrator for a new invitation.",
+                    )
+                } else {
+                    error
+                }
+            })?;
+        let credentials = Credentials {
+            access: Zeroizing::new(pair.access_token),
+            refresh: Zeroizing::new(pair.refresh_token),
+        };
+        // Resolve canonical ownership metadata before exposing any authenticated account.
+        let workspace = self
+            .request::<Workspace>(Method::GET, "v1/workspace", Some(&credentials.access), None)
+            .await
+            .and_then(|workspace| {
+                if workspace.id != pair.user.tenant_id || workspace.slug.trim().is_empty() {
+                    Err(DesktopError::protocol())
+                } else {
+                    Ok(workspace)
+                }
+            });
+        let workspace = match workspace {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                let _ = self
+                    .request::<serde_json::Value>(
+                        Method::POST,
+                        "v1/auth/logout",
+                        None,
+                        Some(&serde_json::json!({"refresh_token":credentials.refresh.as_str()})),
+                    )
+                    .await;
+                return Err(error);
+            }
+        };
         Ok(Account {
             manager: self,
             user: pair.user,
-            credentials: Mutex::new(Credentials {
-                access: Zeroizing::new(pair.access_token),
-                refresh: Zeroizing::new(pair.refresh_token),
-            }),
+            workspace,
+            credentials: Mutex::new(credentials),
         })
     }
 }
@@ -151,7 +186,7 @@ async fn parse_response(mut response: reqwest::Response) -> Result<serde_json::V
             }
             StatusCode::FORBIDDEN => DesktopError::new(
                 "forbidden",
-                "Your account is not permitted to perform this action.",
+                "Your account is not permitted to perform this action, or self-registration is disabled.",
             ),
             StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED => DesktopError::new(
                 "unavailable",
@@ -159,7 +194,11 @@ async fn parse_response(mut response: reqwest::Response) -> Result<serde_json::V
             ),
             StatusCode::CONFLICT => DesktopError::new(
                 "conflict",
-                "The resource is unavailable or this operation conflicts with its current state.",
+                "This workspace identifier or account may already exist, or the operation conflicts with its current state.",
+            ),
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => DesktopError::new(
+                "invalid_input",
+                "Check the fields and password policy. Invitations must be valid, unused and match the invited email.",
             ),
             _ => DesktopError::new("manager_error", "The manager rejected this request."),
         });

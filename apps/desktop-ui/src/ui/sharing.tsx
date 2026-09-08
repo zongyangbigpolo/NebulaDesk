@@ -1,6 +1,17 @@
 import { Monitor, Plus, Shield } from 'lucide-react';
-import type { LocalHost, Machine, PublishedResource } from '../api/types';
+import type { Account, LocalHost, Machine, PublishedResource } from '../api/types';
 import { Empty, ErrorNotice } from './common';
+
+export function LocalBinding({ host, account, verified }: { host: LocalHost | null; account: Account; verified: boolean }) {
+  return <section className="notice local-binding" aria-label="本机实际绑定">
+    <strong>本机实际绑定</strong>
+    {!host ? <p>无法读取本机身份，归属未知。</p> : !host.enrolled ? <p>尚未注册，没有工作空间或所有者绑定。</p> : <>
+      <p>服务器：{host.manager_url ?? '未知'} · 设备 ID：{host.machine_id ?? '未知'}</p>
+      {verified ? <p>已核对当前空间设备记录：{account.workspace.name}（{account.tenant}） · 所有者 {account.display_name || account.email} · {account.email}</p> :
+        <p>其他工作空间 / 所有者未知：本机身份未提供可直接核验的租户信息，当前账号也无法确认所有权。不能认定属于 {account.workspace.name} 或当前用户；共享管理已禁用。</p>}
+    </>}
+  </section>;
+}
 
 export function Sharing({ host, machine, resources, canManage, busy, onEnroll, onToggle, onAccess, onPublish, onEdit, onPermission }: {
   host: LocalHost | null; machine?: Machine; resources: PublishedResource[]; canManage: boolean; busy: boolean;

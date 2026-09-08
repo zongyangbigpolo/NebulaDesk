@@ -1,4 +1,10 @@
-export type Account = { id: string; email: string; display_name: string; role: string; tenant: string; manager_url: string };
+export type Workspace = { id: string; slug: string; name: string; kind: 'PERSONAL' | 'ORGANIZATION' };
+export type Account = { id: string; email: string; display_name: string; role: string; tenant: string; manager_url: string; workspace: Workspace };
+export type Invitation = { id: string; email: string; expires_at: string; created_at: string; revoked_at: string | null; accepted_at: string | null };
+export type DirectoryUser = { id: string; email: string; display_name: string; role: string; disabled: boolean };
+export type Group = { id: string; name: string };
+type Server = { manager_url: string; allow_insecure_http?: boolean };
+type Signup = { display_name: string; email: string; password: string };
 export type Policy = { input: boolean; audio: boolean; clipboard: boolean; file_transfer: boolean };
 export type Resource = {
   id: string; name: string; kind: 'DESKTOP' | 'APP'; description: string;
@@ -38,6 +44,21 @@ export type Publication = { kind: 'DESKTOP' | 'APP'; name: string; description: 
 export type Changes = { name?: string; description?: string; enabled?: boolean };
 
 export type Commands = {
+  connection_settings: { args: object; result: { manager_url: string | null } };
+  users: { args: object; result: DirectoryUser[] };
+  set_user_disabled: { args: { user_id: string; disabled: boolean }; result: null };
+  groups: { args: object; result: Group[] };
+  create_group: { args: { name: string }; result: Group };
+  delete_group: { args: { group_id: string }; result: null };
+  group_members: { args: { group_id: string }; result: DirectoryUser[] };
+  add_group_member: { args: { group_id: string; user_id: string }; result: null };
+  remove_group_member: { args: { group_id: string; user_id: string }; result: null };
+  registration_options: { args: Server; result: { self_registration_enabled: boolean } };
+  register: { args: Server & Signup & { workspace_slug: string; workspace_name: string; workspace_kind: Workspace['kind'] }; result: Account };
+  accept_invitation: { args: Server & Signup & { token: string }; result: Account };
+  create_invitation: { args: { email: string }; result: Invitation & { token: string } };
+  invitations: { args: object; result: Invitation[] };
+  revoke_invitation: { args: { id: string }; result: null };
   login: { args: { manager_url: string; tenant: string; email: string; password: string; allow_insecure_http?: boolean }; result: Account };
   logout: { args: object; result: null };
   account: { args: object; result: Account | null };
@@ -67,6 +88,7 @@ export type Commands = {
 export type Request<K extends keyof Commands = keyof Commands> = {
   [P in K]: { op: P } & Commands[P]['args']
 }[K];
+export type AuthenticationRequest = Request<'login' | 'register' | 'accept_invitation'>;
 export interface DesktopApi {
   request<K extends keyof Commands>(request: Request<K>): Promise<Commands[K]['result']>;
 }

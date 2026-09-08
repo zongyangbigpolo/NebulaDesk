@@ -1,0 +1,36 @@
+import { expect, it } from 'vitest';
+import { createDemoApi } from '../api/demo';
+
+it('keeps demo invitation creation and one-use acceptance explicitly sample-only', async () => {
+  const api = createDemoApi();
+  await api.request({ op: 'logout' });
+  expect(await api.request({ op: 'account' })).toBeNull();
+  const server = { manager_url: 'https://example.test' };
+  expect(await api.request({ op: 'registration_options', ...server })).toEqual({ self_registration_enabled: true });
+  const owner = await api.request({ op: 'register', ...server, workspace_name: 'Sample', workspace_slug: 'sample', workspace_kind: 'ORGANIZATION', display_name: 'Owner', email: 'owner@example.test', password: 'sample-password' });
+  expect(owner.workspace.name).toContain('示例');
+  expect(await api.request({ op: 'connection_settings' })).toEqual(server);
+  const users = await api.request({ op: 'users' });
+  expect(users.map(user => user.id)).toEqual([owner.id]);
+  const group = await api.request({ op: 'create_group', name: '示例团队' });
+  await api.request({ op: 'add_group_member', group_id: group.id, user_id: owner.id });
+  expect(await api.request({ op: 'group_members', group_id: group.id })).toEqual(users);
+  await api.request({ op: 'remove_group_member', group_id: group.id, user_id: owner.id });
+  expect(await api.request({ op: 'group_members', group_id: group.id })).toEqual([]);
+  await api.request({ op: 'delete_group', group_id: group.id });
+  expect(await api.request({ op: 'groups' })).toEqual([]);
+  const issued = await api.request({ op: 'create_invitation', email: 'member@example.test' });
+  expect(issued.token).toMatch(/^demo-only-/);
+  const items = await api.request({ op: 'invitations' });
+  expect(items).toHaveLength(1);
+  expect(items[0]).not.toHaveProperty('token');
+  await api.request({ op: 'logout' });
+  const request = { op: 'accept_invitation' as const, ...server, token: issued.token, display_name: 'Member', email: 'member@example.test', password: 'sample-password' };
+  const member = await api.request(request);
+  expect(member.workspace).toEqual(owner.workspace);
+  expect(member.role).toBe('USER');
+  await expect(api.request({ op: 'invitations' })).rejects.toThrow('组织管理员');
+  await expect(api.request({ op: 'users' })).rejects.toThrow('组织管理员');
+  await api.request({ op: 'logout' });
+  await expect(api.request(request)).rejects.toThrow('示例邀请无效');
+});

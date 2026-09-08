@@ -28,6 +28,21 @@ The frontend catches and displays errors and does not replace them with demo dat
 
 | Request | Reply |
 | --- | --- |
+| `{op:"connection_settings"}` | `{manager_url:string \| null}` (validated runtime/build HTTPS default, or last successful address for this app lifetime) |
+| `{op:"registration_options",manager_url,allow_insecure_http?}` | `{self_registration_enabled:boolean}` |
+| `{op:"register",manager_url,allow_insecure_http?,workspace_slug,workspace_name,workspace_kind,display_name,email,password}` | `Account` |
+| `{op:"accept_invitation",manager_url,allow_insecure_http?,token,display_name,email,password}` | `Account` |
+| `{op:"invitations"}` | `Invitation[]` |
+| `{op:"create_invitation",email}` | `Invitation & {token:string}` (one-time code) |
+| `{op:"revoke_invitation",id}` | `null` |
+| `{op:"users"}` | `DirectoryUser[]` |
+| `{op:"set_user_disabled",user_id,disabled}` | `null` |
+| `{op:"groups"}` | `Group[]` |
+| `{op:"create_group",name}` | `Group` |
+| `{op:"delete_group",group_id}` | `null` |
+| `{op:"group_members",group_id}` | `DirectoryUser[]` |
+| `{op:"add_group_member",group_id,user_id}` | `null` |
+| `{op:"remove_group_member",group_id,user_id}` | `null` |
 | `{op:"login",manager_url,tenant,email,password,allow_insecure_http?}` | `Account` |
 | `{op:"logout"}` | `null` |
 | `{op:"account"}` | `Account \| null` |
@@ -60,7 +75,12 @@ The host deduplicates open sessions by resource and focuses an existing window.
 
 ```ts
 type Account = { id: string; email: string; display_name: string; role: string;
-  tenant: string; manager_url: string };
+  tenant: string; manager_url: string; workspace: Workspace };
+type Workspace = { id: string; slug: string; name: string; kind: "PERSONAL" | "ORGANIZATION" };
+type Invitation = { id: string; email: string; expires_at: string; created_at: string;
+  revoked_at: string | null; accepted_at: string | null };
+type DirectoryUser = { id: string; email: string; display_name: string; role: string; disabled: boolean };
+type Group = { id: string; name: string };
 type Policy = { input: boolean; audio: boolean; clipboard: boolean; file_transfer: boolean };
 type Resource = { id: string; name: string; kind: "DESKTOP" | "APP";
   description: string; machine_status: string; role: string | null;
@@ -101,6 +121,27 @@ not tenant directory administration. VIEWER cannot enable any optional channel.
 Grant history retains expiry and revocation fields; inactive rows are not shown
 as usable or offered another revoke operation. Non-loopback plaintext HTTP requires an
 explicit user acknowledgement (`allow_insecure_http`), not a hidden retry.
+
+Registration creates a new workspace and its ADMIN; it never joins a workspace
+by guessing its slug. Joining an existing organization requires an email-bound,
+48-hour, single-use invitation and creates only a USER. Invitation and directory
+operations in the desktop host require an ORGANIZATION with ADMIN or legacy OWNER.
+The server remains authoritative. Self-disable is not allowed. Deleting a group
+revokes group grants, not the users themselves, and does not recall live sessions.
+
+Login, registration and invitation acceptance all fetch authoritative workspace
+metadata and verify the user/tenant association before installing an account.
+If this fails, the new login is revoked rather than exposing a partial account.
+Password and invitation inputs are cleared after submission; one-time invitation
+codes are never persisted. Account-mode enrollment explicitly supplies the
+current user's ID as owner, including ADMIN/OWNER accounts.
+
+Signup limits match Manager: slug 1–63 lowercase ASCII alphanumeric/hyphen
+characters with no leading/trailing hyphen; names 1–200 UTF-8 bytes and no control
+characters; email at most 254 bytes; password at least 12 Unicode characters and
+at most 1024 bytes; invitation token at most 128 bytes. Exact identifier inputs
+disable native autocorrection and capitalization. No email verification or
+automatic email delivery is implied.
 
 The UI can be previewed in a normal browser using an **explicit** demo switch.
 The demo adapter is a separate module, visibly identified, and never selected

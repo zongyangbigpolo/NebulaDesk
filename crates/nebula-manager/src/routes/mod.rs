@@ -6,6 +6,7 @@ pub mod machines;
 pub mod nodes;
 pub mod resources;
 pub mod sessions;
+mod workspace;
 
 use std::net::SocketAddr;
 
@@ -89,6 +90,12 @@ pub fn router(state: AppState) -> Router {
         .route("/ready", get(ready))
         .route("/.well-known/jwks.json", get(jwks))
         .route("/v1/auth/login", post(auth::login))
+        .route("/v1/auth/registration", get(workspace::registration))
+        .route("/v1/auth/register", post(workspace::register))
+        .route(
+            "/v1/auth/accept-invitation",
+            post(workspace::accept_invitation),
+        )
         .route("/v1/auth/refresh", post(auth::refresh))
         .route("/v1/auth/logout", post(auth::logout))
         // Enrolment authenticates with the token in the body, so it cannot
@@ -97,6 +104,15 @@ pub fn router(state: AppState) -> Router {
 
     let tenanted = Router::new()
         .route("/v1/auth/me", get(auth::me))
+        .route("/v1/workspace", get(workspace::current))
+        .route(
+            "/v1/workspace/invitations",
+            post(workspace::create_invitation).get(workspace::list_invitations),
+        )
+        .route(
+            "/v1/workspace/invitations/{id}",
+            delete(workspace::revoke_invitation),
+        )
         .route(
             "/v1/users",
             post(directory::create_user).get(directory::list_users),
@@ -109,7 +125,11 @@ pub fn router(state: AppState) -> Router {
             "/v1/groups",
             post(directory::create_group).get(directory::list_groups),
         )
-        .route("/v1/groups/{id}/members", post(directory::add_group_member))
+        .route("/v1/groups/{id}", delete(directory::delete_group))
+        .route(
+            "/v1/groups/{id}/members",
+            post(directory::add_group_member).get(directory::list_group_members),
+        )
         .route(
             "/v1/groups/{id}/members/{user_id}",
             delete(directory::remove_group_member),

@@ -142,6 +142,23 @@ Manager 当前是 HTTP API；生产部署应提供 HTTPS，开发脚本默认使
 `127.0.0.1` 当成给远端设备使用的地址。PostgreSQL 只供 Manager 访问。
 生产环境不应沿用开发用的 SSH 反向隧道或测试账号。
 
+### 部署配置与拆分顺序
+
+[`deploy/cloud`](../../deploy/cloud/README.md) 提供三个独立 systemd 服务、统一的
+地址配置、独立 HTTPS 入口和证书续期定时器。当前示例将三者放在 `47.103.58.159`：
+公网 Manager 为 `https://47.103.58.159`（TCP 443），Gateway 为 UDP 7443，
+Relay 为 UDP 7444；内部 Manager 只监听 `127.0.0.1:18081`，数据库不对公网开放。
+TCP 80 用于 HTTPS 证书挑战。配置示例不代表某次部署已经启动或完成端到端验收。
+
+Manager 独占组织、用户、用户组、设备和授权数据；Gateway/Relay 不各建一套用户库。
+Manager 的内部访问地址与公开票据 issuer 分开配置，后者必须保持为公开 HTTPS 地址。
+客户端只配置 Manager，节点通过登记和心跳提供可达的地址与证书 pin。
+桌面宿主是本机 API 调用层，不是第二个云端 Manager。
+
+现在同机部署便于运维；后续按地域、带宽优先拆分 Relay，再根据连接规模拆 Gateway。
+Manager/数据库按控制面负载独立扩容。服务拆分不自动等于高可用，数据库备份、节点
+故障切换、共享配置和运维监控仍需单独建设。
+
 ## 4. 从点击“连接”到出现画面
 
 ```mermaid
@@ -218,9 +235,14 @@ stateDiagram-v2
 erDiagram
   TENANT ||--o{ USER : contains
   TENANT ||--o{ MACHINE : contains
+  TENANT ||--o{ USER_GROUP : contains
+  TENANT ||--o{ WORKSPACE_INVITATION : issues
+  USER ||--o{ GROUP_MEMBERSHIP : joins
+  USER_GROUP ||--o{ GROUP_MEMBERSHIP : contains
   USER o|--o{ MACHINE : owns
   MACHINE ||--o{ RESOURCE : publishes
-  USER ||--o{ ENTITLEMENT : receives
+  USER o|--o{ ENTITLEMENT : receives
+  USER_GROUP o|--o{ ENTITLEMENT : receives
   RESOURCE ||--o{ ENTITLEMENT : grants
   RESOURCE ||--o{ SESSION : opens
   USER ||--o{ SESSION : initiates
@@ -228,13 +250,29 @@ erDiagram
 
 机器是资源的宿主，资源才是客户端申请连接的对象。资源可以是桌面，也可以是应用的
 发布记录；应用的执行路径属于所有者配置，不必暴露给仅有使用权限的人。
-授权可以指向用户或组，上图为便于阅读只画用户授权。
+每条授权指向用户或组之一；用户组通过成员关系参与服务端资源权限计算。
+删除组会在一个事务中撤销其资源授权并删除成员关系，不删除成员账号。
+
+工作空间对应现有 tenant，类型为 `PERSONAL` 或 `ORGANIZATION`。
+自助注册在同一事务中创建新空间、`ADMIN` 所有者和登录凭据，默认关闭，部署者需显式
+开启。组织管理员通过 48 小时有效、绑定邮箱、一次性的邀请创建普通 `USER`；
+数据库只存邀请码 hash，撤销、到期、重复使用及邮箱不匹配都不能加入。
+旧 `OWNER` 角色保留管理员权限，但新账号不自行选择管理员角色。
+账号设置仅向组织管理员开放成员和用户组管理，不向普通成员暴露目录枚举。
+
+当前账号归属于一个工作空间，同一邮箱跨空间并非同一个全局账号；
+没有多组织 membership 切换、自动邀请邮件、邮箱验证或密码找回。
+旧数据升级前必须执行只读邮箱唯一性预检，并暂停旧版本目录写入。
+遇到同空间大小写或首尾空白导致的重复邮箱，应人工确认后修正，不能自动合并账号；
+具体步骤见云端部署文档。
 
 Manager 根据当前数据库关系判定所有权、授权和会话策略，不信任前端的“我是所有者”
 标志。所有操作都在租户范围内执行。拥有某台设备不意味着可以管理整个用户目录；
 向指定用户共享时按本租户内的确切邮箱解析，不提供跨租户搜索。
 
 Agent 通过一次性注册令牌取得自己的机器身份，不使用人类的 access token 常驻运行。
+桌面「注册本机」显式指定当前用户为设备所有者，并显示所属空间，管理员注册也不例外。
+其他空间的既有本机身份不会被登录新账号自动接管；注册账号与开启共享是独立步骤。
 用户退出管理账号与撤销设备身份是两件事。移除设备、关闭共享、删除资源、撤销某人的
 授权也有不同影响，界面应分别说明并确认，而不是用一个无差别“删除”操作。
 

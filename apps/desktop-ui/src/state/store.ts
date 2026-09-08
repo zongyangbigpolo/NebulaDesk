@@ -1,4 +1,4 @@
-import type { Account, DesktopApi, LocalHost, Machine, Resource, Session, Transfer } from '../api/types';
+import type { Account, AuthenticationRequest, DesktopApi, LocalHost, Machine, Resource, Session, Transfer } from '../api/types';
 import { errorMessage } from '../api/desktop';
 
 export type Snapshot = {
@@ -35,12 +35,15 @@ export class DesktopStore {
     }
   }
   async login(input: { manager_url: string; tenant: string; email: string; password: string; allow_insecure_http?: boolean }) {
+    return this.authenticate({ op: 'login', ...input });
+  }
+  async authenticate(request: AuthenticationRequest) {
     if (this.mutationPending) return false;
     this.mutationPending = true;
     const epoch = ++this.epoch;
-    this.set({ busy: true, error: null });
+    this.set({ ...empty(), ready: true, busy: true });
     try {
-      const account = await this.api.request({ op: 'login', ...input });
+      const account = await this.api.request(request);
       if (epoch !== this.epoch) return false;
       this.set({ account, ready: true });
       await this.refresh();

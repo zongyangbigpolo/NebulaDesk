@@ -1,0 +1,25 @@
+[Unit]
+Description=NebulaDesk QUIC gateway
+After=network-online.target nebula-manager.service
+Wants=network-online.target nebula-manager.service
+
+[Service]
+Type=simple
+User=nebula
+Group=nebula
+EnvironmentFile=/etc/nebula/deployment.env
+EnvironmentFile=/etc/nebula/infrastructure.secrets.env
+ExecStart=/opt/nebula/current/bin/nebula-gateway
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/nebula/gateway
+
+[Install]
+WantedBy=multi-user.target

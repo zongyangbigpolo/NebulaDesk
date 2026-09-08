@@ -47,6 +47,25 @@ available. The gateway and relay cannot read session pixels, audio or keystrokes
 
 更多界面素材见[产品 UI 目录](design/product-ui/README.md)。
 
+### 注册账号与设备归属
+
+登录页提供「创建账号」和「我有组织邀请」。创建账号时选择个人空间或新组织，
+填写工作空间标识、显示名称、邮箱和密码；创建者成为该空间的管理员。
+加入已有组织必须使用管理员发出的、绑定邮箱的一次性邀请码，不能仅填写组织名称加入。
+同一邮箱在不同工作空间仍是独立账号，登录时需要工作空间标识。
+
+组织管理员可在账号设置中邀请成员、启停账号、创建和删除用户组、增删组成员。
+邀请码有效期 48 小时，只显示一次，需要自行交付；当前没有自动发邮件或邮箱验证。
+「本机共享 → 注册本机」会明确显示归属的工作空间和当前用户，注册账号本身不会自动
+添加电脑或开启共享，也不会把已有其他身份的设备悄悄改绑到新账号。
+
+云端地址、QUIC 节点地址和注册开关统一配置在
+[`deploy/cloud/deployment.env.example`](deploy/cloud/deployment.env.example)；
+实际私有配置放在 `/etc/nebula`，不提交密码或密钥。
+桌面用户只需填写 HTTPS Manager 地址，Gateway/Relay 由服务发现提供。
+打包时可设置 `NEBULA_MANAGER_URL` 作为登录页默认地址，用户仍可更换服务器。
+部署及旧数据库升级步骤见[云端部署说明](deploy/cloud/README.md)。
+
 ### 界面与运行边界
 
 前后端分开维护：`apps/desktop-ui` 使用 React/TypeScript，只负责管理界面；
@@ -67,7 +86,7 @@ available. The gateway and relay cannot read session pixels, audio or keystrokes
 
 | Program | What it is |
 | --- | --- |
-| `nebula-manager` | The control plane. Users, tenants, machines, published resources, entitlements, and the short-lived tickets that authorise a session. Holds all the state; carries none of the media. |
+| `nebula-manager` | The control plane. Personal/organization workspaces, users, groups, invitations, machines, resources, entitlements, and short-lived session tickets. PostgreSQL stores the authoritative directory and authorization data; no media passes through it. |
 | `nebula-gateway` | The public QUIC signalling entry point. Redeems tickets, and holds the outbound control tunnel each machine keeps open. |
 | `nebula-relay` | The data plane. Forwards bytes between two QUIC connections without being able to read them. |
 | `nebula-agent` | Runs on a machine that is being made available. Captures, encodes, injects input. |
@@ -172,10 +191,13 @@ To build a self-contained macOS application for local use:
 ```sh
 npm --prefix apps/desktop-host ci
 npm --prefix apps/desktop-host run build -- --debug --bundles app
+codesign --force --deep --sign - target/debug/bundle/macos/NebulaDesk.app
+codesign --verify --deep --strict target/debug/bundle/macos/NebulaDesk.app
 # target/debug/bundle/macos/NebulaDesk.app
 ```
 
-Run the sidecar preparation above first. For a release bundle, prepare sidecars
+Run the sidecar preparation above first. The ad-hoc signature above is for local
+development, not a Developer ID signature or notarization. For a release bundle, prepare sidecars
 without `--debug` and build without `--debug`; signing and notarization still
 need the distributor's credentials. The installed bundle does not need Node
 or a running Vite server. Windows/Linux use their native Tauri bundle targets;

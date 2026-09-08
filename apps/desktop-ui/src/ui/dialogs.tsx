@@ -1,10 +1,15 @@
 import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from 'react';
 import type { Account, DesktopApi, Machine, PublishedResource } from '../api/types';
+import { canAdministerOrganization } from '../api/permissions';
 import { useQuery } from '../state/useQuery';
 import { dateLabel, Empty, ErrorNotice, grantStatus, Loading, Modal } from './common';
+import { Invitations } from './invitations';
+import { OrganizationAdmin } from './organization';
 
 export type DialogState =
   | { kind: 'enroll' }
+  | { kind: 'invitations' }
+  | { kind: 'organization' }
   | { kind: 'rename'; machine: Machine }
   | { kind: 'remove'; machine: Machine }
   | { kind: 'stop' }
@@ -17,8 +22,8 @@ type Run = (work: () => Promise<unknown>, refresh?: boolean) => Promise<boolean>
 type Props = { dialog: DialogState; account: Account; api: DesktopApi; busy: boolean; error: string | null; run: Run; onClose: () => void; onCompleted?: () => void; onLogout: () => Promise<boolean> };
 const admissionNotice = '授权变更会阻止后续连接；已建立的连接不会立即断开。需要立即断开时，请停止被控端共享。';
 
-function Actions({ busy, onClose, label = '保存', danger = false }: { busy: boolean; onClose: () => void; label?: string; danger?: boolean }) {
-  return <footer className="modal-actions"><button type="button" disabled={busy} onClick={onClose}>取消</button><button type="submit" className={danger ? 'danger' : 'primary'} disabled={busy}>{busy ? '正在处理…' : label}</button></footer>;
+function Actions({ busy, blocked = false, onClose, label = '保存', danger = false }: { busy: boolean; blocked?: boolean; onClose: () => void; label?: string; danger?: boolean }) {
+  return <footer className="modal-actions"><button type="button" disabled={busy} onClick={onClose}>取消</button><button type="submit" className={danger ? 'danger' : 'primary'} disabled={busy || blocked}>{busy ? '正在处理…' : label}</button></footer>;
 }
 export function HttpOptIn({ url, value, onChange }: { url: string; value: boolean; onChange: (value: boolean) => void }) {
   return url.trim().toLowerCase().startsWith('http:') ? <label className="checkbox warning"><input type="checkbox" checked={value} onChange={e => onChange(e.target.checked)} />仅开发环境：允许向回环或私有 IP 通过明文 HTTP 发送凭据。请勿在不可信网络使用。</label> : null;
@@ -35,6 +40,8 @@ export function ActionDialog(props: Props) {
   const [token, setToken] = useState('');
   const [http, setHttp] = useState(false);
   if (dialog.kind === 'access') return <AccessDialog {...props} resourceId={dialog.resourceId} name={dialog.name} />;
+  if (dialog.kind === 'invitations') return canAdministerOrganization(account) ? <Invitations {...props} /> : null;
+  if (dialog.kind === 'organization') return canAdministerOrganization(account) ? <OrganizationAdmin {...props} /> : null;
   const titles = { enroll: '添加这台电脑', rename: '重命名设备', remove: '移除设备', stop: '停止本机共享', disconnect: '断开会话', logout: '退出登录', publish: '发布资源', edit: '编辑发布信息' };
   let body: ReactNode;
   let label = '保存';
@@ -42,7 +49,14 @@ export function ActionDialog(props: Props) {
   switch (dialog.kind) {
     case 'enroll':
       label = '添加设备';
-      body = <><p className="muted">将运行此客户端的电脑加入工作空间。不会添加其他远端设备。</p><label>设备名称<input autoFocus required value={name} onChange={e => setName(e.target.value)} maxLength={120} placeholder="例如：我的 MacBook" /></label><label>注册方式<select value={method} onChange={e => setMethod(e.target.value)}><option value="account">使用当前账号注册</option><option value="token">使用管理员提供的令牌</option></select></label>{method === 'token' && <><label>工作空间地址<input type="url" required value={managerUrl} onChange={e => setManagerUrl(e.target.value)} /></label><label>注册令牌<input type="password" required value={token} autoComplete="off" onChange={e => setToken(e.target.value)} /></label></>}<HttpOptIn url={method === 'account' ? account.manager_url : managerUrl} value={http} onChange={setHttp} /><p className="muted">注册令牌仅用于本次操作，不保存在浏览器中。注册完成后，请在本机共享中开启远程连接。</p></>;
+      body = <><p className="muted">将运行此客户端的电脑加入工作空间。不会添加其他远端设备。</p>
+        <label>设备名称<input autoFocus required value={name} onChange={e => setName(e.target.value)} maxLength={120} placeholder="例如：我的 MacBook" /></label>
+        <label>注册方式<select value={method} onChange={e => { setMethod(e.target.value); setToken(''); setHttp(false); }}><option value="account">使用当前账号注册</option><option value="token">使用管理员提供的设备令牌</option></select></label>
+        {method === 'account' ? <div className="notice" aria-label="设备归属确认"><strong>确认设备归属</strong><p>目标工作空间：{account.workspace.name}（{account.workspace.kind === 'PERSONAL' ? '个人空间' : '组织'}）</p><p>工作空间标识：{account.tenant}</p><p>设备所有者：{account.display_name} · {account.email}</p><p>服务器：{account.manager_url}</p><p>归属固定为当前账号，不能指定其他所有者。已有本机绑定不会自动转移。</p></div> : <>
+          <p className="notice">这是管理员设备注册模式，不是账号注册或组织成员邀请。目标工作空间与所有者由设备令牌决定，无法在此确认；请向管理员核实，不能据此认定属于当前账号。</p>
+          <label>工作空间地址<input autoCapitalize="none" autoCorrect="off" spellCheck={false} type="url" required value={managerUrl} onChange={e => { setManagerUrl(e.target.value); setHttp(false); }} /></label><label>注册令牌<input autoCapitalize="none" autoCorrect="off" spellCheck={false} type="password" required value={token} autoComplete="off" onChange={e => setToken(e.target.value)} /></label>
+        </>}
+        <HttpOptIn url={method === 'account' ? account.manager_url : managerUrl} value={http} onChange={setHttp} /><p className="muted">注册令牌仅用于本次操作，不保存在浏览器中。注册完成后，请在本机共享中开启远程连接。</p></>;
       break;
     case 'rename': body = <label>设备名称<input autoFocus required value={name} onChange={e => setName(e.target.value)} maxLength={120} /></label>; break;
     case 'publish': case 'edit':
@@ -59,10 +73,11 @@ export function ActionDialog(props: Props) {
     let ok = false;
     switch (dialog.kind) {
       case 'enroll':
+        if ((method === 'account' ? account.manager_url : managerUrl).trim().toLowerCase().startsWith('http:') && !http) return;
         ok = await run(async () => {
           const enrollmentToken = method === 'account' ? (await api.request({ op: 'create_enrollment', name: name.trim() })).token : token.trim();
           await api.request({ op: 'enroll_local', manager_url: method === 'account' ? account.manager_url : managerUrl.trim(), name: name.trim(), token: enrollmentToken, allow_insecure_http: http });
-        }); break;
+        }); setToken(''); break;
       case 'rename': ok = await run(() => api.request({ op: 'rename_machine', machine_id: dialog.machine.id, name: name.trim() })); break;
       case 'remove': ok = await run(() => api.request({ op: 'remove_machine', machine_id: dialog.machine.id })); break;
       case 'stop': ok = await run(() => api.request({ op: 'set_host_enabled', enabled: false })); break;
@@ -73,7 +88,8 @@ export function ActionDialog(props: Props) {
     }
     if (ok) { setToken(''); props.onCompleted?.(); onClose(); }
   }
-  return <Modal title={titles[dialog.kind]} onClose={onClose} busy={busy}><form onSubmit={submit}><div className="modal-body"><ErrorNotice message={error} />{body}{dialog.kind === 'edit' && !enabled && <p className="notice">{admissionNotice}</p>}</div><Actions busy={busy} onClose={onClose} label={label} danger={danger} /></form></Modal>;
+  const httpBlocked = dialog.kind === 'enroll' && (method === 'account' ? account.manager_url : managerUrl).trim().toLowerCase().startsWith('http:') && !http;
+  return <Modal title={titles[dialog.kind]} onClose={onClose} busy={busy}><form onSubmit={submit}><div className="modal-body"><ErrorNotice message={error} />{body}{dialog.kind === 'edit' && !enabled && <p className="notice">{admissionNotice}</p>}</div><Actions busy={busy} blocked={httpBlocked} onClose={onClose} label={label} danger={danger} /></form></Modal>;
 }
 
 function AccessDialog({ name, resourceId, api, busy, error, run, onClose }: Props & { name: string; resourceId: string }) {

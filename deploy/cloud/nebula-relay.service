@@ -1,0 +1,25 @@
+[Unit]
+Description=NebulaDesk encrypted QUIC relay
+After=network-online.target nebula-manager.service
+Wants=network-online.target nebula-manager.service
+
+[Service]
+Type=simple
+User=nebula
+Group=nebula
+EnvironmentFile=/etc/nebula/deployment.env
+EnvironmentFile=/etc/nebula/infrastructure.secrets.env
+ExecStart=/opt/nebula/current/bin/nebula-relay
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/nebula/relay
+
+[Install]
+WantedBy=multi-user.target

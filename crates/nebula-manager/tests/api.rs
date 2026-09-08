@@ -772,6 +772,54 @@ async fn group_membership_grants_access_and_revocation_removes_it() {
 }
 
 #[tokio::test]
+async fn deleting_a_group_revokes_its_resource_grants() {
+    let app = App::start().await;
+    let (_, resource) = app.online_machine_with_desktop("group-delete", None).await;
+    let (user, token) = app.user("member@acme.test", "USER").await;
+    let group = app
+        .post(
+            "/v1/groups",
+            Some(&app.owner_token),
+            json!({"name": "Temporary"}),
+        )
+        .await
+        .expect_status(StatusCode::CREATED)
+        .json()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    app.post(
+        &format!("/v1/groups/{group}/members"),
+        Some(&app.owner_token),
+        json!({"user_id": user}),
+    )
+    .await
+    .expect_status(StatusCode::NO_CONTENT);
+    app.post(
+        &format!("/v1/resources/{resource}/entitlements"),
+        Some(&app.owner_token),
+        json!({"subject_kind": "GROUP", "subject_id": group, "role": "VIEWER"}),
+    )
+    .await
+    .expect_status(StatusCode::CREATED);
+    assert_eq!(list_len(&app, &token).await, 1);
+    app.delete(&format!("/v1/groups/{group}"), Some(&app.owner_token))
+        .await
+        .expect_status(StatusCode::NO_CONTENT);
+    assert_eq!(list_len(&app, &token).await, 0);
+    let grants = app
+        .get(
+            &format!("/v1/resources/{resource}/entitlements"),
+            Some(&app.owner_token),
+        )
+        .await
+        .expect_status(StatusCode::OK)
+        .json();
+    assert_eq!(grants.as_array().unwrap().len(), 1);
+    assert!(!grants[0]["revoked_at"].is_null());
+}
+
+#[tokio::test]
 async fn a_session_ticket_carries_the_clamped_policy() {
     let app = App::start().await;
     let (gateway, _) = app.infrastructure().await;

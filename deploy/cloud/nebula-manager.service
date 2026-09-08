@@ -1,0 +1,24 @@
+[Unit]
+Description=NebulaDesk management API
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nebula
+Group=nebula
+EnvironmentFile=/etc/nebula/deployment.env
+EnvironmentFile=/etc/nebula/manager.secrets.env
+ExecStart=/opt/nebula/current/bin/nebula-manager
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
