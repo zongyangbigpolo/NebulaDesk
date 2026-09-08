@@ -3,26 +3,62 @@
 Remote desktop over QUIC, end to end encrypted, for the current releases of
 macOS, Windows and Linux.
 
-A user signs in, sees the machines and applications they are entitled to, and
-launches one. They are never told which machine serves it, and no part of the
-infrastructure they pass through can read the pixels, the audio or the
-keystrokes.
+A user signs in and sees the desktops and published applications they are
+entitled to. Desktop sessions use a native window; application publication and
+authorization are separate from single-application streaming, which is not yet
+available. The gateway and relay cannot read session pixels, audio or keystrokes.
 
-## The five programs
+## 产品界面与最终效果
+
+桌面产品采用已确认的[四张设计稿](design/product-ui/README.md)。
+**管理主窗口负责资源和共享，独立 Session 窗口负责远程操作**，不是在管理页面里嵌入一块视频。
+
+| 界面 | 最终使用效果 | 设计稿 |
+| --- | --- | --- |
+| 我的资源 | 登录后看到自己的电脑和获得授权的应用；搜索、筛选、查看在线状态，已打开的连接可直接返回。 | [资源首页](design/product-ui/01-resources.svg) |
+| 本机共享 | 注册当前电脑、启停被控服务、查看系统权限，分别管理桌面和应用的访问授权。 | [本机共享](design/product-ui/02-local-sharing.svg) |
+| 设备详情 | 查看真实的设备信息、在线状态和允许使用的功能；所有者可以修改名称或移除设备。 | [设备详情](design/product-ui/03-device-details.svg) |
+| Session | 远程画面占据主区域，工具条提供声音、剪贴板、文件、全屏和断开操作；连接面板显示实际路径和测量数据。 | [会话窗口](design/product-ui/04-session.svg) |
+
+![我的资源设计](design/product-ui/01-resources.svg)
+
+上述设计中的人名、电脑和指标是布局示例，不是预置账号或实时数据。
+正式界面从 Manager 和本地运行状态取数；浏览器演示使用独立、明确标注的演示入口。
+未获系统权限、设备离线、连接失败、授权失效都有单独状态，不用样例数据掩盖错误。
+
+前后端分开维护：`apps/desktop-ui` 使用 React/TypeScript，只负责管理界面；
+`crates/nebula-desktop` 使用 Rust/Tauri，负责登录、API 和本机进程；
+`crates/nebula-client` 保留原生会话、QUIC、解码和渲染。
+**音视频不经过 WebView、JavaScript 或桌面管理 IPC。**
+
+关闭一个 Session 只结束该连接；关闭管理窗口与停止本机共享是不同操作。
+应用卡片的目标是直接启动获得授权的软件，不要求使用者寻找承载它的电脑。
+当前尚未实现单应用窗口串流，相关入口必须明确标为不可连接，不能退化为暴露整台电脑。
+公网持续画面流畅度优化也仍是独立工作，不因产品界面落地而视为解决。
+
+工程分层、服务器部署及完整连接顺序见
+[产品工程与运行时架构](docs/architecture/PRODUCT_ARCHITECTURE.md)；
+前后端调用边界见[桌面接口约定](docs/architecture/DESKTOP_CONTRACT.md)。
+
+## Programs and responsibilities
 
 | Program | What it is |
 | --- | --- |
 | `nebula-manager` | The control plane. Users, tenants, machines, published resources, entitlements, and the short-lived tickets that authorise a session. Holds all the state; carries none of the media. |
-| `nebula-gateway` | The only public entry point. Redeems tickets, and holds the outbound control tunnel each machine keeps open. |
+| `nebula-gateway` | The public QUIC signalling entry point. Redeems tickets, and holds the outbound control tunnel each machine keeps open. |
 | `nebula-relay` | The data plane. Forwards bytes between two QUIC connections without being able to read them. |
 | `nebula-agent` | Runs on a machine that is being made available. Captures, encodes, injects input. |
-| `nebula-client` | The workspace app a user runs. |
+| `nebula-desktop` | The management application. Hosts the frontend, calls Manager APIs, and supervises native session windows. |
+| `nebula-client` | A native session window and CLI client; owns the QUIC/media path, not the management WebView. |
 
 ```mermaid
 flowchart LR
-    C[nebula-client] -->|ticket| G[nebula-gateway]
+    UI[React management UI] <-->|local typed IPC| D[nebula-desktop]
+    D <-->|HTTPS auth and resources| M[nebula-manager]
+    D -->|private process pipe| C[nebula-client]
+    C -->|QUIC ticket| G[nebula-gateway]
     A[nebula-agent] -->|outbound tunnel| G
-    G --> M[nebula-manager]
+    G --> M
     C <-->|encrypted media| R[nebula-relay]
     A <-->|encrypted media| R
     C <-.->|preferred authenticated direct path| A

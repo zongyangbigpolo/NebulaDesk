@@ -1,6 +1,9 @@
 # NebulaDesk V2 — 架构设计（全面重构）
 
 > 状态：设计定稿，实施中。
+> 桌面管理层现采用 React/TypeScript + Rust/Tauri，与原生 Session 分离。
+> 工程目录与运行时关系以 [PRODUCT_ARCHITECTURE.md](PRODUCT_ARCHITECTURE.md) 为准；
+> 本文保留协议、媒体和控制面的设计说明。
 > 本文取代 `ARCHITECTURE.md` / `ARCHITECTURE_OVERVIEW.md` / `PLAN.md` / `ROADMAP.md`
 > （V1 的 macOS-only C++/ObjC++ 实现将归档至 `legacy/`）。
 

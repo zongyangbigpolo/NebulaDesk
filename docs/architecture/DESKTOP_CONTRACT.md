@@ -39,6 +39,7 @@ The frontend catches and displays errors and does not replace them with demo dat
 | `{op:"focus_session",session_id}` | `null` |
 | `{op:"disconnect_session",session_id}` | `null` |
 | `{op:"local_host"}` | `LocalHost` |
+| `{op:"create_enrollment",name}` | `{token:string,expires_at:string}` (single-use, never persisted by the UI) |
 | `{op:"enroll_local",manager_url,token,name}` | `LocalHost` |
 | `{op:"set_host_enabled",enabled}` | `LocalHost` |
 | `{op:"rename_machine",machine_id,name}` | `null` |
