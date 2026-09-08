@@ -345,7 +345,7 @@ impl Chrome {
                     ui.set_clip_rect(rect);
                     egui::Frame::new()
                         .fill(Color32::from_rgb(251, 252, 253))
-                        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(223, 230, 236)))
+                        .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(223, 230, 236)))
                         .corner_radius(12)
                         .inner_margin(20)
                         .show(ui, |ui| {
@@ -654,7 +654,7 @@ fn icon_button(
     } else {
         Color32::from_rgb(156, 167, 176)
     };
-    let stroke = egui::Stroke::new(1.4, color);
+    let stroke = egui::Stroke::new(1.4_f32, color);
     let p = |x, y| center + Vec2::new(x, y);
     let line = |points: &[(f32, f32)]| {
         painter.add(egui::Shape::line(
