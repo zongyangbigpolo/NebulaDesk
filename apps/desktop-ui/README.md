@@ -65,8 +65,10 @@ The layout uses the actual native frame, not simulated traffic lights.
   disabled; it never connects the complete desktop instead.
 - Unknown OS/account metadata remains unknown. A local sharing toggle is not an
   authorization boundary; backend ownership remains authoritative.
-- Existing grants display `user_id`/`group_id`, because the contract does not
-  return recipient email. New grants use an exact complete email, not a directory.
+- Existing grants prefer optional `user_email`, `user_display_name`, `group_name`
+  metadata, with `user_id`/`group_id` as fallback for older replies. New grants
+  use an exact complete email, not a directory. VIEWER disallows all capability
+  flags; the form resets and disables them when switching to this role.
 - Recent use comes from observed session history, not fabricated timestamps.
   The contract has no persisted recents or host access audit endpoint.
 - No remote image/audio payload, bearer token, session ticket or executable path

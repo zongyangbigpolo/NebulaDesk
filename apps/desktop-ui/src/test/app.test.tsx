@@ -55,6 +55,18 @@ describe('desktop presentation and actions', () => {
     expect(screen.queryByRole('button', { name: '移除设备' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '管理访问权限' })).not.toBeInTheDocument();
   });
+  it('opens only the selected native permission settings and surfaces unsupported errors', async () => {
+    const user = userEvent.setup();
+    const api = fakeApi({ open_permission_settings: () => Promise.reject({ code: 'unsupported', message: '请手动打开系统设置' }) });
+    render(<App api={api} />);
+    await screen.findByRole('button', { name: '打开' });
+    await user.click(screen.getByRole('button', { name: '本机共享' }));
+    const button = await screen.findByRole('button', { name: '打开屏幕录制系统设置' });
+    await waitFor(() => expect(button).toBeEnabled());
+    await user.click(button);
+    expect(await screen.findByRole('alert')).toHaveTextContent('请手动打开系统设置');
+    expect(api.calls).toContainEqual({ op: 'open_permission_settings', permission: 'screen' });
+  });
   it('sends exact email grants with independent permission choices', async () => {
     const user = userEvent.setup();
     const api = fakeApi({

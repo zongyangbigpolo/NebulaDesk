@@ -4,6 +4,10 @@ import type { Resource, Session } from '../api/types';
 
 export const sessionLabels: Record<Session['state'], string> = { connecting: '正在连接', connected: '已连接', disconnected: '已断开', failed: '连接失败' };
 export function online(resource: Resource) { return resource.machine_status.toUpperCase() === 'ONLINE'; }
+export function machineStatusLabel(resource: Resource) {
+  return online(resource) ? '在线' : resource.machine_status.toUpperCase() === 'OFFLINE' ? '离线' : '状态未知';
+}
+export function shortcutLabel(platform: string) { return /mac/i.test(platform) ? '⌘ K' : 'Ctrl K'; }
 export function unavailable(resource: Resource) {
   if (!resource.launch_supported) return resource.kind === 'APP' ? '暂不支持独立应用连接' : '此资源暂不支持连接';
   if (!online(resource)) return resource.machine_status.toUpperCase() === 'OFFLINE' ? '设备离线' : '设备状态未知';

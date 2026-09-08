@@ -65,7 +65,7 @@ export function createDemoApi(): DesktopApi {
       case 'update_resource': published = published.map(r => r.id === request.resource_id ? { ...r, ...request.changes } : r); return null;
       case 'grants': return grants.filter(g => g.resource_id === request.resource_id);
       case 'grant_access': {
-        const grant: Grant = { id: crypto.randomUUID(), resource_id: request.resource_id, user_id: request.email, group_id: null, role: request.role, allow_audio: request.allow_audio, allow_clipboard: request.allow_clipboard, allow_file_transfer: request.allow_file_transfer };
+        const grant: Grant = { id: crypto.randomUUID(), resource_id: request.resource_id, user_id: crypto.randomUUID(), user_email: request.email, group_id: null, role: request.role, allow_audio: request.allow_audio, allow_clipboard: request.allow_clipboard, allow_file_transfer: request.allow_file_transfer };
         grants = [...grants, grant]; return grant;
       }
       case 'revoke_access': grants = grants.filter(g => g.id !== request.entitlement_id); return null;
