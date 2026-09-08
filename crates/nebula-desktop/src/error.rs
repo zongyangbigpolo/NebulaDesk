@@ -17,7 +17,10 @@ impl DesktopError {
     }
 
     pub fn protocol() -> Self {
-        Self::new("protocol", "The service returned an invalid or oversized response.")
+        Self::new(
+            "protocol",
+            "The service returned an invalid or oversized response.",
+        )
     }
 
     pub fn cancelled() -> Self {

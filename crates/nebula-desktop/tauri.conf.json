@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "NebulaDesk",
+  "version": "0.1.0",
+  "identifier": "com.nebuladesk.desktop",
+  "build": {
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../../apps/desktop-ui/dist",
+    "beforeDevCommand": "npm --prefix ../../apps/desktop-ui run dev",
+    "beforeBuildCommand": "npm --prefix ../../apps/desktop-ui run build",
+    "features": ["gui"]
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "NebulaDesk",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 960,
+        "minHeight": 640,
+        "create": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; frame-src 'none'",
+      "devCsp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1420; object-src 'none'; base-uri 'none'; frame-src 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "externalBin": ["binaries/nebula-client", "binaries/nebula-agent"],
+    "macOS": {
+      "minimumSystemVersion": "12.0",
+      "infoPlist": "Info.plist"
+    }
+  }
+}

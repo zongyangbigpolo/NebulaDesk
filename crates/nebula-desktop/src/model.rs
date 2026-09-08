@@ -1,33 +1,98 @@
+pub use nebula_desktop_protocol::{
+    ConnectionPath, Policy, SessionState, TransferDirection as Direction, TransferState,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
-    Login { manager_url: String, tenant: String, email: String, password: String, #[serde(default)] allow_insecure_http: bool },
+    Login {
+        manager_url: String,
+        tenant: String,
+        email: String,
+        password: String,
+        #[serde(default)]
+        allow_insecure_http: bool,
+    },
     Logout,
     Account,
     Resources,
     Machines,
-    Resource { id: Uuid },
-    Connect { resource_id: Uuid },
+    Resource {
+        id: Uuid,
+    },
+    Connect {
+        resource_id: Uuid,
+    },
     Sessions,
-    FocusSession { session_id: Uuid },
-    DisconnectSession { session_id: Uuid },
+    FocusSession {
+        session_id: Uuid,
+    },
+    DisconnectSession {
+        session_id: Uuid,
+    },
     LocalHost,
-    EnrollLocal { manager_url: String, token: String, name: String, #[serde(default)] allow_insecure_http: bool },
-    SetHostEnabled { enabled: bool },
-    CreateEnrollment { name: String },
-    RenameMachine { machine_id: Uuid, name: String },
-    RemoveMachine { machine_id: Uuid },
-    MachineResources { machine_id: Uuid },
-    PublishResource { machine_id: Uuid, resource: Publication },
-    UpdateResource { resource_id: Uuid, changes: ResourceChanges },
-    Grants { resource_id: Uuid },
-    GrantAccess { resource_id: Uuid, email: String, role: Role, allow_clipboard: bool, allow_file_transfer: bool, allow_audio: bool },
-    RevokeAccess { entitlement_id: Uuid },
+    OpenPermissionSettings {
+        permission: Permission,
+    },
+    EnrollLocal {
+        manager_url: String,
+        token: String,
+        name: String,
+        #[serde(default)]
+        allow_insecure_http: bool,
+    },
+    SetHostEnabled {
+        enabled: bool,
+    },
+    CreateEnrollment {
+        name: String,
+    },
+    RenameMachine {
+        machine_id: Uuid,
+        name: String,
+    },
+    RemoveMachine {
+        machine_id: Uuid,
+    },
+    MachineResources {
+        machine_id: Uuid,
+    },
+    PublishResource {
+        machine_id: Uuid,
+        resource: Publication,
+    },
+    UpdateResource {
+        resource_id: Uuid,
+        changes: ResourceChanges,
+    },
+    Grants {
+        resource_id: Uuid,
+    },
+    GrantAccess {
+        resource_id: Uuid,
+        email: String,
+        role: Role,
+        allow_clipboard: bool,
+        allow_file_transfer: bool,
+        allow_audio: bool,
+    },
+    RevokeAccess {
+        entitlement_id: Uuid,
+    },
     Transfers,
-    SendFiles { session_id: Uuid },
+    SendFiles {
+        session_id: Uuid,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Permission {
+    Screen,
+    Input,
+    Audio,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -51,18 +116,17 @@ pub struct ResourceChanges {
 
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(rename_all = "UPPERCASE")]
-pub enum Kind { Desktop, App }
+pub enum Kind {
+    Desktop,
+    App,
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "UPPERCASE")]
-pub enum Role { Viewer, Controller, Admin }
-
-#[derive(Deserialize, Serialize, Clone)]
-pub struct Policy {
-    pub input: bool,
-    pub audio: bool,
-    pub clipboard: bool,
-    pub file_transfer: bool,
+pub enum Role {
+    Viewer,
+    Controller,
+    Admin,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -113,6 +177,9 @@ pub struct Entitlement {
     pub resource_id: Uuid,
     pub subject_kind: String,
     pub subject_id: Uuid,
+    pub user_email: Option<String>,
+    pub user_display_name: Option<String>,
+    pub group_name: Option<String>,
     pub role: String,
     pub allow_clipboard: bool,
     pub allow_file_transfer: bool,
@@ -125,6 +192,9 @@ pub struct Grant {
     pub resource_id: Uuid,
     pub user_id: Option<Uuid>,
     pub group_id: Option<Uuid>,
+    pub user_email: Option<String>,
+    pub user_display_name: Option<String>,
+    pub group_name: Option<String>,
     pub role: String,
     pub allow_clipboard: bool,
     pub allow_file_transfer: bool,
@@ -134,11 +204,17 @@ pub struct Grant {
 impl From<Entitlement> for Grant {
     fn from(value: Entitlement) -> Self {
         Self {
-            id: value.id, resource_id: value.resource_id,
+            id: value.id,
+            resource_id: value.resource_id,
             user_id: (value.subject_kind == "USER").then_some(value.subject_id),
             group_id: (value.subject_kind == "GROUP").then_some(value.subject_id),
-            role: value.role, allow_clipboard: value.allow_clipboard,
-            allow_file_transfer: value.allow_file_transfer, allow_audio: value.allow_audio,
+            user_email: value.user_email,
+            user_display_name: value.user_display_name,
+            group_name: value.group_name,
+            role: value.role,
+            allow_clipboard: value.allow_clipboard,
+            allow_file_transfer: value.allow_file_transfer,
+            allow_audio: value.allow_audio,
         }
     }
 }
@@ -159,19 +235,14 @@ pub struct AccountView {
     pub manager_url: String,
 }
 
-#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionState { Connecting, Connected, Disconnected, Failed }
-
-impl SessionState {
-    pub fn active(self) -> bool {
+pub trait StateExt {
+    fn active(self) -> bool;
+}
+impl StateExt for SessionState {
+    fn active(self) -> bool {
         matches!(self, Self::Connecting | Self::Connected)
     }
 }
-
-#[derive(Deserialize, Serialize, Clone, Copy)]
-#[serde(rename_all = "snake_case")]
-pub enum ConnectionPath { Direct, Relay }
 
 #[derive(Serialize, Clone)]
 pub struct Session {
@@ -184,14 +255,6 @@ pub struct Session {
     pub error: Option<String>,
     pub rtt_ms: Option<f64>,
 }
-
-#[derive(Deserialize, Serialize, Clone)]
-#[serde(rename_all = "snake_case")]
-pub enum Direction { Send, Receive }
-
-#[derive(Deserialize, Serialize, Clone, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum TransferState { Offered, Transferring, Complete, Failed }
 
 #[derive(Serialize, Clone)]
 pub struct Transfer {
