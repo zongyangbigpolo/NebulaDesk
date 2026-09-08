@@ -32,7 +32,7 @@ done
 {
   printf 'source_commit=%s\ntarget=%s\nglibc_baseline=%s\n' "$COMMIT" "$TARGET" "$GLIBC"
   rustc --version
-  cargo zigbuild --version
+  cargo-zigbuild --version
   zig version
 } > "$STAGE/build-info.txt"
 (
