@@ -312,15 +312,19 @@ reach, which is rarely the one the process bound to.
 ### macOS permissions
 
 A machine running the agent needs two grants in System Settings > Privacy &
-Security, both under the agent's own binary:
+Security. For the desktop bundle, authorize the actual **NebulaDesk.app** used
+for sharing, not an old backup or an unrelated standalone agent:
 
 * **Screen & System Audio Recording** — without it there is nothing to capture,
   and the session fails rather than showing a blank picture.
 * **Accessibility** — without it the agent refuses to offer input at all,
   rather than posting events the window server silently discards.
 
-Both are tied to the exact binary, so a rebuild invalidates them. If the agent
-is already listed and still refuses, remove the entry and add it again.
+Grants follow macOS's responsible application and code identity. Ad-hoc rebuilds
+and multiple installed copies can require renewed authorization; a grant for a
+Terminal-launched CLI does not establish permission for the desktop bundle.
+If the current app is absent, add it and enable its switch. Follow any system
+relaunch request, then reconnect; input availability is checked at session start.
 
 Direct connections also need **Local Network** access on both Macs. A CLI
 launched by an IDE or terminal may inherit that application's privacy identity.
@@ -360,6 +364,30 @@ Two-Mac desktop runs have also exercised native text/PNG pasteboards in both
 directions, with endpoint logs confirming Nebula clipboard messages, and
 six-file batches in each direction (including empty and 5 MiB files) verified
 by content hashes. Copying a file again preserves the earlier arrival.
+
+### Packaged Mac acceptance: 2026-09-09
+
+This run used the signed-in management UI and its bundled native Client/Agent,
+with cloud session brokering and **LAN Direct** media, not the demo UI or a
+standalone CLI session.
+
+| Area | Result in this run |
+| --- | --- |
+| Screen capture and reconnect | The prior immediate disconnect reproduced a macOS Screen Recording denial. After the user authorized NebulaDesk, two connections succeeded at 1440 x 900; the second stayed connected while animated video snapshots 90 seconds apart showed advancing source frame numbers. |
+| System audio | A five-second remote 997 Hz tone reached the Client's native output; the passive meter detected 240128 matching frames at 48 kHz, versus zero in the silent baseline. This is not a physical-speaker measurement. |
+| Clipboard | Text and native PNG images synchronized in both directions. |
+| Files | Six files per direction, including empty and 5242909-byte files, arrived with matching SHA-256 hashes. |
+| Keyboard and mouse | Not accepted in this run: controlled input did not reach the fixture, and the current bundle's Accessibility grant still needed confirmation. Earlier standalone/native input results do not replace this packaged-app acceptance. |
+
+The running apps were not replaced during this run, to preserve their in-memory
+logins and newly granted OS permission. The `7ffafff` failure-feedback update is
+committed; signed apps are staged under `Desktop/client/update-7ffafff` and
+`Desktop/server/update-7ffafff`, but activation and post-update acceptance remain
+pending. The run does not establish sustained WAN/Relay performance, loss recovery
+under load, or Windows/Linux runtime interoperability.
+
+Remaining product work is tracked in the
+[architecture boundaries](docs/architecture/PRODUCT_ARCHITECTURE.md#9-当前边界与后续扩展).
 
 ### Clipboard and files on macOS
 
