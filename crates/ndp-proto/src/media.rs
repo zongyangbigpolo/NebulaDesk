@@ -42,7 +42,9 @@ fn video_codec_from_id(v: u8) -> Result<VideoCodec> {
 /// width(2) height(2) duration_us(4)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoFrameInfo {
-    /// Which negotiated display this frame belongs to.
+    /// Which negotiated display this frame belongs to. In explicitly negotiated
+    /// application mode, this is a session-unique, never-reused surface ID;
+    /// decoder and recovery state must be independent for each ID.
     pub display: u8,
     /// Codec of the bitstream that follows.
     pub codec: VideoCodec,

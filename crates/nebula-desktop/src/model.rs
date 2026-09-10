@@ -80,6 +80,8 @@ pub enum Request {
     },
     Connect {
         resource_id: Uuid,
+        #[serde(default)]
+        keyboard_profile: ApplicationKeyboardProfile,
     },
     Sessions,
     FocusSession {
@@ -156,6 +158,26 @@ pub struct Workspace {
     pub slug: String,
     pub name: String,
     pub kind: WorkspaceKind,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplicationKeyboardProfile {
+    #[default]
+    Physical,
+    Editing,
+    Terminal,
+}
+
+impl ApplicationKeyboardProfile {
+    pub fn client_args(self) -> [&'static str; 4] {
+        let (mode, profile) = match self {
+            Self::Physical => ("physical", "physical"),
+            Self::Editing => ("semantic", "editing"),
+            Self::Terminal => ("semantic", "terminal"),
+        };
+        ["--keyboard-mode", mode, "--keyboard-profile", profile]
+    }
 }
 
 #[derive(Deserialize, Serialize)]

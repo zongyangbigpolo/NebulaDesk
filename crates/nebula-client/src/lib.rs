@@ -9,6 +9,8 @@
 //! HTTP, [`connect`] turns a ticket into an encrypted session, and everything
 //! after that is media.
 
+pub mod application;
+mod application_native;
 pub mod audio;
 pub mod chrome;
 pub mod connect;
@@ -19,6 +21,7 @@ pub mod manager;
 pub mod nal;
 pub mod render;
 pub mod session;
+pub mod shortcuts;
 pub mod video;
 
 pub use connect::{connect_to_agent, Connected};

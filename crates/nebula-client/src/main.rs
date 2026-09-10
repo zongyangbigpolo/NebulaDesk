@@ -38,13 +38,32 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run a host-owned native session with bounded control messages on stdin.
-    DesktopSession,
+    DesktopSession {
+        /// Application-only shortcut mode; desktop input remains physical.
+        #[arg(long, default_value = "physical", value_parser = ["physical", "semantic"])]
+        keyboard_mode: String,
+        /// Per-resource application keyboard profile.
+        #[arg(long, default_value = "physical", value_parser = ["physical", "editing", "terminal"])]
+        keyboard_profile: String,
+        /// Override the negotiated application host OS.
+        #[arg(long, value_parser = ["macos", "windows", "linux"])]
+        host_os: Option<String>,
+    },
     /// Show everything this account may connect to.
     List,
     /// Open a resource in a window.
     Connect {
         /// The resource's id, or enough of its name to identify it.
         resource: String,
+        /// Application shortcut behavior; desktop sessions remain physical.
+        #[arg(long, default_value = "physical", value_parser = ["physical", "semantic"])]
+        keyboard_mode: String,
+        /// Published application's input profile (terminal preserves Ctrl+C).
+        #[arg(long, default_value = "physical", value_parser = ["physical", "editing", "terminal"])]
+        keyboard_profile: String,
+        /// Override the negotiated remote OS for application shortcuts.
+        #[arg(long, value_parser = ["macos", "windows", "linux"])]
+        host_os: Option<String>,
     },
 }
 
@@ -58,8 +77,17 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    if matches!(cli.command, Command::DesktopSession) {
-        return nebula_client::desktop::run();
+    if let Command::DesktopSession {
+        keyboard_mode,
+        keyboard_profile,
+        host_os,
+    } = &cli.command
+    {
+        return nebula_client::desktop::run_with_keyboard(keyboard_configuration(
+            keyboard_mode,
+            keyboard_profile,
+            host_os.as_deref(),
+        ));
     }
     let manager_url = cli
         .manager_url
@@ -92,7 +120,7 @@ fn main() -> anyhow::Result<()> {
     })?;
 
     match cli.command {
-        Command::DesktopSession => unreachable!("handled before login"),
+        Command::DesktopSession { .. } => unreachable!("handled before login"),
         Command::List => {
             if resources.is_empty() {
                 println!("Nothing has been shared with this account yet.");
@@ -107,7 +135,12 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
 
-        Command::Connect { resource } => {
+        Command::Connect {
+            resource,
+            keyboard_mode,
+            keyboard_profile,
+            host_os,
+        } => {
             let chosen = pick(&resources, &resource)?;
             if !chosen.is_online() {
                 anyhow::bail!(
@@ -117,11 +150,48 @@ fn main() -> anyhow::Result<()> {
                 );
             }
             let ticket = runtime.block_on(manager.open(&chosen.id))?;
+            anyhow::ensure!(
+                ticket.application_windows == (chosen.kind == "APP"),
+                "The manager did not confirm the requested resource mode. Update or refresh the workspace."
+            );
             // The runtime is done; the session builds its own, because the
             // event loop is about to take this thread for good.
             drop(runtime);
-            session::run(ticket, &chosen.name)
+            if chosen.kind == "APP" {
+                nebula_client::application::run_with_keyboard(
+                    ticket,
+                    false,
+                    keyboard_configuration(&keyboard_mode, &keyboard_profile, host_os.as_deref()),
+                )
+            } else {
+                session::run(ticket, &chosen.name)
+            }
         }
+    }
+}
+
+fn keyboard_configuration(
+    mode: &str,
+    profile: &str,
+    host: Option<&str>,
+) -> nebula_client::shortcuts::Configuration {
+    use nebula_client::shortcuts::{Configuration, Mode, Platform, Profile};
+    Configuration {
+        mode: if mode == "semantic" {
+            Mode::Semantic
+        } else {
+            Mode::Physical
+        },
+        profile: match profile {
+            "editing" => Profile::Editing,
+            "terminal" => Profile::Terminal,
+            _ => Profile::Physical,
+        },
+        host: host.map(|os| match os {
+            "macos" => Platform::Mac,
+            "windows" => Platform::Windows,
+            _ => Platform::Linux,
+        }),
     }
 }
 
@@ -164,7 +234,42 @@ mod tests {
     #[test]
     fn desktop_session_can_parse_without_human_login_arguments() {
         let cli = Cli::try_parse_from(["nebula-client", "desktop-session"]).unwrap();
-        assert!(matches!(cli.command, Command::DesktopSession));
+        assert!(
+            matches!(cli.command, Command::DesktopSession { keyboard_mode, keyboard_profile, host_os: None }
+            if keyboard_mode == "physical" && keyboard_profile == "physical")
+        );
+    }
+
+    #[test]
+    fn managed_application_shortcut_mode_is_explicit_and_login_free() {
+        let cli = Cli::try_parse_from([
+            "nebula-client",
+            "desktop-session",
+            "--keyboard-mode",
+            "semantic",
+            "--keyboard-profile",
+            "editing",
+        ])
+        .unwrap();
+        let Command::DesktopSession {
+            keyboard_mode,
+            keyboard_profile,
+            host_os,
+        } = cli.command
+        else {
+            panic!("managed session expected");
+        };
+        let configuration =
+            keyboard_configuration(&keyboard_mode, &keyboard_profile, host_os.as_deref());
+        assert_eq!(configuration.mode, nebula_client::shortcuts::Mode::Semantic);
+        assert_eq!(
+            configuration.profile,
+            nebula_client::shortcuts::Profile::Editing
+        );
+        assert!(
+            configuration.host.is_none(),
+            "negotiated host OS remains available"
+        );
     }
 
     #[test]
@@ -181,7 +286,35 @@ mod tests {
             "Office",
         ])
         .unwrap();
-        assert!(matches!(cli.command, Command::Connect { resource } if resource == "Office"));
+        assert!(matches!(cli.command, Command::Connect { resource, .. } if resource == "Office"));
+    }
+
+    #[test]
+    fn semantic_application_shortcuts_allow_negotiated_host_or_explicit_override() {
+        assert!(Cli::try_parse_from([
+            "nebula-client",
+            "connect",
+            "Editor",
+            "--keyboard-mode",
+            "semantic"
+        ])
+        .is_ok());
+        let cli = Cli::try_parse_from([
+            "nebula-client",
+            "connect",
+            "Editor",
+            "--keyboard-mode",
+            "semantic",
+            "--keyboard-profile",
+            "editing",
+            "--host-os",
+            "macos",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Command::Connect { keyboard_mode, keyboard_profile, host_os: Some(host), .. }
+            if keyboard_mode == "semantic" && keyboard_profile == "editing" && host == "macos")
+        );
     }
 
     fn resource(id: &str, name: &str) -> Resource {

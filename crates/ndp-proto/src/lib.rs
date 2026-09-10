@@ -36,6 +36,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod application;
 pub mod caps;
 pub mod channel;
 pub mod control;
@@ -44,6 +45,11 @@ pub mod input;
 pub mod media;
 pub mod transfer;
 
+pub use application::{
+    ApplicationFailureReason, ApplicationHostOs, ApplicationKeyboardProfile, ApplicationMessage,
+    SurfaceFrameInfo, SurfaceInfo, SurfaceRegistry, APPLICATION_PROTOCOL_VERSION,
+    MAX_APPLICATION_SURFACES, SURFACE_FRAME_INFO_LEN,
+};
 pub use caps::{
     AudioCodec, AudioParams, Caps, ColorCaps, DisplayGeometry, FeatureFlags, VideoCodec,
 };

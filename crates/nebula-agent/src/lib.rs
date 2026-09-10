@@ -12,6 +12,7 @@
 
 #![warn(missing_docs)]
 
+pub mod application;
 pub mod clipboard;
 mod direct;
 pub mod files;
@@ -109,6 +110,16 @@ impl Agent {
 
     /// Attach to a gateway and serve until the tunnel ends.
     async fn attach_once(&self) -> anyhow::Result<()> {
+        // Native capture/encoder prerequisite checks can block for seconds.
+        // Complete them off the async executor and before opening a tunnel,
+        // where the gateway's AgentHello deadline is already running.
+        let platform = self.platform.clone();
+        let application = tokio::task::spawn_blocking(move || platform.application_capability())
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "application capability probe failed before gateway attach");
+                nebula_common::ApplicationCapability::default()
+            });
         let assignment = self.manager.gateway().await?;
         let pin = CertificateFingerprint::from_hex(&assignment.cert_pin)
             .map_err(|_| anyhow::anyhow!("the manager gave a malformed gateway pin"))?;
@@ -133,6 +144,7 @@ impl Agent {
                 machine_id: nebula_common::MachineId::from_uuid(self.identity.machine_id),
                 credential: self.identity.credential.clone(),
                 agent_version: env!("CARGO_PKG_VERSION").into(),
+                application_windows: application.is_supported(),
             },
         )
         .await?;
@@ -156,11 +168,23 @@ impl Agent {
         // once the liveness grace period elapsed and could not be reached
         // again until it reconnected.
         let manager = self.manager.clone();
+        let platform = self.platform.clone();
         let liveness = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(heartbeat);
             loop {
                 ticker.tick().await;
-                if let Err(error) = manager.heartbeat("ONLINE", Some(gateway_id)).await {
+                let probe = platform.clone();
+                let application =
+                    tokio::task::spawn_blocking(move || probe.application_capability())
+                        .await
+                        .unwrap_or_else(|error| {
+                            tracing::warn!(%error, "application capability probe failed");
+                            nebula_common::ApplicationCapability::default()
+                        });
+                if let Err(error) = manager
+                    .heartbeat_with_application("ONLINE", Some(gateway_id), application)
+                    .await
+                {
                     // Losing one heartbeat is survivable; the grace period is
                     // several intervals wide.
                     tracing::warn!(%error, "could not report liveness to the manager");
@@ -231,6 +255,8 @@ impl Agent {
                     let platform = Arc::clone(&self.platform);
                     let reply = outbound.clone();
                     let registry = Arc::clone(&self.sessions);
+                    let manager = self.manager.clone();
+                    let machine = nebula_common::MachineId::from_uuid(self.identity.machine_id);
                     let (stop, stopped) = oneshot::channel();
                     registry
                         .lock()
@@ -238,7 +264,17 @@ impl Agent {
                         .insert(request.session, stop);
                     tokio::spawn(async move {
                         let session = request.session;
-                        let served = session::serve(request, keys, platform, stopped).await;
+                        let served = async {
+                            manager
+                                .verify_session_authority(
+                                    &request,
+                                    machine,
+                                    &hex::encode(keys.public().as_bytes()),
+                                )
+                                .await?;
+                            session::serve(*request, keys, platform, stopped).await
+                        }
+                        .await;
                         // However it ended, it is no longer running, and a
                         // stale entry would make the next heartbeat lie.
                         registry

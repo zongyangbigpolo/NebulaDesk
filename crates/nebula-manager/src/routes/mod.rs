@@ -167,6 +167,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/gateways", post(nodes::register_gateway))
         .route("/v1/relays", post(nodes::register_relay))
         .route("/v1/machines/heartbeat", post(machines::heartbeat))
+        .route(
+            "/v1/machines/session-authority",
+            get(machines::session_authority),
+        )
         .route("/v1/machines/self/gateway", get(machines::my_gateway))
         .route("/v1/nodes/self/heartbeat", post(nodes::heartbeat))
         .route("/v1/sessions/{id}/report", post(nodes::report_session));

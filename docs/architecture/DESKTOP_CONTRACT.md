@@ -49,7 +49,7 @@ The frontend catches and displays errors and does not replace them with demo dat
 | `{op:"resources"}` | `Resource[]` |
 | `{op:"machines"}` | `Machine[]` (only managed/owned devices) |
 | `{op:"resource",id}` | `Resource` |
-| `{op:"connect",resource_id}` | `Session` (starting, not yet connected) |
+| `{op:"connect",resource_id,keyboard_profile?}` | `Session` (starting, not yet connected); profile is `"physical"` (default), `"editing"` or `"terminal"`, and non-physical profiles require an APP resource |
 | `{op:"sessions"}` | `Session[]` |
 | `{op:"focus_session",session_id}` | `null` |
 | `{op:"disconnect_session",session_id}` | `null` |
@@ -72,6 +72,8 @@ The frontend catches and displays errors and does not replace them with demo dat
 Polling `sessions` and `transfers` is allowed at a bounded cadence while visible;
 overlapping polls and stale replies after logout must not replace current state.
 The host deduplicates open sessions by resource and focuses an existing window.
+Application keyboard preferences last only for the current login and apply to
+new connections; focusing an existing session does not change its keyboard mode.
 
 ```ts
 type Account = { id: string; email: string; display_name: string; role: string;
@@ -162,6 +164,19 @@ The first input line is:
 {"version":1,"resource_id":"uuid","resource_name":"Office Mac","ticket":{"session_id":"uuid","ticket":"secret","gateway_addr":"host:port","gateway_pin":"hex","agent_key":"hex","policy":{"input":true,"audio":true,"clipboard":true,"file_transfer":true}}}
 ```
 
+`Launch.application_windows` defaults to false for legacy desktop launches.
+For APP resources it must be true, and the ticket must disable session-wide audio,
+clipboard and files. The host verifies the requested resource kind and Manager's
+session mode before spawning; it never forwards a separate executable path or
+argument list to the child. Keyboard preferences become fixed child CLI enum
+arguments, not executable configuration or authorization claims.
+
+Each APP surface is a separate native window. Closing it requests normal remote
+window closure and waits for its removal, preserving save/cancel dialogs. In
+view-only mode, close disconnects instead of sending an unauthorized close
+request. Explicit `disconnect` ends the connection without terminating the remote
+application. Neither mode falls back to a full desktop capture.
+
 Subsequent commands are tagged by `command`:
 
 ```json
@@ -173,7 +188,10 @@ Subsequent commands are tagged by `command`:
 ```
 
 Parent-selected paths originate in a native picker. The child never accepts
-arbitrary remote requests to read files. EOF means the owning host exited and
+arbitrary remote requests to read files. The host checks the actual session's
+ticket policy before opening the picker and again when sending commands; APP
+sessions cannot enable these global channels through stale resource metadata.
+EOF means the owning host exited and
 ends this client session. Closing the main management window only hides it, so
 its supervised session processes and separately managed Agent remain alive.
 Explicit application exit closes client sessions with a clear warning.
@@ -188,7 +206,8 @@ Events are tagged by `event`:
 {"event":"transfer","id":"send:1","name":"report.pdf","direction":"send","transferred":1024,"total":2048,"state":"transferring","error":null}
 ```
 
-The child emits connected only after the real handshake. Path changes update
+The child emits connected only after the real handshake; APP mode additionally
+requires a decoded picture after successful window-protocol negotiation. Path changes update
 an already connected session. Final state and child exit both clear supervision;
 error output must be bounded and must not include launch secrets.
 Unexpected post-handshake termination is a failure, not a user disconnect.
@@ -207,7 +226,14 @@ without exposing a directory listing.
 
 `GET /v1/resources` and `GET /v1/resources/{id}` return the additional resource
 metadata/policy above using the same authoritative grant resolution as admission.
-Session admission rejects unsupported application streaming explicitly.
+APP-aware hosts add the exact `?application_windows=true` query and send
+`application_windows:true` in `POST /v1/sessions`. Resource availability requires
+actual backend capability; session admission rejects unsupported application
+streaming explicitly. A successful response includes an `application_windows`
+mode hint alongside the opaque signed ticket. The trusted published launch
+snapshot is bound into the signed target, verified by Agent, and is not a
+client-provided command. Existing grants continue to affect new admission only;
+session policy is the immutable admission snapshot.
 New managed resource creation gives its owner access through a defined,
 tested ownership policy, not a frontend-only implicit permission.
 

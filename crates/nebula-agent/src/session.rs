@@ -120,6 +120,7 @@ pub async fn serve(
             conn,
             responder,
             |ticket| {
+                bind_session_ticket(&request, ticket)?;
                 // The agent cannot check the ticket's signature: it holds no
                 // manager keys, and giving it some would put a verification
                 // dependency on the machine least able to keep one current. The
@@ -172,6 +173,54 @@ pub async fn serve(
 }
 
 struct SessionLifetime(Session);
+
+fn bind_session_ticket(request: &SessionRequest, payload: &[u8]) -> Result<(), String> {
+    use base64::Engine;
+    let presented = if payload.first() == Some(&b'{') {
+        serde_json::from_slice::<SessionHello>(payload)
+            .map_err(|_| "malformed session hello".to_string())?
+            .ticket
+    } else {
+        String::from_utf8(payload.to_vec()).map_err(|_| "malformed session ticket".to_string())?
+    };
+    if let Some(admitted) = request.signed_ticket.as_deref() {
+        if presented != admitted {
+            return Err("session ticket does not match admission".into());
+        }
+    } else if request.launch_target.is_application() {
+        return Err("application authority is missing".into());
+    }
+    let parts: Vec<_> = presented.split('.').collect();
+    if parts.len() == 3 {
+        // This parse only DENIES downgrade attempts. It never grants authority:
+        // signatures/bindings were checked with trusted Manager keys at admission.
+        // Legacy gateways may omit the envelope JWT, but an original APP JWT
+        // inside authenticated Noise must never select the legacy desktop path.
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .map_err(|_| "malformed session ticket".to_string())?;
+        let claims: serde_json::Value =
+            serde_json::from_slice(&claims).map_err(|_| "malformed session ticket".to_string())?;
+        if !claims.is_object() {
+            return Err("malformed session ticket".into());
+        }
+        let target = claims
+            .get("launch_target")
+            .cloned()
+            .map(serde_json::from_value::<nebula_common::LaunchTarget>)
+            .transpose()
+            .map_err(|_| "invalid session target".to_string())?
+            .unwrap_or_default();
+        if target != request.launch_target
+            || (target.is_application() && request.signed_ticket.is_none())
+        {
+            return Err("session target does not match authenticated client ticket".into());
+        }
+    } else if request.launch_target.is_application() {
+        return Err("malformed application ticket".into());
+    }
+    Ok(())
+}
 
 fn session_multipath(ticket: &[u8]) -> Result<bool, String> {
     if ticket.first() == Some(&b'{') {
@@ -233,6 +282,21 @@ async fn pump_media(
     platform: Arc<dyn Platform>,
     tally: &mut Tally,
 ) {
+    if let nebula_common::LaunchTarget::Application { launch, .. } = &request.launch_target {
+        pump_application(request, session, receiver, platform, launch.clone(), tally).await;
+        return;
+    }
+    let _controller = if request.policy.input {
+        match crate::application::ControllerLease::acquire(platform.shared_desktop()) {
+            Ok(lease) => Some(lease),
+            Err(_) => {
+                session.close(0x23, b"shared desktop controller busy");
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let platform = match platform.session_scope(request.policy.input) {
         Ok(Some(scoped)) => scoped,
         Ok(None) => platform,
@@ -262,7 +326,7 @@ async fn pump_media(
     };
 
     let (frames_tx, mut frames) = mpsc::channel::<EncodedFrame>(FRAME_QUEUE);
-    let mut video = match start_video(video, VideoConfig::default(), frames_tx).await {
+    let mut video = match start_video(video, VideoConfig::default(), frames_tx.into()).await {
         Ok(video) => video,
         Err(error) => {
             tracing::error!(%error, "the video source refused to start");
@@ -508,6 +572,331 @@ async fn pump_media(
     drop(video);
     drop(starting_audio);
     drop(audio);
+}
+
+async fn application_control(
+    session: &Session,
+    seq: &mut u32,
+    message: ndp_proto::ControlMessage,
+) -> bool {
+    let Ok(payload) = message.encode() else {
+        return false;
+    };
+    let header = MsgHeader::new(message.kind(), *seq, 0);
+    *seq = seq.wrapping_add(1);
+    session
+        .send(Channel::Control, header, &payload)
+        .await
+        .is_ok()
+}
+
+async fn application_failure(session: &Session, seq: &mut u32, detail: &'static str) {
+    let _ = tokio::time::timeout(
+        Duration::from_secs(1),
+        application_control(
+            session,
+            seq,
+            ndp_proto::ControlMessage::Bye {
+                reason: ndp_proto::control::ByeReason::NegotiationFailed,
+                detail: Some(detail.into()),
+            },
+        ),
+    )
+    .await;
+}
+
+async fn pump_application(
+    request: &SessionRequest,
+    session: Session,
+    mut receiver: SessionReceiver,
+    platform: Arc<dyn Platform>,
+    launch: nebula_common::ApplicationLaunch,
+    tally: &mut Tally,
+) {
+    pump_application_inner(
+        request,
+        session.clone(),
+        &mut receiver,
+        platform,
+        launch,
+        tally,
+    )
+    .await;
+    // Reliable send completion only means queued to QUIC. Keep the transport
+    // alive until the client acknowledges Bye/closes, otherwise session Drop
+    // can discard the final Remove/StartupFailed/Bye before it is delivered.
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(Ok(message)) = receiver.recv().await {
+            if message.channel == Channel::Control && message.header.kind == MsgKind::Bye {
+                break;
+            }
+        }
+    })
+    .await;
+}
+
+async fn pump_application_inner(
+    request: &SessionRequest,
+    session: Session,
+    receiver: &mut SessionReceiver,
+    platform: Arc<dyn Platform>,
+    launch: nebula_common::ApplicationLaunch,
+    tally: &mut Tally,
+) {
+    use crate::application::{WorkerCommand, WorkerEvent};
+    use ndp_proto::application::{
+        ApplicationMessage, SurfaceRegistry, APPLICATION_PROTOCOL_VERSION, MAX_APPLICATION_SURFACES,
+    };
+    use ndp_proto::{ControlMessage, FeatureFlags, VideoCodec, VideoFrameInfo};
+    let mut seq = 0;
+    if request
+        .launch_target
+        .validate(
+            nebula_common::ResourceId::from_uuid(request.resource_id),
+            request.policy,
+        )
+        .is_err()
+    {
+        application_failure(&session, &mut seq, "application_authority_invalid").await;
+        return;
+    }
+    let offered = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let message = receiver.recv().await?.ok()?;
+            tally.received += message.payload.len() as u64;
+            if message.channel != Channel::Control {
+                return None;
+            }
+            if message.header.kind == MsgKind::Ping {
+                let header = MsgHeader::new(
+                    MsgKind::Pong,
+                    message.header.seq,
+                    message.header.timestamp_us,
+                );
+                session
+                    .send(Channel::Control, header, &message.payload)
+                    .await
+                    .ok()?;
+                continue;
+            }
+            if message.header.kind != MsgKind::Hello {
+                return None;
+            }
+            let ControlMessage::Hello { caps, .. } =
+                ControlMessage::decode(&message.payload).ok()?
+            else {
+                return None;
+            };
+            return Some(caps);
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(mut caps) = offered.filter(|caps| {
+        caps.is_valid()
+            && caps.features.contains(FeatureFlags::APPLICATION_WINDOWS)
+            && caps.video_codecs.contains(&VideoCodec::H264)
+    }) else {
+        application_failure(&session, &mut seq, "application_negotiation_required").await;
+        return;
+    };
+    let lease = match crate::application::ControllerLease::acquire(platform.shared_desktop()) {
+        Ok(lease) => lease,
+        Err(_) => {
+            application_failure(&session, &mut seq, "shared_desktop_controller_busy").await;
+            return;
+        }
+    };
+    if !application_control(
+        &session,
+        &mut seq,
+        ControlMessage::Application(ApplicationMessage::Hello {
+            protocol_version: APPLICATION_PROTOCOL_VERSION,
+            max_surfaces: MAX_APPLICATION_SURFACES,
+            host_os: crate::platform::application_host_os(),
+            keyboard_profile: ndp_proto::application::ApplicationKeyboardProfile::Physical,
+        }),
+    )
+    .await
+    {
+        return;
+    }
+    caps.features = FeatureFlags::APPLICATION_WINDOWS;
+    caps.video_codecs = vec![VideoCodec::H264];
+    caps.audio_codecs.clear();
+    caps.max_bitrate_bps = caps.max_bitrate_bps.min(12_000_000);
+    let mut worker = match crate::application::spawn(
+        platform,
+        launch,
+        request.policy.input,
+        caps.max_bitrate_bps,
+        lease,
+    ) {
+        Ok(worker) => worker,
+        Err(_) => {
+            application_failure(&session, &mut seq, "application_backend_unavailable").await;
+            return;
+        }
+    };
+    let mut registry = SurfaceRegistry::new(MAX_APPLICATION_SURFACES).expect("protocol limit");
+    let mut sending: Option<VideoSend> = None;
+    let mut sending_surface = None;
+    let mut surface_sequences = [0u32; MAX_APPLICATION_SURFACES as usize];
+    let mut unavailable = std::collections::BTreeSet::new();
+    let mut ready = false;
+    let mut path_changes = session.path_changes();
+    loop {
+        tokio::select! {
+            biased;
+            event = worker.events.recv() => {
+                match event {
+                    Some(WorkerEvent::Ready) => {
+                        if !application_control(&session, &mut seq, ControlMessage::HelloAck {
+                            caps: caps.clone(), agent_version: env!("CARGO_PKG_VERSION").into(), active_codec: VideoCodec::H264,
+                        }).await { break; }
+                        ready = true;
+                    }
+                    Some(WorkerEvent::Metadata(message)) => {
+                        let refresh_surface = match &message {
+                            ApplicationMessage::SurfaceUpsert { surface } => Some(surface.surface_id),
+                            _ => None,
+                        };
+                        let valid = match &message {
+                            ApplicationMessage::SurfaceUpsert { surface } => {
+                                if sending_surface == Some(surface.surface_id)
+                                    && registry.get(surface.surface_id).is_some_and(|old|
+                                        old.geometry_generation != surface.geometry_generation || surface.minimized)
+                                { sending = None; }
+                                unavailable.remove(&surface.surface_id);
+                                registry.upsert(surface.clone()).is_ok()
+                            }
+                            ApplicationMessage::SurfaceRemove { surface_id } => {
+                                if sending_surface == Some(*surface_id) { sending = None; }
+                                unavailable.remove(surface_id);
+                                registry.remove(*surface_id).is_ok()
+                            }
+                            _ => false,
+                        };
+                        if !valid || !application_control(&session, &mut seq, ControlMessage::Application(message)).await { break; }
+                        if let Some(id) = refresh_surface {
+                            if worker.commands.try_send(WorkerCommand::Keyframe(id)).is_err() { break; }
+                        }
+                    }
+                    Some(WorkerEvent::SurfaceFailed(id)) => {
+                        unavailable.insert(id);
+                        if sending_surface == Some(id) { sending = None; }
+                        if !application_control(&session, &mut seq, ControlMessage::Application(
+                            ApplicationMessage::SurfaceUnavailable {
+                                surface_id: id,
+                                reason: ndp_proto::application::ApplicationFailureReason::SurfaceUnavailable,
+                            }
+                        )).await { break; }
+                    }
+                    Some(WorkerEvent::Failed(reason)) => {
+                        let _ = application_control(&session, &mut seq, ControlMessage::Application(
+                            ApplicationMessage::StartupFailed { reason }
+                        )).await;
+                        application_failure(&session, &mut seq, "application_backend_unavailable").await;
+                        break;
+                    }
+                    Some(WorkerEvent::Ended) => {
+                        let _ = application_control(&session, &mut seq, ControlMessage::Bye {
+                            reason: ndp_proto::control::ByeReason::UserClosed, detail: None,
+                        }).await;
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            changed = async {
+                match path_changes.as_mut() {
+                    Some(changes) => changes.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if changed.is_err() { path_changes = None; continue; }
+                sending = None;
+                while worker.frames.try_recv().is_ok() {}
+                for id in 0..MAX_APPLICATION_SURFACES {
+                    if registry.get(id).is_some() {
+                        let _ = worker.commands.try_send(WorkerCommand::Keyframe(id));
+                    }
+                }
+            }
+            message = receiver.recv() => {
+                let Some(Ok(message)) = message else { break; };
+                tally.received += message.payload.len() as u64;
+                if message.channel != Channel::Control {
+                    // Desktop input, audio, global clipboard and file paths
+                    // are never dispatched from application sessions.
+                    continue;
+                }
+                match message.header.kind {
+                    MsgKind::Ping => {
+                        let header = MsgHeader::new(MsgKind::Pong, message.header.seq, message.header.timestamp_us);
+                        if session.send(Channel::Control, header, &message.payload).await.is_err() { break; }
+                    }
+                    MsgKind::Bye => break,
+                    MsgKind::Application => {
+                        let Ok(ControlMessage::Application(command)) = ControlMessage::decode(&message.payload) else { continue; };
+                        if registry.validate_command(&command).is_err() {
+                            // The backend also validates on its posting thread.
+                            // Forward invalid commands to release held input.
+                            if worker.commands.try_send(WorkerCommand::Client(command)).is_err() { break; }
+                            continue;
+                        }
+                        if worker.commands.try_send(WorkerCommand::Client(command)).is_err() {
+                            application_failure(&session, &mut seq, "application_command_queue_full").await;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            frame = worker.frames.recv(), if ready && sending.is_none() => {
+                let Some(frame) = frame else { break; };
+                let Some(surface) = registry.get(frame.id) else { continue; };
+                if !frame.is_current() || surface.geometry_generation != frame.generation || surface.minimized || unavailable.contains(&frame.id) { continue; }
+                let info = VideoFrameInfo { display: frame.id, codec: VideoCodec::H264,
+                    width: surface.width as u16, height: surface.height as u16, duration_us: 33_333 };
+                let scoped = ndp_proto::application::SurfaceFrameInfo {
+                    geometry_generation: frame.generation,
+                    surface_sequence: surface_sequences[frame.id as usize],
+                }.frame_payload(&frame.frame.data);
+                surface_sequences[frame.id as usize] = surface_sequences[frame.id as usize].wrapping_add(1);
+                let payload = info.frame_payload(&scoped);
+                let flags = if frame.frame.keyframe { MsgFlags::KEYFRAME } else { MsgFlags::DISCARDABLE };
+                let header = MsgHeader::new(MsgKind::VideoFrame, seq, frame.frame.timestamp_us).with_flags(flags);
+                seq = seq.wrapping_add(1);
+                let deadline = (!frame.frame.keyframe).then(|| tokio::time::Instant::now() + FRAME_DEADLINE);
+                let sender = session.clone();
+                sending_surface = Some(frame.id);
+                sending = Some(Box::pin(async move {
+                    let outcome = sender.send_video_frame(header, &payload, deadline).await?;
+                    Ok((outcome, payload.len()))
+                }));
+            }
+            result = async {
+                match sending.as_mut() {
+                    Some(send) => send.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                sending = None;
+                match result {
+                    Ok((ndp_transport::FrameOutcome::Sent, bytes)) => tally.sent += bytes as u64,
+                    Ok((ndp_transport::FrameOutcome::Discarded, _)) => {
+                        if let Some(id) = sending_surface {
+                            let _ = worker.commands.try_send(WorkerCommand::Keyframe(id));
+                        }
+                    }
+                    Err(_) => break,
+                }
+                sending_surface = None;
+            }
+        }
+    }
 }
 
 struct StartedVideo {
@@ -805,6 +1194,61 @@ mod tests {
         assert!(session_multipath(br#"{"ticket":true,"multipath":true}"#).is_err());
         assert!(session_multipath(b"{").is_err());
     }
+
+    #[test]
+    fn application_noise_ticket_cannot_be_downgraded_by_stripping_gateway_authority() {
+        use base64::Engine;
+        let resource = nebula_common::ResourceId::new();
+        let launch = nebula_common::ApplicationLaunch {
+            launch_path: "/Applications/Editor.app".into(),
+            launch_args: vec![],
+            working_dir: None,
+        };
+        let target = nebula_common::LaunchTarget::Application {
+            resource_id: resource,
+            version: launch.version(),
+            launch,
+        };
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&serde_json::json!({ "launch_target": target })).unwrap());
+        // Signature checking is independently exercised by SessionRequest tests;
+        // this helper only enforces authenticated-Noise/envelope consistency.
+        let token = format!("header.{encoded}.signature");
+        let mut request = SessionRequest {
+            session: nebula_common::SessionId::new(),
+            resource_id: resource.as_uuid(),
+            launch_target: target,
+            signed_ticket: Some(token.clone()),
+            policy: nebula_common::application::application_policy(
+                nebula_common::SessionPolicy::full(),
+            ),
+            role: nebula_common::SessionRole::Controller,
+            relay_addr: String::new(),
+            relay_pin: String::new(),
+            pair_token: String::new(),
+            client_key: String::new(),
+        };
+        assert!(bind_session_ticket(&request, token.as_bytes()).is_ok());
+        assert!(bind_session_ticket(&request, b"different-client-ticket").is_err());
+        request.launch_target = Default::default();
+        assert!(bind_session_ticket(&request, token.as_bytes()).is_err());
+        request.signed_ticket = None;
+        assert!(bind_session_ticket(&request, token.as_bytes()).is_err());
+        let hello = serde_json::to_vec(&SessionHello {
+            ticket: token,
+            multipath: true,
+        })
+        .unwrap();
+        assert!(bind_session_ticket(&request, &hello).is_err());
+        assert!(bind_session_ticket(&request, b"legacy-desktop-ticket").is_ok());
+        let legacy_claims =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{\"legacy\":true}");
+        assert!(bind_session_ticket(
+            &request,
+            format!("header.{legacy_claims}.signature").as_bytes()
+        )
+        .is_ok());
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct PumpProbe {
@@ -817,6 +1261,9 @@ mod tests {
     }
 
     impl Platform for PumpProbe {
+        fn shared_desktop(&self) -> bool {
+            false
+        }
         fn video(&self) -> anyhow::Result<Box<dyn VideoSource>> {
             Ok(Box::new(ProbeVideo {
                 sink: self.sink.clone(),
@@ -874,6 +1321,314 @@ mod tests {
             self.0.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
+    }
+
+    struct AppPumpProbe(Arc<AtomicUsize>, Arc<std::sync::atomic::AtomicBool>);
+
+    impl Platform for AppPumpProbe {
+        fn shared_desktop(&self) -> bool {
+            false
+        }
+        fn application_capability(&self) -> nebula_common::ApplicationCapability {
+            nebula_common::ApplicationCapability {
+                supported: true,
+                protocol_version: 1,
+                max_surfaces: 32,
+                global_menu_supported: false,
+                reason: None,
+            }
+        }
+        fn application(
+            &self,
+            _: &nebula_common::ApplicationLaunch,
+        ) -> anyhow::Result<Box<dyn crate::application::ApplicationBackend>> {
+            Ok(Box::new(Self(self.0.clone(), self.1.clone())))
+        }
+        fn video(&self) -> anyhow::Result<Box<dyn VideoSource>> {
+            panic!("application captured desktop")
+        }
+        fn input(&self) -> anyhow::Result<Box<dyn crate::media::InputInjector>> {
+            panic!("application opened desktop input")
+        }
+        fn audio(&self) -> anyhow::Result<Box<dyn AudioSource>> {
+            panic!("application opened global audio")
+        }
+        fn clipboard(&self) -> anyhow::Result<Box<dyn crate::clipboard::ClipboardAccess>> {
+            panic!("application opened global clipboard")
+        }
+    }
+
+    impl crate::application::ApplicationBackend for AppPumpProbe {
+        fn snapshot(&mut self) -> anyhow::Result<Vec<crate::application::NativeSurface>> {
+            if self.1.load(Ordering::SeqCst) {
+                return Ok(Vec::new());
+            }
+            Ok(vec![crate::application::NativeSurface {
+                native_id: 12345,
+                parent: None,
+                title: "App".into(),
+                width: 640,
+                height: 480,
+                scale: 1.0,
+                geometry_generation: 1,
+                modal: false,
+                minimized: false,
+            }])
+        }
+        fn video(&mut self, _: u64) -> anyhow::Result<Box<dyn VideoSource>> {
+            Ok(Box::new(crate::media::SyntheticVideo::default()))
+        }
+        fn input(&mut self, _: u64, _: u32, _: &InputEvent) -> anyhow::Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn operate(
+            &mut self,
+            _: u64,
+            command: &ndp_proto::application::ApplicationMessage,
+        ) -> anyhow::Result<()> {
+            if matches!(
+                command,
+                ndp_proto::application::ApplicationMessage::Close { .. }
+            ) {
+                self.1.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        fn release_input(&mut self) {}
+        fn stop(&mut self) {}
+    }
+
+    #[tokio::test]
+    async fn application_pump_negotiates_before_media_and_never_dispatches_global_input() {
+        use ndp_proto::application::ApplicationMessage;
+        use ndp_proto::{ControlMessage, FeatureFlags};
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let config = TransportConfig::default();
+            let credentials = ndp_transport::dev_credentials(&[]).unwrap();
+            let server = ndp_transport::server_endpoint(
+                "127.0.0.1:0".parse().unwrap(),
+                &credentials,
+                &[ndp_transport::ALPN_SESSION],
+                &config,
+            )
+            .unwrap();
+            let endpoint = client_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+            let keys = StaticKeypair::generate();
+            let public = keys.public();
+            let listener = server.clone();
+            let accept_config = config.clone();
+            let accepting = tokio::spawn(async move {
+                let conn = listener.accept().await.unwrap().await.unwrap();
+                Session::accept(
+                    conn,
+                    Responder::new(&keys, b"application pump").unwrap(),
+                    |_| Ok(Vec::new()),
+                    &accept_config,
+                )
+                .await
+                .unwrap()
+            });
+            let conn = connect(
+                &endpoint,
+                server.local_addr().unwrap(),
+                "localhost",
+                credentials.fingerprint,
+                ndp_transport::ALPN_SESSION,
+                &config,
+            )
+            .await
+            .unwrap();
+            let (client, mut incoming, _) = Session::initiate(
+                conn,
+                ndp_crypto::Initiator::new(
+                    &StaticKeypair::generate(),
+                    &public,
+                    b"application pump",
+                )
+                .unwrap(),
+                b"ticket",
+                &config,
+            )
+            .await
+            .unwrap();
+            let (agent, receiver) = accepting.await.unwrap();
+            let launch = nebula_common::ApplicationLaunch {
+                launch_path: "/synthetic".into(),
+                launch_args: vec![],
+                working_dir: None,
+            };
+            let resource_id = nebula_common::ResourceId::new();
+            let request = SessionRequest {
+                session: nebula_common::SessionId::new(),
+                resource_id: resource_id.as_uuid(),
+                launch_target: nebula_common::LaunchTarget::Application {
+                    resource_id,
+                    version: launch.version(),
+                    launch,
+                },
+                signed_ticket: None,
+                policy: nebula_common::application::application_policy(
+                    nebula_common::SessionPolicy::full(),
+                ),
+                role: nebula_common::SessionRole::Controller,
+                relay_addr: String::new(),
+                relay_pin: String::new(),
+                pair_token: String::new(),
+                client_key: String::new(),
+            };
+            let injected = Arc::new(AtomicUsize::new(0));
+            let platform = Arc::new(AppPumpProbe(injected.clone(), Arc::default()));
+            let (stop, stopped) = oneshot::channel();
+            let running =
+                tokio::spawn(
+                    async move { pump(&request, agent, receiver, platform, stopped).await },
+                );
+            let caps = ndp_proto::Caps {
+                video_codecs: vec![ndp_proto::VideoCodec::H264],
+                audio_codecs: vec![ndp_proto::AudioCodec::Opus],
+                displays: vec![ndp_proto::DisplayGeometry {
+                    width: 640,
+                    height: 480,
+                    scale: 1.0,
+                    refresh_hz: 30,
+                }],
+                audio: Default::default(),
+                color: Default::default(),
+                max_bitrate_bps: 4_000_000,
+                features: FeatureFlags::APPLICATION_WINDOWS | FeatureFlags::CLIPBOARD,
+            };
+            let mut seq = 0;
+            assert!(
+                application_control(
+                    &client,
+                    &mut seq,
+                    ControlMessage::Hello {
+                        caps,
+                        client_version: "test".into(),
+                        client_os: "synthetic".into()
+                    }
+                )
+                .await
+            );
+            let mut hello = false;
+            let mut ack = false;
+            let mut surface = false;
+            loop {
+                let message = incoming.recv().await.unwrap().unwrap();
+                if message.channel == Channel::Video {
+                    assert!(hello && ack && surface);
+                    let (info, scoped) =
+                        ndp_proto::VideoFrameInfo::split(&message.payload).unwrap();
+                    assert_eq!(
+                        ndp_proto::application::SurfaceFrameInfo::split(scoped)
+                            .unwrap()
+                            .0
+                            .geometry_generation,
+                        1
+                    );
+                    assert_eq!((info.display, info.width, info.height), (0, 640, 480));
+                    break;
+                }
+                match ControlMessage::decode(&message.payload).unwrap() {
+                    ControlMessage::Application(ApplicationMessage::Hello { .. }) => hello = true,
+                    ControlMessage::HelloAck { caps, .. } => {
+                        assert!(hello);
+                        assert_eq!(caps.features, FeatureFlags::APPLICATION_WINDOWS);
+                        assert!(caps.audio_codecs.is_empty());
+                        ack = true;
+                    }
+                    ControlMessage::Application(ApplicationMessage::SurfaceUpsert { .. }) => {
+                        assert!(ack);
+                        surface = true;
+                    }
+                    _ => panic!("unexpected application control"),
+                }
+            }
+            let event = InputEvent::mouse_move(0.5, 0.5, ndp_proto::Modifiers::NONE);
+            client
+                .send(
+                    Channel::Input,
+                    MsgHeader::new(MsgKind::InputBatch, 90, 0),
+                    &event.to_bytes(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                application_control(
+                    &client,
+                    &mut seq,
+                    ControlMessage::Application(ApplicationMessage::Input {
+                        surface_id: 0,
+                        geometry_generation: 2,
+                        event: event.to_bytes()
+                    })
+                )
+                .await
+            );
+            assert!(
+                application_control(
+                    &client,
+                    &mut seq,
+                    ControlMessage::Application(ApplicationMessage::Input {
+                        surface_id: 0,
+                        geometry_generation: 1,
+                        event: event.to_bytes()
+                    })
+                )
+                .await
+            );
+            while injected.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(injected.load(Ordering::SeqCst), 1);
+            assert!(
+                application_control(
+                    &client,
+                    &mut seq,
+                    ControlMessage::Application(ApplicationMessage::Close {
+                        surface_id: 0,
+                        geometry_generation: 1
+                    },)
+                )
+                .await
+            );
+            let mut removed = false;
+            loop {
+                let message = incoming.recv().await.unwrap().unwrap();
+                if message.channel != Channel::Control {
+                    continue;
+                }
+                match ControlMessage::decode(&message.payload).unwrap() {
+                    ControlMessage::Application(ApplicationMessage::SurfaceRemove {
+                        surface_id: 0,
+                    }) => removed = true,
+                    ControlMessage::Bye {
+                        reason: ndp_proto::control::ByeReason::UserClosed,
+                        ..
+                    } => {
+                        assert!(removed, "native removal must precede orderly completion");
+                        assert!(
+                            application_control(
+                                &client,
+                                &mut seq,
+                                ControlMessage::Bye {
+                                    reason: ndp_proto::control::ByeReason::UserClosed,
+                                    detail: None,
+                                }
+                            )
+                            .await
+                        );
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            running.await.unwrap();
+            drop(stop);
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -939,6 +1694,8 @@ mod tests {
             let request = SessionRequest {
                 session: nebula_common::SessionId::new(),
                 resource_id: uuid::Uuid::new_v4(),
+                launch_target: Default::default(),
+                signed_ticket: None,
                 policy: nebula_common::SessionPolicy {
                     input: true,
                     ..nebula_common::SessionPolicy::view_only()
@@ -1104,6 +1861,8 @@ mod tests {
             let request = SessionRequest {
                 session: nebula_common::SessionId::new(),
                 resource_id: uuid::Uuid::new_v4(),
+                launch_target: Default::default(),
+                signed_ticket: None,
                 policy: nebula_common::SessionPolicy {
                     audio: true,
                     ..nebula_common::SessionPolicy::view_only()
@@ -1387,6 +2146,8 @@ mod tests {
             let request = SessionRequest {
                 session: nebula_common::SessionId::new(),
                 resource_id: uuid::Uuid::new_v4(),
+                launch_target: Default::default(),
+                signed_ticket: None,
                 policy: nebula_common::SessionPolicy {
                     input: true,
                     audio: true,
@@ -1562,7 +2323,11 @@ mod tests {
             stopped: Some(stopped),
         };
         let (sink, _frames) = mpsc::channel(1);
-        let task = tokio::spawn(start_video(Box::new(video), VideoConfig::default(), sink));
+        let task = tokio::spawn(start_video(
+            Box::new(video),
+            VideoConfig::default(),
+            sink.into(),
+        ));
         tokio::time::timeout(Duration::from_secs(1), started)
             .await
             .unwrap()

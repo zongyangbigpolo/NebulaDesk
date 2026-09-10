@@ -22,3 +22,5 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 quinn = { workspace = true }
 tracing = { workspace = true }
+jsonwebtoken = { workspace = true }
+time = { workspace = true }

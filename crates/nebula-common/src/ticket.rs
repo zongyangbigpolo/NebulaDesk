@@ -16,8 +16,9 @@
 //! The cost of that trade is revocation latency, which is why the TTL is
 //! [`DEFAULT_TTL`] — a minute is long enough to survive a slow client and
 //! short enough that a revoked entitlement cannot be exploited meaningfully.
-//! A ticket authorises *starting* a session, never continuing one: cutting
-//! off a live session is the gateway's job, driven by the manager.
+//! A ticket authorises *starting* a session. Its authorization snapshot lasts
+//! the logical session; expiry or later entitlement edits do not revoke a
+//! running session in realtime.
 
 use std::collections::BTreeMap;
 
@@ -32,7 +33,8 @@ pub const DEFAULT_TTL: Duration = Duration::seconds(60);
 /// Tolerance for clock skew between the manager and a verifier.
 pub const CLOCK_SKEW: Duration = Duration::seconds(30);
 
-/// The JWT `aud` value: a ticket is meant for gateways, nothing else.
+/// Stable JWT audience. Gateways redeem tickets; application agents also verify
+/// the original ticket's authority without changing the deployed audience.
 pub const AUDIENCE: &str = "nebula-gateway";
 
 /// What a session may do, resolved from the entitlement at issue time.
@@ -151,6 +153,10 @@ pub struct TicketClaims {
     /// Resolved policy, already clamped to the role's ceiling.
     pub policy: SessionPolicy,
 
+    /// Immutable publisher launch snapshot. Missing on legacy desktop tickets.
+    #[serde(default)]
+    pub launch_target: crate::LaunchTarget,
+
     /// The agent's Noise static public key, hex encoded.
     ///
     /// This is what makes the end-to-end handshake meaningful: the client
@@ -178,6 +184,16 @@ impl TicketClaims {
     pub fn remaining_secs(&self, now: OffsetDateTime) -> i64 {
         (self.exp - now.unix_timestamp()).max(0)
     }
+}
+
+/// Trusted issuer and verification keys fetched together by an enrolled agent.
+/// The issuer is independent of the manager's transport/base URL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TicketAuthority {
+    /// Exact issuer required when verifying session JWTs.
+    pub issuer: String,
+    /// Current public signing keys, not credentials.
+    pub jwks: Jwks,
 }
 
 /// A JSON Web Key Set, as published by the manager and cached by gateways.
@@ -254,6 +270,16 @@ fn base64url_decode(s: &str) -> crate::Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn old_tickets_default_to_desktop_and_unknown_modes_fail_closed() {
+        let mut value = serde_json::to_value(claims(OffsetDateTime::now_utc())).unwrap();
+        value.as_object_mut().unwrap().remove("launch_target");
+        let decoded: TicketClaims = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(decoded.launch_target, crate::LaunchTarget::Desktop);
+        value["launch_target"] = serde_json::json!({"kind":"unknown"});
+        assert!(serde_json::from_value::<TicketClaims>(value).is_err());
+    }
+
     fn claims(now: OffsetDateTime) -> TicketClaims {
         TicketClaims {
             iss: "https://manager.example".into(),
@@ -268,6 +294,7 @@ mod tests {
             rid: ResourceId::new(),
             role: SessionRole::Controller,
             policy: SessionPolicy::full(),
+            launch_target: Default::default(),
             agent_key: "aa".repeat(32),
             relay_addr: "203.0.113.7:4443".into(),
             relay_pin: "bb".repeat(32),

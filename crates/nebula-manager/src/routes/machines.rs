@@ -518,6 +518,21 @@ pub struct GatewayAssignment {
     pub cert_pin: String,
 }
 
+/// `GET /v1/machines/session-authority`
+///
+/// An agent fetches this over its enrolled trusted manager connection, not a
+/// gateway-supplied URL. Machine authentication prevents an accidental fetch
+/// against a different manager deployment from silently becoming authority.
+pub async fn session_authority(
+    State(state): State<AppState>,
+    _machine: AuthMachine,
+) -> Json<nebula_common::TicketAuthority> {
+    Json(nebula_common::TicketAuthority {
+        issuer: state.signer.issuer().to_owned(),
+        jwks: state.signer.jwks(),
+    })
+}
+
 /// `GET /v1/machines/self/gateway`
 ///
 /// An agent cannot be configured with a gateway address: gateways are

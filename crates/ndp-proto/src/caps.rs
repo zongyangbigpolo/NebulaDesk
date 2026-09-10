@@ -129,6 +129,8 @@ impl FeatureFlags {
     pub const CURSOR_OVERLAY: Self = Self(1 << 4);
     /// Peer is willing to attempt a direct (non-relayed) path.
     pub const DIRECT_UPGRADE: Self = Self(1 << 5);
+    /// Isolated application surfaces, never desktop capture or display input.
+    pub const APPLICATION_WINDOWS: Self = Self(1 << 6);
 
     /// True when every bit in `other` is set.
     #[must_use]
@@ -289,6 +291,23 @@ mod tests {
             ..client_caps()
         };
         assert!(client.negotiate(&agent).is_none());
+    }
+
+    #[test]
+    fn application_support_requires_both_peers_to_opt_in() {
+        let old = client_caps();
+        let mut new = client_caps();
+        new.features = new.features | FeatureFlags::APPLICATION_WINDOWS;
+        assert!(!old
+            .negotiate(&new)
+            .unwrap()
+            .features
+            .contains(FeatureFlags::APPLICATION_WINDOWS));
+        assert!(new
+            .negotiate(&new)
+            .unwrap()
+            .features
+            .contains(FeatureFlags::APPLICATION_WINDOWS));
     }
 
     #[test]

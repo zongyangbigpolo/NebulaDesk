@@ -6,6 +6,7 @@ export type Group = { id: string; name: string };
 type Server = { manager_url: string; allow_insecure_http?: boolean };
 type Signup = { display_name: string; email: string; password: string };
 export type Policy = { input: boolean; audio: boolean; clipboard: boolean; file_transfer: boolean };
+export type ApplicationKeyboardProfile = 'physical' | 'editing' | 'terminal';
 export type Resource = {
   id: string; name: string; kind: 'DESKTOP' | 'APP'; description: string;
   machine_status: string; role: string | null; policy: Policy; owner_name: string | null;
@@ -65,7 +66,7 @@ export type Commands = {
   resources: { args: object; result: Resource[] };
   machines: { args: object; result: Machine[] };
   resource: { args: { id: string }; result: Resource };
-  connect: { args: { resource_id: string }; result: Session };
+  connect: { args: { resource_id: string; keyboard_profile?: ApplicationKeyboardProfile }; result: Session };
   sessions: { args: object; result: Session[] };
   focus_session: { args: { session_id: string }; result: null };
   disconnect_session: { args: { session_id: string }; result: null };

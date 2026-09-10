@@ -26,6 +26,7 @@ use windows::{
         },
         Media::MediaFoundation::*,
         System::WinRT::{Direct3D11::*, Graphics::Capture::IGraphicsCaptureItemInterop},
+        UI::WindowsAndMessaging::{IsIconic, IsWindowVisible},
     },
 };
 
@@ -37,10 +38,22 @@ use crate::media::{EncodedFrame, FrameSink, VideoConfig, VideoSource};
 
 #[derive(Default)]
 pub struct WindowsVideo {
+    target: Option<Arc<super::application_native::Window>>,
     running: Arc<AtomicBool>,
     keyframe: Arc<AtomicBool>,
     bitrate: Arc<AtomicU32>,
     worker: Option<JoinHandle<()>>,
+}
+
+impl WindowsVideo {
+    pub(super) fn for_window(
+        target: Arc<super::application_native::Window>,
+    ) -> anyhow::Result<Self> {
+        target.validate()?;
+        let mut video = Self::default();
+        video.target = Some(target);
+        Ok(video)
+    }
 }
 
 impl VideoSource for WindowsVideo {
@@ -64,6 +77,7 @@ impl VideoSource for WindowsVideo {
         let running = self.running.clone();
         let keyframe = self.keyframe.clone();
         let bitrate = self.bitrate.clone();
+        let target = self.target.clone();
         self.worker = Some(
             std::thread::Builder::new()
                 .name("nebula-wgc-mf".into())
@@ -71,12 +85,20 @@ impl VideoSource for WindowsVideo {
                     let result = (|| {
                         let _runtime = Runtime::new()?;
                         let d3d = D3d::new()?;
-                        let capture = Capture::new(&d3d)?;
+                        let capture = Capture::new(&d3d, target)?;
                         let size = capture.item.Size()?;
                         ensure!(
                             size.Width > 0 && size.Height > 0,
-                            "primary display is unavailable"
+                            "capture target is unavailable"
                         );
+                        if let Some(window) = &capture.target {
+                            let bounds = window.bounds()?;
+                            ensure!(
+                                i64::from(size.Width) == i64::from(bounds.right) - i64::from(bounds.left)
+                                    && i64::from(size.Height) == i64::from(bounds.bottom) - i64::from(bounds.top),
+                                "WGC window size does not match its physical bounds; refusing ambiguous input mapping"
+                            );
+                        }
                         let scale = (config.width as f64 / size.Width as f64)
                             .min(config.height as f64 / size.Height as f64)
                             .min(1.0);
@@ -142,6 +164,7 @@ impl Drop for WindowsVideo {
 const CAPTURE_HELP: &str = "Windows Graphics Capture could not open the primary display; run the agent in the signed-in interactive user session, unlock the desktop, and allow screen capture in Windows privacy settings (Session 0/services and the secure desktop are not capturable)";
 
 struct Capture {
+    target: Option<Arc<super::application_native::Window>>,
     session: GraphicsCaptureSession,
     pool: Direct3D11CaptureFramePool,
     item: GraphicsCaptureItem,
@@ -150,14 +173,26 @@ struct Capture {
 }
 
 impl Capture {
-    fn new(d3d: &D3d) -> anyhow::Result<Self> {
+    fn new(
+        d3d: &D3d,
+        target: Option<Arc<super::application_native::Window>>,
+    ) -> anyhow::Result<Self> {
         ensure!(GraphicsCaptureSession::IsSupported()?, "{CAPTURE_HELP}");
         unsafe {
             let interop: IGraphicsCaptureItemInterop =
                 factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
-            let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
-            let item: GraphicsCaptureItem =
-                interop.CreateForMonitor(monitor).context(CAPTURE_HELP)?;
+            let item: GraphicsCaptureItem = match &target {
+                Some(window) => {
+                    window.validate()?;
+                    interop.CreateForWindow(window.hwnd()).context(
+                        "WGC cannot capture the owned application window; no desktop fallback is permitted"
+                    )?
+                }
+                None => {
+                    let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+                    interop.CreateForMonitor(monitor).context(CAPTURE_HELP)?
+                }
+            };
             let dxgi: IDXGIDevice = d3d.device.cast()?;
             let device: IDirect3DDevice = CreateDirect3D11DeviceFromDXGIDevice(&dxgi)?.cast()?;
             let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
@@ -176,6 +211,7 @@ impl Capture {
                 Ok(())
             }))?;
             Ok(Self {
+                target,
                 session,
                 pool,
                 item,
@@ -565,6 +601,16 @@ fn pump(
     // Retain the last real capture so a keyframe request can recover an entirely static desktop.
     let mut latest = None;
     while running.load(Ordering::Acquire) && !sink.is_closed() {
+        if let Some(window) = &capture.target {
+            window.validate()?;
+            ensure!(
+                super::application_policy::capture_available(
+                    unsafe { IsWindowVisible(window.hwnd()).as_bool() },
+                    unsafe { IsIconic(window.hwnd()).as_bool() }
+                ),
+                "owned application window is temporarily unavailable"
+            );
+        }
         ensure!(
             !capture.closed.load(Ordering::Acquire),
             "captured display closed; reconnect after restoring the display"

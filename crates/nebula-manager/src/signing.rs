@@ -31,6 +31,11 @@ impl std::fmt::Debug for TicketSigner {
 }
 
 impl TicketSigner {
+    /// Exact signed issuer; never infer this from a manager's connection URL.
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
     /// Load the active signing key, creating one on first start.
     ///
     /// Two replicas starting simultaneously can both try to create the first
@@ -165,6 +170,7 @@ impl TicketSigner {
             rid: resource,
             role,
             policy,
+            launch_target: Default::default(),
             agent_key,
             relay_addr,
             relay_pin,
@@ -177,6 +183,10 @@ impl TicketSigner {
     /// ticket that every gateway will reject is a far worse failure than a
     /// few extra microseconds here.
     pub fn issue(&self, claims: &TicketClaims) -> ApiResult<String> {
+        claims
+            .launch_target
+            .validate(claims.rid, claims.policy)
+            .map_err(|_| ApiError::Conflict("invalid application session authority".into()))?;
         let token = self.sign(claims)?;
         debug_assert!(self.verify(&token).is_ok(), "signed an unverifiable ticket");
         Ok(token)
@@ -209,6 +219,81 @@ fn _assert_signs(key: &SigningKey) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_agent_verification_rejects_gateway_authority_substitution() {
+        use nebula_common::{ApplicationLaunch, LaunchTarget};
+        let signer = signer();
+        let mut claims = claims(&signer);
+        claims.policy = nebula_common::application::application_policy(claims.policy);
+        let launch = ApplicationLaunch {
+            launch_path: "/trusted/editor".into(),
+            launch_args: vec!["literal;argument".into()],
+            working_dir: None,
+        };
+        claims.launch_target = LaunchTarget::Application {
+            resource_id: claims.rid,
+            version: launch.version(),
+            launch,
+        };
+        let request = ndp_signal::SessionRequest {
+            session: claims.sid,
+            resource_id: claims.rid.as_uuid(),
+            policy: claims.policy,
+            role: claims.role,
+            launch_target: claims.launch_target.clone(),
+            signed_ticket: Some(signer.issue(&claims).unwrap()),
+            relay_addr: claims.relay_addr.clone(),
+            relay_pin: claims.relay_pin.clone(),
+            pair_token: "pair".into(),
+            client_key: "client".into(),
+        };
+        let verify = |request: &ndp_signal::SessionRequest| {
+            request.verify_signed_authority(
+                &signer.jwks(),
+                &signer.issuer,
+                claims.mid,
+                &claims.agent_key,
+            )
+        };
+        assert_eq!(verify(&request).unwrap(), claims);
+        let mut tampered = request.clone();
+        tampered.launch_target = LaunchTarget::Desktop;
+        assert!(verify(&tampered).is_err());
+        tampered = request.clone();
+        tampered.policy.audio = true;
+        assert!(verify(&tampered).is_err());
+        tampered = request.clone();
+        tampered.resource_id = uuid::Uuid::now_v7();
+        assert!(verify(&tampered).is_err());
+        tampered = request.clone();
+        tampered.relay_pin = "substitute".into();
+        assert!(verify(&tampered).is_err());
+        tampered = request.clone();
+        tampered.signed_ticket = None;
+        assert!(verify(&tampered).is_err());
+        assert!(request
+            .verify_signed_authority(
+                &signer.jwks(),
+                "wrong-issuer",
+                claims.mid,
+                &claims.agent_key
+            )
+            .is_err());
+        assert!(request
+            .verify_signed_authority(
+                &signer.jwks(),
+                &signer.issuer,
+                nebula_common::MachineId::new(),
+                &claims.agent_key
+            )
+            .is_err());
+        let mut poisoned = claims.clone();
+        if let LaunchTarget::Application { launch, .. } = &mut poisoned.launch_target {
+            launch.launch_path = "/substitute".into();
+        }
+        assert!(signer.issue(&poisoned).is_err());
+    }
 
     fn signer() -> TicketSigner {
         let mut rng = rand::rngs::OsRng;

@@ -28,6 +28,8 @@ pub struct Tunnel {
     /// as reachable until its heartbeat goes stale. It is dropped with the
     /// tunnel and never written anywhere.
     pub credential: String,
+    /// Live peer opt-in; prevents stale machine capability data reaching old agents.
+    pub application_windows: bool,
 }
 
 /// Every agent currently attached to this gateway.
@@ -104,6 +106,7 @@ mod tests {
             outbound,
             connection,
             credential: "cred".into(),
+            application_windows: false,
         }
     }
 

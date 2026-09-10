@@ -19,6 +19,7 @@ use crate::media::{EncodedFrame, FrameSink, VideoConfig, VideoSource};
 
 pub(super) struct LinuxVideo {
     allow_input: bool,
+    window_only: bool,
     portal: Arc<Mutex<Option<Portal>>>,
     running: Arc<AtomicBool>,
     keyframe: Arc<AtomicBool>,
@@ -30,12 +31,22 @@ impl LinuxVideo {
     pub fn new(allow_input: bool, portal: Arc<Mutex<Option<Portal>>>) -> Self {
         Self {
             allow_input,
+            window_only: false,
             portal,
             running: Arc::new(AtomicBool::new(false)),
             keyframe: Arc::new(AtomicBool::new(false)),
             bitrate: Arc::new(AtomicU32::new(0)),
             worker: None,
         }
+    }
+
+    /// Consent-only window capture. It is not an authenticated published APP
+    /// target and therefore must not be returned by `Platform::application`.
+    #[allow(dead_code)]
+    pub fn consented_window() -> Self {
+        let mut source = Self::new(false, Arc::new(Mutex::new(None)));
+        source.window_only = true;
+        source
     }
 }
 
@@ -64,7 +75,15 @@ impl VideoSource for LinuxVideo {
                 "missing native Linux plugin {plugin}; install VA-API drivers and GStreamer packages; \
                  no software video fallback is permitted");
         }
-        let (portal, stream) = Portal::open(self.allow_input)?;
+        let (portal, stream) = if self.window_only {
+            anyhow::ensure!(
+                !self.allow_input,
+                "consented window input must remain disabled"
+            );
+            Portal::open_window_consent()?
+        } else {
+            Portal::open(self.allow_input)?
+        };
         let active = portal.active.clone();
         let (width, height) = fit(stream.width, stream.height, config.width, config.height);
         let pipeline = Pipeline::new(&format!(

@@ -225,7 +225,7 @@ impl Drop for WindowsInput {
     }
 }
 
-fn scan(usage: u32) -> anyhow::Result<KEYBDINPUT> {
+pub(super) fn scan(usage: u32) -> anyhow::Result<KEYBDINPUT> {
     let virtual_key = match usage {
         0x75 => Some(VK_HELP),
         0x7f => Some(VK_VOLUME_MUTE),

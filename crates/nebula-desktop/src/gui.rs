@@ -54,6 +54,12 @@ async fn desktop_request(
             .ok_or_else(|| {
                 DesktopError::new("session_closed", "This session is no longer active.")
             })?;
+        if !host.sessions.file_transfer_allowed(session_id).await {
+            return Err(DesktopError::new(
+                "permission_denied",
+                "File transfer is unavailable for this session.",
+            ));
+        }
         let files = rfd::AsyncFileDialog::new()
             .set_title("Send files to remote desktop")
             .pick_files()

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { ArrowRightLeft, ArrowUpRight, ChevronRight, CircleHelp, Grid2X2, LogOut, Monitor, RefreshCw, Search, Settings } from 'lucide-react';
-import type { Account, DesktopApi, Resource, Session } from './api/types';
+import type { Account, ApplicationKeyboardProfile, DesktopApi, Resource, Session } from './api/types';
 import { canAdministerOrganization } from './api/permissions';
 import { DesktopStore } from './state/store';
 import { useQuery } from './state/useQuery';
@@ -38,6 +38,7 @@ function Workspace({ store, account, demo }: { store: DesktopStore; account: Acc
   const [filter, setFilter] = useState<ResourceFilter>('ALL');
   const [sort, setSort] = useState('recent');
   const [search, setSearch] = useState('');
+  const [keyboardProfiles, setKeyboardProfiles] = useState<Record<string, ApplicationKeyboardProfile>>({});
   const searchRef = useRef<HTMLInputElement>(null);
   const resourceLoad = useCallback(() => selectedId ? api.request({ op: 'resource', id: selectedId }) : Promise.resolve(null), [api, selectedId]);
   const detail = useQuery(resourceLoad);
@@ -65,7 +66,9 @@ function Workspace({ store, account, demo }: { store: DesktopStore; account: Acc
   }
   async function connect(resource: Resource) {
     if (unavailable(resource)) return;
-    if (await store.action(() => api.request({ op: 'connect', resource_id: resource.id }), false) && demo) setDemoFocus(true);
+    const profile = resource.kind === 'APP' ? keyboardProfiles[resource.id] : undefined;
+    const keyboard = profile && profile !== 'physical' ? { keyboard_profile: profile } : {};
+    if (await store.action(() => api.request({ op: 'connect', resource_id: resource.id, ...keyboard }), false) && demo) setDemoFocus(true);
   }
   const detailResource = detail.data;
   const detailMachine = state.machines.find(m => m.id === detailResource?.machine_id);
@@ -75,8 +78,8 @@ function Workspace({ store, account, demo }: { store: DesktopStore; account: Acc
     <div className="main-column"><header className="toolbar"><span>{account.tenant}</span><div className="search-field"><Search size={15} /><input ref={searchRef} aria-label="搜索资源" placeholder="搜索资源" value={search} onChange={e => { setSearch(e.target.value); navigate('resources'); }} /><kbd>{shortcutLabel(navigator.platform)}</kbd></div><button className="icon-button" aria-label="刷新" disabled={state.busy || state.loading} onClick={() => { void store.refresh(); void store.poll(); detail.reload(); published.reload(); }}><RefreshCw size={16} /></button><button className="icon-button" aria-label="帮助" onClick={() => setHelp(true)}><CircleHelp size={17} /></button></header>
     <main className="content"><ErrorNotice message={state.error} />{state.loading && <Loading />}
       {page === 'resources' && !selectedId && <p className="workspace-identity">{account.workspace.name} · {account.workspace.kind === 'PERSONAL' ? '个人空间' : '组织'} · 当前账号 {account.display_name || account.email} · 登录标识 {account.tenant}</p>}
-      {page === 'resources' && !selectedId && <Resources resources={state.resources} sessions={state.sessions} query={search} filter={filter} sort={sort} busy={state.busy} onFilter={setFilter} onSort={setSort} onAdd={() => openDialog({ kind: 'enroll' })} onDetails={resource => setSelectedId(resource.id)} onConnect={resource => void connect(resource)} onFocus={session => void focus(session)} />}
-      {page === 'resources' && selectedId && (detail.loading ? <Loading /> : detail.error ? <><ErrorNotice message={detail.error} /><button onClick={() => setSelectedId(null)}>返回资源</button><button onClick={detail.reload}>重试</button></> : detailResource ? <Details resource={detailResource} machine={detailMachine} busy={state.busy} onBack={() => setSelectedId(null)} onConnect={() => void connect(detailResource)} onRename={() => { if (detailMachine) openDialog({ kind: 'rename', machine: detailMachine }); }} onRemove={() => { if (detailMachine) openDialog({ kind: 'remove', machine: detailMachine }); }} onAccess={() => openDialog({ kind: 'access', resourceId: detailResource.id, name: detailResource.name })} onPublish={() => { if (detailResource.machine_id) openDialog({ kind: 'publish', machineId: detailResource.machine_id, resourceKind: 'APP' }); }} onRefresh={detail.reload} /> : <Empty title="资源已不存在" />)}
+      {page === 'resources' && !selectedId && <Resources resources={state.resources} sessions={state.sessions} query={search} filter={filter} sort={sort} busy={state.busy} onFilter={setFilter} onSort={setSort} onAdd={() => openDialog({ kind: 'enroll' })} onDetails={resource => setSelectedId(resource.id)} onConnect={resource => void connect(resource)} onFocus={session => void focus(session)} onDisconnect={session => openDialog({ kind: 'disconnect', sessionId: session.session_id, name: session.name })} />}
+      {page === 'resources' && selectedId && (detail.loading ? <Loading /> : detail.error ? <><ErrorNotice message={detail.error} /><button onClick={() => setSelectedId(null)}>返回资源</button><button onClick={detail.reload}>重试</button></> : detailResource ? <Details resource={detailResource} machine={detailMachine} busy={state.busy} keyboardProfile={keyboardProfiles[detailResource.id] ?? 'physical'} onKeyboardProfile={profile => setKeyboardProfiles(previous => ({ ...previous, [detailResource.id]: profile }))} onBack={() => setSelectedId(null)} onConnect={() => void connect(detailResource)} onRename={() => { if (detailMachine) openDialog({ kind: 'rename', machine: detailMachine }); }} onRemove={() => { if (detailMachine) openDialog({ kind: 'remove', machine: detailMachine }); }} onAccess={() => openDialog({ kind: 'access', resourceId: detailResource.id, name: detailResource.name })} onPublish={() => { if (detailResource.machine_id) openDialog({ kind: 'publish', machineId: detailResource.machine_id, resourceKind: 'APP' }); }} onRefresh={detail.reload} /> : <Empty title="资源已不存在" />)}
       {page === 'sharing' && <><LocalBinding host={state.host} account={account} verified={canManageLocal} /><ErrorNotice message={published.error} />{published.loading && <Loading />}<Sharing host={state.host} machine={hostMachine} resources={canManageLocal ? published.data ?? [] : []} canManage={canManageLocal} busy={state.busy || published.loading} onEnroll={() => openDialog({ kind: 'enroll' })} onToggle={() => { if (state.host?.running) openDialog({ kind: 'stop' }); else void store.action(() => api.request({ op: 'set_host_enabled', enabled: true })); }} onAccess={resource => openDialog({ kind: 'access', resourceId: resource.id, name: resource.name })} onPublish={kind => { if (hostId) openDialog({ kind: 'publish', machineId: hostId, resourceKind: kind }); }} onEdit={resource => openDialog({ kind: 'edit', resource })} onPermission={permission => { void store.action(() => api.request({ op: 'open_permission_settings', permission }), false).then(ok => { if (ok && demo) setDemoPermission(true); }); }} /></>}
       {page === 'transfers' && <Transfers transfers={state.transfers} sessions={state.sessions} resources={state.resources} busy={state.busy} onSend={session => void store.action(() => api.request({ op: 'send_files', session_id: session.session_id }), false)} onFocus={session => void focus(session)} onDisconnect={session => openDialog({ kind: 'disconnect', sessionId: session.session_id, name: session.name })} />}
       {page === 'settings' && <>
@@ -94,7 +97,7 @@ function Workspace({ store, account, demo }: { store: DesktopStore; account: Acc
       </>}
     </main></div>
     {dialog && <ActionDialog key={JSON.stringify(dialog)} dialog={dialog} account={account} api={api} busy={state.busy} error={state.error} run={(work, refresh) => store.action(work, refresh)} onClose={closeDialog} onCompleted={() => { if (dialog.kind === 'remove') setSelectedId(null); }} onLogout={() => store.logout()} />}
-    {help && <Modal title="使用 NebulaDesk" onClose={() => setHelp(false)}><div className="modal-body"><h3>连接你的电脑</h3><p>在远端电脑登录同一工作空间，添加设备，并开启本机共享。被共享的资源将显示在“我的资源”。</p><h3>遇到连接问题</h3><p>检查远端电源、网络、后台服务与操作系统权限。离线或不支持的资源无法启动。错误会原样显示，不会自动切换为演示数据。</p><h3>窗口与隐私</h3><p>主窗口只负责管理。关闭独立会话窗口即可断开连接。退出登录关闭所有当前账号的会话，但共享服务需要单独停止。</p></div></Modal>}
+    {help && <Modal title="使用 NebulaDesk" onClose={() => setHelp(false)}><div className="modal-body"><h3>连接你的电脑</h3><p>在远端电脑登录同一工作空间，添加设备，并开启本机共享。被共享的资源将显示在“我的资源”。</p><h3>遇到连接问题</h3><p>检查远端电源、网络、后台服务与操作系统权限。离线或不支持的资源无法启动。连接失败会显示安全的错误提示，不会自动切换为演示数据。</p><h3>窗口与隐私</h3><p>主窗口只负责管理。关闭桌面会话窗口会断开连接；关闭应用窗口则请求远端正常关闭，未保存内容可能需要确认。要保留远端应用并离开，请在“当前连接”中断开。退出登录关闭所有当前账号的会话，但共享服务需要单独停止。</p></div></Modal>}
     {demoFocus && <Modal title="独立会话窗口" onClose={() => setDemoFocus(false)}><div className="modal-body"><p>这是浏览器演示，不会连接真实设备或模拟远程视频。桌面客户端会在独立的原生窗口中打开或聚焦该会话。</p><button className="primary" onClick={() => { setDemoFocus(false); navigate('transfers'); }}>查看演示会话</button></div></Modal>}
     {demoPermission && <Modal title="系统权限设置" onClose={() => setDemoPermission(false)}><div className="modal-body"><p>演示模式不会打开操作系统设置。桌面客户端将打开所选权限的系统设置页面；请手动确认授权，然后刷新本机状态。</p></div></Modal>}
   </div>;

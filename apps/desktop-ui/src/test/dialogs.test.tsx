@@ -16,6 +16,10 @@ describe('management command dialogs', () => {
   it('publishes APP metadata without invoking connect', async () => {
     const user = userEvent.setup();
     const { api, close } = mount({ kind: 'publish', machineId: machine.id, resourceKind: 'APP' }, { publish_resource: () => published });
+    expect(screen.getByText(/无需选择电脑/)).toBeVisible();
+    expect(screen.getByText(/并非独立沙箱/)).toBeVisible();
+    expect(screen.getByLabelText('应用启动路径')).toHaveAttribute('autocorrect', 'off');
+    expect(screen.getByLabelText('启动参数（每行一个，可选）')).toHaveAttribute('spellcheck', 'false');
     await user.type(screen.getByLabelText('资源名称'), '测试应用');
     await user.type(screen.getByLabelText('描述'), '设计工具');
     await user.type(screen.getByLabelText('应用启动路径'), '/Applications/Example.app');

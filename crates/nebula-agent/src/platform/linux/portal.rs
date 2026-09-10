@@ -15,6 +15,7 @@ use futures::StreamExt;
 use ndp_proto::InputEvent;
 use tokio::sync::{mpsc as async_mpsc, watch};
 
+use super::application_policy::{validate_window_selection, SelectedSource};
 use super::input::InputState;
 
 const CONSENT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -42,6 +43,19 @@ pub(super) struct Portal {
 
 impl Portal {
     pub fn open(allow_input: bool) -> anyhow::Result<(Self, Stream)> {
+        Self::open_source(allow_input, false)
+    }
+
+    /// Consent-only primitive; not an APP backend because source identity is untrusted.
+    pub fn open_window_consent() -> anyhow::Result<(Self, Stream)> {
+        Self::open_source(false, true)
+    }
+
+    fn open_source(allow_input: bool, window_only: bool) -> anyhow::Result<(Self, Stream)> {
+        anyhow::ensure!(
+            !window_only || !allow_input,
+            "window consent cannot grant global input"
+        );
         let (commands, incoming) = async_mpsc::channel(32);
         let (stop, stopped) = watch::channel(false);
         let (ready, started) = mpsc::sync_channel(1);
@@ -61,8 +75,15 @@ impl Portal {
                     }
                 };
                 runtime.block_on(async {
-                    if let Err(error) =
-                        run(allow_input, incoming, stopped, &ready, &worker_active).await
+                    if let Err(error) = run(
+                        allow_input,
+                        window_only,
+                        incoming,
+                        stopped,
+                        &ready,
+                        &worker_active,
+                    )
+                    .await
                     {
                         tracing::error!(%error, "Linux desktop portal stopped");
                         let _ = ready.try_send(Err(error));
@@ -130,12 +151,21 @@ impl DesktopSession {
 
 async fn run(
     allow_input: bool,
+    window_only: bool,
     mut commands: async_mpsc::Receiver<Command>,
     mut stopped: watch::Receiver<bool>,
     ready: &mpsc::SyncSender<anyhow::Result<Stream>>,
     active: &AtomicBool,
 ) -> anyhow::Result<()> {
     let cast = tokio::time::timeout(CALL_TIMEOUT, Screencast::new()).await??;
+    if window_only {
+        anyhow::ensure!(
+            tokio::time::timeout(CALL_TIMEOUT, cast.available_source_types())
+                .await??
+                .contains(SourceType::Window),
+            "this compositor does not support consented ScreenCast window capture"
+        );
+    }
     let remote = if allow_input {
         Some(tokio::time::timeout(CALL_TIMEOUT, RemoteDesktop::new()).await??)
     } else {
@@ -152,7 +182,7 @@ async fn run(
     let result = tokio::select! {
         _ = stopped.changed() => Ok(()),
         result = async {
-            let stream = tokio::time::timeout(CONSENT_TIMEOUT, select(&cast, remote.as_ref(), &session))
+            let stream = tokio::time::timeout(CONSENT_TIMEOUT, select(&cast, remote.as_ref(), &session, window_only))
                 .await.context("desktop sharing consent timed out")??;
             let node = stream.node;
             let geometry = (stream.width, stream.height);
@@ -194,13 +224,19 @@ async fn select(
     cast: &Screencast<'static>,
     remote: Option<&RemoteDesktop<'static>>,
     session: &DesktopSession,
+    window_only: bool,
 ) -> anyhow::Result<Stream> {
     let (streams, fd) = match session {
         DesktopSession::View(session) => {
             cast.select_sources(
                 session,
                 CursorMode::Embedded,
-                SourceType::Monitor.into(),
+                if window_only {
+                    SourceType::Window
+                } else {
+                    SourceType::Monitor
+                }
+                .into(),
                 false,
                 None,
                 PersistMode::DoNot,
@@ -250,6 +286,29 @@ async fn select(
             )
         }
     };
+    if window_only {
+        let stream = streams
+            .first()
+            .context("portal returned no selected window")?;
+        let kind = match stream.source_type() {
+            Some(SourceType::Window) => SelectedSource::Window,
+            Some(SourceType::Monitor) => SelectedSource::Monitor,
+            _ => SelectedSource::Unknown,
+        };
+        let selected = validate_window_selection(
+            streams.len(),
+            kind,
+            stream.pipe_wire_node_id(),
+            stream.size(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        return Ok(Stream {
+            fd,
+            node: selected.node,
+            width: selected.width,
+            height: selected.height,
+        });
+    }
     anyhow::ensure!(
         streams.len() == 1,
         "select exactly one monitor in the sharing dialog"

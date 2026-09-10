@@ -211,8 +211,8 @@ impl Desktop {
                 let auth = self.auth.lock().await;
                 value(auth.account.as_ref().map(|account| account_view(account, &auth.tenant)))
             }
-            Request::Resources => value(self.api::<Vec<Resource>>(Method::GET, "v1/resources", None).await?),
-            Request::Resource { id } => value(self.api::<Resource>(Method::GET, &format!("v1/resources/{id}"), None).await?),
+            Request::Resources => value(self.api::<Vec<Resource>>(Method::GET, "v1/resources?application_windows=true", None).await?),
+            Request::Resource { id } => value(self.api::<Resource>(Method::GET, &format!("v1/resources/{id}?application_windows=true"), None).await?),
             Request::Machines => value(self.api::<Vec<Machine>>(Method::GET, "v1/machines", None).await?),
             Request::CreateEnrollment { name } => {
                 nonempty(&name, 255)?;
@@ -247,7 +247,7 @@ impl Desktop {
                 value(Grant::from(grant))
             }
             Request::RevokeAccess { entitlement_id } => self.api(Method::DELETE, &format!("v1/entitlements/{entitlement_id}"), None).await,
-            Request::Connect { resource_id } => {
+            Request::Connect { resource_id, keyboard_profile } => {
                 let (account, cancelled) = self.context().await?;
                 let _gate = tokio::select! {
                     biased;
@@ -263,11 +263,15 @@ impl Desktop {
                     biased;
                     _ = cancelled.cancelled() => return Err(DesktopError::cancelled()),
                     result = async {
-                        let resource: Resource = account.request(Method::GET, &format!("v1/resources/{resource_id}"), None).await?;
-                        if !resource.launch_supported || matches!(resource.kind, Kind::App) {
-                            return Err(DesktopError::new("unsupported", "This resource does not support native desktop streaming."));
+                        let resource: Resource = account.request(Method::GET, &format!("v1/resources/{resource_id}?application_windows=true"), None).await?;
+                        if resource.id != resource_id { return Err(DesktopError::protocol()); }
+                        if !resource.launch_supported {
+                            return Err(DesktopError::new("unsupported", "This resource is not supported by the remote host's native session backend."));
                         }
-                        let ticket: Ticket = account.request(Method::POST, "v1/sessions", Some(&json!({"resource_id":resource_id,"client_os":std::env::consts::OS}))).await?;
+                        if !matches!(resource.kind, Kind::App) && keyboard_profile != ApplicationKeyboardProfile::Physical {
+                            return Err(DesktopError::new("unsupported", "Keyboard adaptation is available only for application sessions."));
+                        }
+                        let ticket: Ticket = account.request(Method::POST, "v1/sessions", Some(&json!({"resource_id":resource_id,"client_os":std::env::consts::OS,"application_windows":true}))).await?;
                         Ok((resource, ticket))
                     } => result?,
                 };
@@ -279,7 +283,7 @@ impl Desktop {
                     close_unused_ticket(account, id);
                     return Err(DesktopError::cancelled());
                 }
-                let session = self.sessions.start(resource, ticket).await;
+                let session = self.sessions.start(resource, ticket, keyboard_profile).await;
                 drop(auth);
                 match session {
                     Ok(session) => value(session),
@@ -506,6 +510,72 @@ mod tests {
             "missing-agent".into(),
             "unused-identity".into(),
         )
+    }
+
+    #[tokio::test]
+    async fn application_admission_uses_resource_capability_without_desktop_fallback() {
+        for supported in [false, true] {
+            let (pair, workspace) = auth_fixture("ADMIN", "PERSONAL");
+            let resource_id = uuid::Uuid::nil();
+            let mut replies = vec![
+                reply("POST", "/v1/auth/login", 200, pair),
+                reply("GET", "/v1/workspace", 200, workspace),
+                reply(
+                    "GET",
+                    "/v1/resources/00000000-0000-0000-0000-000000000000?application_windows=true",
+                    200,
+                    json!({
+                        "id":resource_id,"name":"Editor","kind":"APP",
+                        "description":"","machine_status":"ONLINE","role":"CONTROLLER",
+                        "policy":{"input":true,"audio":false,"clipboard":false,"file_transfer":false},
+                        "owned":false,"launch_supported":supported
+                    }),
+                ),
+            ];
+            if supported {
+                replies.push(reply(
+                    "POST",
+                    "/v1/sessions",
+                    409,
+                    json!({"error":"application backend is busy"}),
+                ));
+            }
+            let (url, server) = mock_manager(replies).await;
+            let host = desktop();
+            host.request(Request::Login {
+                manager_url: url,
+                tenant: "acme".into(),
+                email: "exact@example.test".into(),
+                password: "test-password".into(),
+                allow_insecure_http: true,
+            })
+            .await
+            .unwrap();
+            let error = host
+                .request(Request::Connect {
+                    resource_id,
+                    keyboard_profile: ApplicationKeyboardProfile::Editing,
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.code,
+                if supported { "conflict" } else { "unsupported" }
+            );
+            let requests = tokio::time::timeout(std::time::Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(requests.len(), if supported { 4 } else { 3 });
+            if supported {
+                assert_eq!(requests[3].1["resource_id"], resource_id.to_string());
+                assert_eq!(requests[3].1["application_windows"], true);
+                assert!(requests[3].1.get("launch_path").is_none());
+                assert!(requests[3].1.get("launch_args").is_none());
+                assert!(requests[3].1.get("keyboard_profile").is_none());
+            }
+            assert!(host.sessions.list().await.is_empty());
+        }
     }
 
     #[tokio::test]

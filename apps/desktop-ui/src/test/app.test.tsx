@@ -49,6 +49,20 @@ describe('desktop presentation and actions', () => {
     expect(api.calls).toContainEqual({ op: 'connect', resource_id: resource.id });
     expect(screen.queryByText('已连接')).not.toBeInTheDocument();
   });
+  it('launches a supported application by resource without selecting its host machine', async () => {
+    const user = userEvent.setup();
+    const application = { ...resource, id: 'published-editor', name: 'Remote Editor', kind: 'APP' as const, machine_id: null, os: null, owned: false };
+    const api = fakeApi({
+      resources: () => [application],
+      connect: () => ({ ...session, resource_id: application.id, name: application.name, state: 'connecting' }),
+    });
+    render(<App api={api} />);
+    await user.click(await screen.findByRole('button', { name: '启动' }));
+    await waitFor(() => expect(api.calls).toContainEqual({ op: 'connect', resource_id: application.id }));
+    expect(api.calls.filter(call => call.op === 'connect')).toHaveLength(1);
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.queryByText('暂不支持独立应用连接')).not.toBeInTheDocument();
+  });
   it('keeps an asynchronous native failure visible after its window has closed', async () => {
     const user = userEvent.setup();
     let attempted = false;
@@ -60,6 +74,38 @@ describe('desktop presentation and actions', () => {
     await user.click(await screen.findByRole('button', { name: '打开' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('Check screen recording permission on the remote computer.');
     expect(screen.getByRole('alert')).toHaveTextContent(resource.name);
+  });
+  it('keeps application keyboard adaptation opt-in and sends only a local profile choice', async () => {
+    const user = userEvent.setup();
+    const application = { ...resource, kind: 'APP' as const, name: 'Editor', machine_id: null, owned: false };
+    const api = fakeApi({ resources: () => [application], resource: () => application });
+    render(<App api={api} />);
+    await user.click(await screen.findByRole('button', { name: '查看 Editor 详情' }));
+    const selector = await screen.findByRole('combobox', { name: '键盘映射' });
+    expect(selector).toHaveValue('physical');
+    expect(screen.getByRole('heading', { name: '应用信息' })).toBeVisible();
+    expect(screen.queryByRole('heading', { name: '设备信息' })).not.toBeInTheDocument();
+    expect(screen.queryByText('系统信息未知')).not.toBeInTheDocument();
+    expect(screen.getByText(/下次新连接生效/)).toBeVisible();
+    await user.selectOptions(selector, 'terminal');
+    await user.click(screen.getByRole('button', { name: '启动应用' }));
+    await waitFor(() => expect(api.calls).toContainEqual({
+      op: 'connect', resource_id: resource.id, keyboard_profile: 'terminal',
+    }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+  it('provides an explicit confirmed disconnect without requesting application close', async () => {
+    const user = userEvent.setup();
+    const api = fakeApi({ sessions: () => [session] });
+    render(<App api={api} />);
+    expect(await screen.findByText('当前连接')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: '断开' }));
+    const dialog = await screen.findByRole('dialog', { name: '断开会话' });
+    expect(dialog).toHaveTextContent('这不会请求退出远端应用');
+    expect(api.calls.some(call => call.op === 'disconnect_session')).toBe(false);
+    await user.click(within(dialog).getByRole('button', { name: '断开' }));
+    await waitFor(() => expect(api.calls).toContainEqual({ op: 'disconnect_session', session_id: session.session_id }));
+    expect(api.calls.some(call => call.op === 'connect')).toBe(false);
   });
   it('keeps permissions unknown and requires stop confirmation', async () => {
     const user = userEvent.setup();
@@ -148,6 +194,19 @@ describe('desktop presentation and actions', () => {
     await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '退出登录' }));
     expect(await screen.findByRole('heading', { name: '登录工作空间' })).toBeVisible();
     expect(screen.queryByRole('navigation')).not.toBeInTheDocument();
+  });
+  it('never offers global file transfer for an application even with stale grant metadata', async () => {
+    const user = userEvent.setup();
+    const api = fakeApi({
+      resources: () => [{ ...resource, kind: 'APP', policy: { ...resource.policy, file_transfer: true } }],
+      sessions: () => [session],
+    });
+    render(<App api={api} />);
+    await user.click(await screen.findByRole('button', { name: '文件传输' }));
+    const send = await screen.findByRole('button', { name: '选择文件发送' });
+    expect(send).toBeDisabled();
+    await user.click(send);
+    expect(api.calls.some(call => call.op === 'send_files')).toBe(false);
   });
   it('returns to login with a warning, not stale private data, when logout rejects', async () => {
     const user = userEvent.setup();

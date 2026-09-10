@@ -283,6 +283,15 @@ impl Agent {
 impl Agent {
     /// Open the outbound control tunnel and keep it.
     async fn attach(world: &World, machine: Uuid, credential: &str) -> Self {
+        Self::attach_with_application(world, machine, credential, false).await
+    }
+
+    async fn attach_with_application(
+        world: &World,
+        machine: Uuid,
+        credential: &str,
+        application_windows: bool,
+    ) -> Self {
         let cfg = TransportConfig::default();
         let endpoint = client_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
         let pin = CertificateFingerprint::from_hex(&world.gateway.fingerprint).unwrap();
@@ -298,16 +307,17 @@ impl Agent {
         .expect("the agent should reach the gateway");
 
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
-        ndp_signal::write_message(
-            &mut send,
-            &AgentHello {
-                machine_id: nebula_common::MachineId::from_uuid(machine),
-                credential: credential.to_string(),
-                agent_version: "0.1.0".into(),
-            },
-        )
-        .await
+        let mut hello = serde_json::to_value(AgentHello {
+            machine_id: nebula_common::MachineId::from_uuid(machine),
+            credential: credential.to_string(),
+            agent_version: "0.1.0".into(),
+            application_windows,
+        })
         .unwrap();
+        if !application_windows {
+            hello.as_object_mut().unwrap().remove("application_windows");
+        }
+        ndp_signal::write_message(&mut send, &hello).await.unwrap();
 
         let ack: AgentHelloAck = ndp_signal::read_message(&mut recv).await.unwrap();
         let AgentHelloAck::Accepted { .. } = ack else {
@@ -320,7 +330,7 @@ impl Agent {
             // gateway pushes session requests down it unprompted.
             while let Ok(message) = ndp_signal::read_message::<GatewayMessage>(&mut recv).await {
                 if let GatewayMessage::StartSession(request) = message {
-                    if tx.send(request).await.is_err() {
+                    if tx.send(*request).await.is_err() {
                         break;
                     }
                 }
@@ -441,6 +451,7 @@ async fn a_user_reaches_a_machine_they_were_never_told_the_address_of() {
             ticket: ticket["ticket"].as_str().unwrap().to_string(),
             noise_public_key: hex::encode(client_keys.public().as_bytes()),
             client_version: "0.1.0".into(),
+            application_windows: false,
         },
     )
     .await
@@ -566,6 +577,190 @@ async fn agent_serve(keys: StaticKeypair, mut agent: Agent) -> (Session, Session
 }
 
 #[tokio::test]
+async fn app_gateway_requires_live_peer_support_and_forwards_signed_authority() {
+    let world = World::start().await;
+    let agent_keys = StaticKeypair::generate();
+    let provisioned = world.provision(&agent_keys).await;
+    let app = world
+        .post_as(
+            &format!("/v1/machines/{}/resources", provisioned.machine),
+            &world.owner_token,
+            json!({"kind":"APP","name":"Editor","launch_path":"/trusted/editor",
+            "launch_args":["literal; argument"],"working_dir":"/workspace"}),
+        )
+        .await;
+    let me = world.get("/v1/auth/me", &world.owner_token).await;
+    world
+        .post_as(
+            &format!("/v1/resources/{}/entitlements", app["id"].as_str().unwrap()),
+            &world.owner_token,
+            json!({"subject_kind":"USER","subject_id":me["id"],"role":"CONTROLLER"}),
+        )
+        .await;
+    let response = world
+        .http
+        .post(format!("{}/v1/machines/heartbeat", world.manager_url))
+        .header(
+            "Authorization",
+            format!("Machine {}", provisioned.credential),
+        )
+        .json(&json!({
+            "status":"ONLINE", "capabilities":{"application":{
+                "supported":true,"protocol_version":1,"max_surfaces":32,"reason":null
+            }}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    let authority_url = format!("{}/v1/machines/session-authority", world.manager_url);
+    let rejected = world.http.get(&authority_url).send().await.unwrap();
+    assert_eq!(rejected.status(), 401);
+    let authority: nebula_common::TicketAuthority = world
+        .http
+        .get(&authority_url)
+        .header(
+            "Authorization",
+            format!("Machine {}", provisioned.credential),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(authority.issuer, "https://manager.public.test");
+    assert_ne!(
+        authority.issuer, world.manager_url,
+        "issuer must not be inferred from transport URL"
+    );
+    let mut original_ticket = None;
+    for (attempt, (agent_support, client_support)) in
+        [(false, true), (true, false), (true, true), (true, true)]
+            .into_iter()
+            .enumerate()
+    {
+        let mut agent = Agent::attach_with_application(
+            &world,
+            provisioned.machine,
+            &provisioned.credential,
+            agent_support,
+        )
+        .await;
+        if original_ticket.is_none() {
+            let ticket = world
+                .post_as(
+                    "/v1/sessions",
+                    &world.owner_token,
+                    json!({"resource_id":app["id"],"application_windows":true}),
+                )
+                .await;
+            assert_eq!(ticket["application_windows"], true);
+            original_ticket = Some(ticket["ticket"].as_str().unwrap().to_string());
+        }
+        let token = original_ticket.as_ref().unwrap().clone();
+        let endpoint = client_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let conn = connect(
+            &endpoint,
+            world.gateway_addr,
+            "localhost",
+            CertificateFingerprint::from_hex(&world.gateway.fingerprint).unwrap(),
+            ALPN_SESSION,
+            &TransportConfig::default(),
+        )
+        .await
+        .unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let mut hello = serde_json::to_value(ClientHello {
+            ticket: token.clone(),
+            noise_public_key: hex::encode([9u8; 32]),
+            client_version: "test".into(),
+            application_windows: client_support,
+        })
+        .unwrap();
+        if !client_support {
+            hello.as_object_mut().unwrap().remove("application_windows");
+        }
+        ndp_signal::write_message(&mut send, &hello).await.unwrap();
+        let ack: ClientHelloAck = ndp_signal::read_message(&mut recv).await.unwrap();
+        if !agent_support || !client_support || attempt == 3 {
+            assert!(matches!(ack, ClientHelloAck::Rejected { .. }));
+            assert!(
+                agent.requests.try_recv().is_err(),
+                "old peers must receive no APP requests"
+            );
+        } else {
+            assert!(
+                matches!(ack, ClientHelloAck::Accepted { .. }),
+                "capability rejections must not spend the ticket: {ack:?}"
+            );
+            let request = tokio::time::timeout(Duration::from_secs(5), agent.requests.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(request.signed_ticket.as_deref(), Some(token.as_str()));
+            let claims = request
+                .verify_signed_authority(
+                    &authority.jwks,
+                    &authority.issuer,
+                    nebula_common::MachineId::from_uuid(provisioned.machine),
+                    &hex::encode(agent_keys.public().as_bytes()),
+                )
+                .unwrap();
+            assert_eq!(request.launch_target, claims.launch_target);
+            assert!(request.launch_target.is_application());
+            let nebula_common::LaunchTarget::Application {
+                resource_id,
+                version,
+                launch,
+            } = &request.launch_target
+            else {
+                panic!("APP must never become desktop");
+            };
+            assert_eq!(resource_id.to_string(), app["id"].as_str().unwrap());
+            assert_eq!(launch.launch_path, "/trusted/editor");
+            assert_eq!(launch.launch_args, ["literal; argument"]);
+            assert_eq!(launch.working_dir.as_deref(), Some("/workspace"));
+            assert_eq!(*version, launch.version());
+            assert!(
+                !request.policy.audio && !request.policy.clipboard && !request.policy.file_transfer
+            );
+            let mut altered = request.clone();
+            altered.launch_target = nebula_common::LaunchTarget::Desktop;
+            assert!(altered
+                .verify_signed_authority(
+                    &authority.jwks,
+                    &authority.issuer,
+                    claims.mid,
+                    &claims.agent_key
+                )
+                .is_err());
+            altered = request.clone();
+            altered.policy.clipboard = true;
+            assert!(altered
+                .verify_signed_authority(
+                    &authority.jwks,
+                    &authority.issuer,
+                    claims.mid,
+                    &claims.agent_key
+                )
+                .is_err());
+            assert!(request
+                .verify_signed_authority(
+                    &authority.jwks,
+                    &world.manager_url,
+                    claims.mid,
+                    &claims.agent_key
+                )
+                .is_err());
+        }
+        agent.detach();
+    }
+}
+
+#[tokio::test]
 async fn a_ticket_cannot_be_redeemed_twice() {
     let world = World::start().await;
     let agent_keys = StaticKeypair::generate();
@@ -596,6 +791,7 @@ async fn a_ticket_cannot_be_redeemed_twice() {
                 ticket: token,
                 noise_public_key: hex::encode([9u8; 32]),
                 client_version: "0.1.0".into(),
+                application_windows: false,
             },
         )
         .await

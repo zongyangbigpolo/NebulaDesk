@@ -7,7 +7,7 @@
 //! the two, which is exactly what the client renders as icons. Applications
 //! hide their backing machines; desktops expose device details.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use nebula_common::{ResourceId, SessionPolicy, SessionRole};
@@ -355,6 +355,9 @@ pub struct EntitledResource {
     pub last_seen_at: Option<OffsetDateTime>,
     /// Whether isolated streaming for this resource kind is implemented.
     pub launch_supported: bool,
+    /// Internal runtime advertisement, never expose device metadata to APP consumers.
+    #[serde(skip)]
+    pub machine_capabilities: serde_json::Value,
 }
 
 /// Consumer metadata plus the exact role-clamped admission policy.
@@ -365,22 +368,36 @@ pub struct ResourceView {
     pub resource: EntitledResource,
     /// Authoritative effective policy.
     pub policy: SessionPolicy,
+    /// Isolated backend capability, without device identifiers or launch paths.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub application: Option<nebula_common::ApplicationCapability>,
 }
 
 impl EntitledResource {
-    fn into_view(mut self) -> ApiResult<ResourceView> {
-        let (_, policy) = effective_policy(
+    fn into_view(mut self, application_windows: bool) -> ApiResult<ResourceView> {
+        let (_, mut policy) = effective_policy(
             &self.role,
             self.allow_clipboard,
             self.allow_file_transfer,
             self.allow_audio,
         )?;
+        let application = if self.kind == "APP" {
+            let capability = nebula_common::ApplicationCapability::from_machine_capabilities(
+                &self.machine_capabilities,
+            );
+            self.launch_supported = application_windows && capability.is_supported();
+            policy = nebula_common::application::application_policy(policy);
+            Some(capability)
+        } else {
+            None
+        };
         self.allow_clipboard = policy.clipboard;
         self.allow_file_transfer = policy.file_transfer;
         self.allow_audio = policy.audio;
         Ok(ResourceView {
             resource: self,
             policy,
+            application,
         })
     }
 }
@@ -425,7 +442,8 @@ fn entitled_resources_sql() -> String {
            CASE WHEN r.kind = 'DESKTOP' THEN m.os END AS os,
            CASE WHEN r.kind = 'DESKTOP' THEN m.os_version END AS os_version,
            CASE WHEN r.kind = 'DESKTOP' THEN m.last_seen_at END AS last_seen_at,
-           (r.kind = 'DESKTOP') AS launch_supported
+           (r.kind = 'DESKTOP') AS launch_supported,
+           m.capabilities AS machine_capabilities
     FROM published_resources r
     JOIN machines m ON m.id = r.machine_id AND m.tenant_id = r.tenant_id
     LEFT JOIN users u ON u.id = m.owner_user_id AND u.tenant_id = m.tenant_id
@@ -462,6 +480,7 @@ fn entitled_resources_sql() -> String {
 pub async fn list_mine(
     State(state): State<AppState>,
     caller: AuthUser,
+    Query(client): Query<ResourceClientCapabilities>,
 ) -> ApiResult<Json<Vec<ResourceView>>> {
     let rows = sqlx::query_as::<_, EntitledResource>(&format!(
         "{} ORDER BY r.name",
@@ -473,7 +492,7 @@ pub async fn list_mine(
     .await?;
     Ok(Json(
         rows.into_iter()
-            .map(EntitledResource::into_view)
+            .map(|row| row.into_view(client.application_windows))
             .collect::<ApiResult<Vec<_>>>()?,
     ))
 }
@@ -483,6 +502,7 @@ pub async fn detail(
     State(state): State<AppState>,
     caller: AuthUser,
     Path(id): Path<Uuid>,
+    Query(client): Query<ResourceClientCapabilities>,
 ) -> ApiResult<Json<ResourceView>> {
     let row = sqlx::query_as::<_, EntitledResource>(&format!(
         "{} AND r.id = $3",
@@ -494,7 +514,15 @@ pub async fn detail(
     .fetch_optional(&state.db)
     .await?
     .ok_or(ApiError::NotFound("resource"))?;
-    Ok(Json(row.into_view()?))
+    Ok(Json(row.into_view(client.application_windows)?))
+}
+
+/// Explicit caller opt-in. Legacy resource consumers never see launchable APPs.
+#[derive(Debug, Default, Deserialize)]
+pub struct ResourceClientCapabilities {
+    /// The caller implements negotiated, per-surface native application windows.
+    #[serde(default)]
+    pub application_windows: bool,
 }
 
 /// The authorisation a user holds over one resource.
@@ -516,6 +544,14 @@ pub struct ResolvedGrant {
     pub allow_file_transfer: bool,
     /// Audio permission.
     pub allow_audio: bool,
+    /// Actual runtime backend capabilities, not an OS-name inference.
+    pub machine_capabilities: serde_json::Value,
+    /// Publisher-owned executable snapshot.
+    pub launch_path: Option<String>,
+    /// Publisher-owned argv; never concatenated into a shell command.
+    pub launch_args: Vec<String>,
+    /// Publisher-owned working directory.
+    pub working_dir: Option<String>,
 }
 
 impl ResolvedGrant {
@@ -562,7 +598,8 @@ pub async fn resolve_grant(
 ) -> ApiResult<Option<ResolvedGrant>> {
     let sql = format!(
         "SELECT g.kind, m.id AS machine_id, {} AS machine_status, m.noise_public_key,
-                g.role, g.allow_clipboard, g.allow_file_transfer, g.allow_audio
+                g.role, g.allow_clipboard, g.allow_file_transfer, g.allow_audio,
+                m.capabilities AS machine_capabilities, r.launch_path, r.launch_args, r.working_dir
          FROM ({}) g
          JOIN published_resources r ON r.id = g.id
          JOIN machines m ON m.id = r.machine_id
@@ -869,6 +906,10 @@ mod tests {
             allow_clipboard: clipboard,
             allow_file_transfer: files,
             allow_audio: true,
+            machine_capabilities: serde_json::json!({}),
+            launch_path: None,
+            launch_args: vec![],
+            working_dir: None,
         }
     }
 

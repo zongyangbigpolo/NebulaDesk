@@ -13,7 +13,7 @@ fn main() -> anyhow::Result<()> {
             fps: 30,
             bitrate: 8_000_000,
         },
-        tx,
+        tx.into(),
     )?;
     let rt = tokio::runtime::Runtime::new()?;
     let result = rt.block_on(async {

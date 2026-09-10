@@ -48,10 +48,16 @@ enum SessionEvent {
 /// event loop to run on the thread the process started on, so the network
 /// side is what gets moved onto a runtime of its own.
 pub fn run(ticket: SessionTicket, resource_name: &str) -> anyhow::Result<()> {
+    if ticket.application_windows {
+        return crate::application::run(ticket, false);
+    }
     run_inner(ticket, resource_name, false)
 }
 
 pub fn run_managed(ticket: SessionTicket, resource_name: &str) -> anyhow::Result<()> {
+    if ticket.application_windows {
+        return crate::application::run(ticket, true);
+    }
     run_inner(ticket, resource_name, true)
 }
 
@@ -1509,6 +1515,7 @@ mod tests {
             gateway_pin: String::new(),
             agent_key: "not-hex".into(),
             policy: nebula_common::SessionPolicy::view_only(),
+            application_windows: false,
         };
         let (_input, input) = tokio::sync::mpsc::unbounded_channel();
         let (_files, files) = tokio::sync::mpsc::channel(1);

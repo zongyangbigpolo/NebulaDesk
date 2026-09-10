@@ -12,6 +12,7 @@ fn main() -> anyhow::Result<()> {
         // Key validation fails before the client can attempt a connection.
         agent_key: "preview-not-a-key".into(),
         policy: SessionPolicy::view_only(),
+        application_windows: false,
     };
     session::run(ticket, "NebulaDesk UI preview (offline)")
 }

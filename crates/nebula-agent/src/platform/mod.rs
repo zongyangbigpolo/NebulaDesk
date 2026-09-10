@@ -31,6 +31,7 @@ pub fn native() -> Arc<dyn Platform> {
     {
         Arc::new(macos::MacOs)
     }
+
     #[cfg(target_os = "linux")]
     {
         Arc::new(linux::Linux::default())
@@ -46,6 +47,17 @@ pub fn native() -> Arc<dyn Platform> {
             "no capture backend for this platform yet; streaming a test pattern"
         );
         Arc::new(TestPattern::default())
+    }
+}
+
+/// Keyboard advisory only; this must never be treated as a capability probe.
+pub(crate) fn application_host_os() -> ndp_proto::application::ApplicationHostOs {
+    use ndp_proto::application::ApplicationHostOs;
+    match std::env::consts::OS {
+        "macos" => ApplicationHostOs::Macos,
+        "windows" => ApplicationHostOs::Windows,
+        "linux" => ApplicationHostOs::Linux,
+        _ => ApplicationHostOs::Unknown,
     }
 }
 

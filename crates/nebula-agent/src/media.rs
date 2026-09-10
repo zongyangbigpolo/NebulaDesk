@@ -32,7 +32,135 @@ pub struct EncodedFrame {
 /// at the source, where the encoder can be told to make the next one a
 /// keyframe, rather than to accumulate a queue of stale ones that will be
 /// decoded into visible lag.
-pub type FrameSink = mpsc::Sender<EncodedFrame>;
+#[derive(Clone)]
+pub struct FrameSink {
+    output: FrameOutput,
+    epoch: Option<u64>,
+}
+
+#[derive(Clone)]
+enum FrameOutput {
+    Desktop(mpsc::Sender<EncodedFrame>),
+    Application {
+        output: mpsc::Sender<(EncodedFrame, u64)>,
+        delivery: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        produced_keyframe: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    },
+}
+
+impl From<mpsc::Sender<EncodedFrame>> for FrameSink {
+    fn from(output: mpsc::Sender<EncodedFrame>) -> Self {
+        Self {
+            output: FrameOutput::Desktop(output),
+            epoch: None,
+        }
+    }
+}
+
+impl FrameSink {
+    pub(crate) fn application(
+        output: mpsc::Sender<(EncodedFrame, u64)>,
+        delivery: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        produced_keyframe: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        Self {
+            output: FrameOutput::Application {
+                output,
+                delivery,
+                produced_keyframe,
+            },
+            epoch: None,
+        }
+    }
+
+    /// Freeze provenance when accepting a native image, before asynchronous
+    /// encoding or queuing. Cached images must retain this same sink.
+    pub fn for_frame(&self) -> Self {
+        let mut sink = self.clone();
+        if sink.epoch.is_none() {
+            if let FrameOutput::Application { delivery, .. } = &sink.output {
+                sink.epoch = Some(delivery.load(std::sync::atomic::Ordering::Acquire));
+            }
+        }
+        sink
+    }
+
+    /// Whether a frozen native image still belongs to the enabled delivery epoch.
+    pub fn is_current(&self) -> bool {
+        match (&self.output, self.epoch) {
+            (FrameOutput::Application { delivery, .. }, Some(epoch)) => {
+                epoch & 1 != 0 && delivery.load(std::sync::atomic::Ordering::Acquire) == epoch
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether the consumer has gone away.
+    pub fn is_closed(&self) -> bool {
+        match &self.output {
+            FrameOutput::Desktop(output) => output.is_closed(),
+            FrameOutput::Application { output, .. } => output.is_closed(),
+        }
+    }
+
+    fn note_frame(&self, frame: &EncodedFrame) {
+        if frame.keyframe {
+            if let FrameOutput::Application {
+                produced_keyframe, ..
+            } = &self.output
+            {
+                // Capture progress, not network progress: congestion must not
+                // restart an otherwise healthy native stream.
+                produced_keyframe
+                    .fetch_max(self.epoch.unwrap(), std::sync::atomic::Ordering::AcqRel);
+            }
+        }
+    }
+
+    /// Publish without blocking; stale native images are treated as dropped frames.
+    pub fn try_send(
+        &self,
+        frame: EncodedFrame,
+    ) -> Result<(), mpsc::error::TrySendError<EncodedFrame>> {
+        let sink = self.for_frame();
+        if !sink.is_current() {
+            return Err(mpsc::error::TrySendError::Full(frame));
+        }
+        sink.note_frame(&frame);
+        match &sink.output {
+            FrameOutput::Desktop(output) => output.try_send(frame),
+            FrameOutput::Application { output, .. } => output
+                .try_send((frame, sink.epoch.unwrap()))
+                .map_err(|error| match error {
+                    mpsc::error::TrySendError::Full((frame, _)) => {
+                        mpsc::error::TrySendError::Full(frame)
+                    }
+                    mpsc::error::TrySendError::Closed((frame, _)) => {
+                        mpsc::error::TrySendError::Closed(frame)
+                    }
+                }),
+        }
+    }
+
+    /// Publish with bounded backpressure, preserving the producer's epoch.
+    pub async fn send(
+        &self,
+        frame: EncodedFrame,
+    ) -> Result<(), mpsc::error::SendError<EncodedFrame>> {
+        let sink = self.for_frame();
+        if !sink.is_current() {
+            return Err(mpsc::error::SendError(frame));
+        }
+        sink.note_frame(&frame);
+        match &sink.output {
+            FrameOutput::Desktop(output) => output.send(frame).await,
+            FrameOutput::Application { output, .. } => output
+                .send((frame, sink.epoch.unwrap()))
+                .await
+                .map_err(|mpsc::error::SendError((frame, _))| mpsc::error::SendError(frame)),
+        }
+    }
+}
 
 /// What the client asked for.
 #[derive(Debug, Clone, Copy)]
@@ -60,6 +188,12 @@ impl Default for VideoConfig {
 
 /// A source of encoded video for one session.
 pub trait VideoSource: Send + 'static {
+    /// Whether native images retain `FrameSink::for_frame()` provenance through
+    /// every cache and asynchronous encoder stage. Required for warm APP resume.
+    fn preserves_frame_provenance(&self) -> bool {
+        false
+    }
+
     /// Begin capturing and encoding into `sink`.
     fn start(&mut self, config: VideoConfig, sink: FrameSink) -> anyhow::Result<()>;
 
@@ -157,6 +291,25 @@ pub trait InputInjector: Send + 'static {
 
 /// How a session gets its media on this machine.
 pub trait Platform: Send + Sync + 'static {
+    /// Native shared login sessions require an exclusive controller lease.
+    /// Only genuinely isolated or synthetic backends may return false.
+    fn shared_desktop(&self) -> bool {
+        true
+    }
+
+    /// Probe an implemented native application backend, never infer from OS name.
+    fn application_capability(&self) -> nebula_common::ApplicationCapability {
+        nebula_common::ApplicationCapability::default()
+    }
+
+    /// Launch only the trusted manager-bound application. No desktop fallback.
+    fn application(
+        &self,
+        _launch: &nebula_common::ApplicationLaunch,
+    ) -> anyhow::Result<Box<dyn crate::application::ApplicationBackend>> {
+        anyhow::bail!("native application sessions are unavailable on this backend")
+    }
+
     /// Optionally allocate a per-session factory. Capture and input can share
     /// one desktop-portal consent session without sharing it with other peers.
     /// Stateless backends return `None` and keep using the original factory.
@@ -205,6 +358,10 @@ pub struct TestPattern {
 }
 
 impl Platform for TestPattern {
+    fn shared_desktop(&self) -> bool {
+        false
+    }
+
     fn video(&self) -> anyhow::Result<Box<dyn VideoSource>> {
         Ok(Box::new(SyntheticVideo::default()))
     }
@@ -230,6 +387,10 @@ pub struct SyntheticVideo {
 }
 
 impl VideoSource for SyntheticVideo {
+    fn preserves_frame_provenance(&self) -> bool {
+        true
+    }
+
     fn start(&mut self, config: VideoConfig, sink: FrameSink) -> anyhow::Result<()> {
         let keyframe = std::sync::Arc::clone(&self.keyframe);
         let interval = std::time::Duration::from_micros(1_000_000 / config.fps.max(1) as u64);
@@ -244,6 +405,7 @@ impl VideoSource for SyntheticVideo {
             let mut n: u64 = 0;
             loop {
                 ticker.tick().await;
+                let frame_sink = sink.for_frame();
                 let want_key = n == 0
                     || keyframe.swap(false, std::sync::atomic::Ordering::Relaxed)
                     || n % (config.fps as u64 * 2) == 0;
@@ -254,7 +416,7 @@ impl VideoSource for SyntheticVideo {
                 };
                 // A full sink means the client is behind; dropping here is
                 // the point of the bound.
-                if sink.try_send(frame).is_err() && sink.is_closed() {
+                if frame_sink.try_send(frame).is_err() && sink.is_closed() {
                     return;
                 }
                 n += 1;
@@ -405,7 +567,7 @@ mod tests {
                     fps: 120,
                     ..VideoConfig::default()
                 },
-                tx,
+                tx.into(),
             )
             .unwrap();
 
@@ -424,7 +586,7 @@ mod tests {
     async fn stopping_ends_the_stream() {
         let (tx, mut rx) = mpsc::channel(8);
         let mut video = SyntheticVideo::default();
-        video.start(VideoConfig::default(), tx).unwrap();
+        video.start(VideoConfig::default(), tx.into()).unwrap();
         rx.recv().await.unwrap();
 
         video.stop();

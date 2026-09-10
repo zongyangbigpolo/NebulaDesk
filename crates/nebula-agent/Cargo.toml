@@ -22,6 +22,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 hex = { workspace = true }
+base64 = { workspace = true }
 rand = { workspace = true }
 opus = { workspace = true }
 arboard = { workspace = true }
@@ -34,15 +35,19 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 if-addrs = "0.15"
+fs2 = "0.4"
 
 [[bin]]
 name = "nebula-agent"
 path = "src/main.rs"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-core-graphics = "0.25"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard"] }
-screencapturekit = "9"
+core-graphics = { version = "0.25", features = ["elcapitan"] }
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard", "NSWorkspace", "NSRunningApplication", "NSEvent", "NSGraphicsContext", "objc2-core-graphics", "block2", "libc"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSString", "NSURL", "NSDate", "NSError", "NSProcessInfo"] }
+block2 = "0.6"
+screencapturekit = { version = "9", features = ["macos_14_2"] }
 shiguredo_video_toolbox = "2026.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -58,11 +63,14 @@ windows = { version = "0.61", features = [
     "Foundation", "Graphics_Capture", "Graphics_DirectX_Direct3D11",
     "Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
     "Win32_Media_Audio", "Win32_Media_KernelStreaming", "Win32_Media_Multimedia",
     "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage",
     "Win32_System_Ole", "Win32_System_Variant", "Win32_System_WinRT",
+    "Win32_System_Threading", "Win32_Security",
     "Win32_System_WinRT_Direct3D11", "Win32_System_WinRT_Graphics_Capture",
     "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
 ] }
 
 [dev-dependencies]

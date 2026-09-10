@@ -13,7 +13,7 @@ export function Transfers({ transfers, sessions, resources, busy, onSend, onFocu
     <h3>会话与发送</h3>
     {!sessions.length ? <div className="panel compact-empty">暂无会话。先从“我的资源”连接一台电脑。</div> : <div className="panel">{sessions.map(session => {
       const resource = resources.find(r => r.id === session.resource_id);
-      const canSend = session.state === 'connected' && resource?.policy.file_transfer === true;
+      const canSend = session.state === 'connected' && resource?.kind === 'DESKTOP' && resource.policy.file_transfer === true;
       const active = ['connected', 'connecting'].includes(session.state);
       return <div className="session-row" key={session.session_id}><div className="list-row"><div className="grow"><strong>{session.name}</strong><p>{sessionLabels[session.state]}{session.rtt_ms !== null ? ` · ${session.rtt_ms} ms` : ''}</p></div><button disabled={busy || !active} onClick={() => onFocus(session)}>返回会话</button><button disabled={busy || !canSend} title={!canSend ? '需要已连接且允许文件传输的会话' : undefined} onClick={() => onSend(session)}>选择文件发送</button><button className="text-button danger-text" disabled={busy || !active} onClick={() => onDisconnect(session)}>断开</button></div><ErrorNotice message={session.error} /></div>;
     })}</div>}

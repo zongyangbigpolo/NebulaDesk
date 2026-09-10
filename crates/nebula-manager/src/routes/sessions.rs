@@ -28,6 +28,9 @@ pub struct CreateSession {
     /// The client's operating system, recorded for support and key mapping.
     #[serde(default)]
     pub client_os: Option<String>,
+    /// Explicit native per-surface support. Legacy callers cannot launch APP.
+    #[serde(default)]
+    pub application_windows: bool,
 }
 
 /// Everything a client needs to establish the session.
@@ -57,6 +60,8 @@ pub struct SessionTicket {
     /// this is here so the client knows not to offer the user a feature the
     /// session will silently refuse.
     pub policy: nebula_common::SessionPolicy,
+    /// Expected native-window mode, without exposing publisher launch paths.
+    pub application_windows: bool,
 }
 
 /// `POST /v1/sessions`
@@ -91,12 +96,13 @@ pub async fn create(
         return Err(ApiError::NotFound("resource"));
     };
 
-    if grant.kind != "DESKTOP" {
-        deny("app_streaming_unsupported").await;
-        return Err(ApiError::Conflict(
-            "isolated APP streaming is not supported; desktop fallback is forbidden".into(),
-        ));
-    }
+    let launch_target = match launch_target(&grant, req.resource_id, req.application_windows) {
+        Ok(target) => target,
+        Err(error) => {
+            deny("app_streaming_unsupported").await;
+            return Err(error);
+        }
+    };
 
     if grant.machine_status != "ONLINE" {
         deny("machine_offline").await;
@@ -105,7 +111,10 @@ pub async fn create(
         ));
     }
 
-    let (role, policy) = grant.policy()?;
+    let (role, mut policy) = grant.policy()?;
+    if launch_target.is_application() {
+        policy = nebula_common::application::application_policy(policy);
+    }
 
     // Placement: least-loaded node in the machine's region. The gateway is
     // where the agent's control tunnel already terminates when we know it,
@@ -115,7 +124,7 @@ pub async fn create(
     let relay = pick_relay(&state, &gateway.region).await?;
 
     let session = SessionId::new();
-    let claims = state.signer.claims(
+    let mut claims = state.signer.claims(
         session,
         caller.tenant,
         caller.id,
@@ -127,6 +136,7 @@ pub async fn create(
         relay.quic_addr.clone(),
         relay.cert_pin.clone(),
     );
+    claims.launch_target = launch_target;
     let ticket = state.signer.issue(&claims)?;
 
     // Recording the session before returning the ticket is what makes the
@@ -180,10 +190,107 @@ pub async fn create(
             relay_pin: relay.cert_pin,
             agent_key: claims.agent_key,
             policy,
+            application_windows: claims.launch_target.is_application(),
         }),
     ))
 }
 
+fn launch_target(
+    grant: &crate::routes::resources::ResolvedGrant,
+    resource: Uuid,
+    client_support: bool,
+) -> ApiResult<nebula_common::LaunchTarget> {
+    use nebula_common::{ApplicationCapability, ApplicationLaunch, LaunchTarget};
+    if grant.kind == "DESKTOP" {
+        return Ok(LaunchTarget::Desktop);
+    }
+    if grant.kind != "APP"
+        || !client_support
+        || !ApplicationCapability::from_machine_capabilities(&grant.machine_capabilities)
+            .is_supported()
+    {
+        return Err(ApiError::Conflict(
+            "isolated APP streaming is not supported; desktop fallback is forbidden".into(),
+        ));
+    }
+
+    let launch = ApplicationLaunch {
+        launch_path: grant.launch_path.clone().unwrap_or_default(),
+        launch_args: grant.launch_args.clone(),
+        working_dir: grant.working_dir.clone(),
+    };
+    launch.validate().map_err(|_| {
+        ApiError::Conflict("application launch configuration is unavailable".into())
+    })?;
+    Ok(LaunchTarget::Application {
+        resource_id: ResourceId::from_uuid(resource),
+        version: launch.version(),
+        launch,
+    })
+}
+
+#[cfg(test)]
+mod application_tests {
+    use super::*;
+    use crate::routes::resources::ResolvedGrant;
+    use nebula_common::{ApplicationCapability, LaunchTarget};
+
+    fn grant() -> ResolvedGrant {
+        ResolvedGrant {
+            kind: "APP".into(),
+            machine_id: Uuid::now_v7(),
+            machine_status: "ONLINE".into(),
+            noise_public_key: vec![0; 32],
+            role: "CONTROLLER".into(),
+            allow_clipboard: true,
+            allow_file_transfer: true,
+            allow_audio: true,
+            machine_capabilities: serde_json::json!({"application":ApplicationCapability {
+                    supported: true, protocol_version: 1, max_surfaces: 32, global_menu_supported: false, reason: None }}),
+            launch_path: Some("/Applications/Editor".into()),
+            launch_args: vec!["a; literal".into()],
+            working_dir: Some("/workspace".into()),
+        }
+    }
+
+    #[test]
+    fn app_admission_requires_both_capabilities_and_trusted_launch() {
+        let mut grant = grant();
+        let resource = Uuid::now_v7();
+        assert!(launch_target(&grant, resource, false).is_err());
+        let target = launch_target(&grant, resource, true).unwrap();
+        let LaunchTarget::Application {
+            resource_id,
+            version,
+            launch,
+        } = target
+        else {
+            panic!()
+        };
+        assert_eq!(resource_id.as_uuid(), resource);
+        assert_eq!(launch.launch_args, ["a; literal"]);
+        assert_eq!(version, launch.version());
+        grant.machine_capabilities = serde_json::json!({"application":{"supported":true}});
+        assert!(launch_target(&grant, resource, true).is_err());
+        grant = self::grant();
+        grant.launch_path = Some("relative".into());
+        assert!(launch_target(&grant, resource, true).is_err());
+        grant.kind = "DESKTOP".into();
+        assert_eq!(
+            launch_target(&grant, resource, false).unwrap(),
+            LaunchTarget::Desktop
+        );
+    }
+
+    #[test]
+    fn legacy_create_request_does_not_negotiate_application() {
+        let request: CreateSession = serde_json::from_value(serde_json::json!({
+            "resource_id": Uuid::now_v7()
+        }))
+        .unwrap();
+        assert!(!request.application_windows);
+    }
+}
 #[derive(sqlx::FromRow)]
 struct NodeRow {
     id: Uuid,

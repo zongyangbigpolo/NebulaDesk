@@ -14,7 +14,8 @@ use crate::caps::{Caps, DisplayGeometry, VideoCodec};
 pub enum ByeReason {
     /// The user closed the session.
     UserClosed,
-    /// The session ticket expired or was revoked mid-session.
+    /// Admission authority or an authenticated protocol binding was invalid.
+    /// Ticket expiry and entitlement edits do not revoke an admitted logical session.
     Unauthorized,
     /// Capability negotiation found no workable configuration.
     NegotiationFailed,
@@ -102,6 +103,8 @@ pub enum CandidateKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum ControlMessage {
+    /// Only legal after explicit APPLICATION_WINDOWS negotiation.
+    Application(crate::application::ApplicationMessage),
     /// Client to agent: offered capabilities.
     Hello {
         /// What the client can do.
@@ -182,6 +185,7 @@ impl ControlMessage {
     pub const fn kind(&self) -> crate::MsgKind {
         use crate::MsgKind as K;
         match self {
+            Self::Application(_) => K::Application,
             Self::Hello { .. } => K::Hello,
             Self::HelloAck { .. } => K::HelloAck,
             Self::Bye { .. } => K::Bye,
@@ -198,12 +202,19 @@ impl ControlMessage {
 
     /// Encode the JSON payload that follows the record header.
     pub fn encode(&self) -> crate::Result<Vec<u8>> {
+        if let Self::Application(message) = self {
+            message.validate()?;
+        }
         Ok(serde_json::to_vec(self)?)
     }
 
     /// Decode a JSON control payload.
     pub fn decode(payload: &[u8]) -> crate::Result<Self> {
-        Ok(serde_json::from_slice(payload)?)
+        let message: Self = serde_json::from_slice(payload)?;
+        if let Self::Application(application) = &message {
+            application.validate()?;
+        }
+        Ok(message)
     }
 }
 

@@ -142,6 +142,14 @@ impl TicketVerifier {
     /// expires, so a ticket captured in flight buys an attacker nothing once
     /// the legitimate client has redeemed it.
     pub async fn redeem(&self, token: &str) -> Result<TicketClaims, TicketError> {
+        let claims = self.verify(token).await?;
+        self.consume(&claims).await?;
+        Ok(claims)
+    }
+
+    /// Verify before APP capability checks, without spending an unusable ticket.
+    /// The caller must consume the verified claims before forwarding a session.
+    pub(crate) async fn verify(&self, token: &str) -> Result<TicketClaims, TicketError> {
         let header = jsonwebtoken::decode_header(token).map_err(|_| TicketError::Invalid)?;
         let kid = header.kid.ok_or(TicketError::Invalid)?;
 
@@ -158,7 +166,10 @@ impl TicketVerifier {
             Err(other) => return Err(other),
         };
 
-        self.consume(&claims).await?;
+        claims
+            .launch_target
+            .validate(claims.rid, claims.policy)
+            .map_err(|_| TicketError::Invalid)?;
         Ok(claims)
     }
 
@@ -182,16 +193,69 @@ impl TicketVerifier {
     }
 
     /// Record a ticket as spent, rejecting it if it already was.
-    async fn consume(&self, claims: &TicketClaims) -> Result<(), TicketError> {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    pub(crate) async fn consume(&self, claims: &TicketClaims) -> Result<(), TicketError> {
+        let now = time::OffsetDateTime::now_utc();
+        if !claims.is_valid_at(now) {
+            return Err(TicketError::Invalid);
+        }
+        let now = now.unix_timestamp();
         let mut seen = self.seen.lock().await;
         // Expired entries can never cause a false rejection, so dropping them
         // here keeps the table proportional to the ticket rate rather than to
         // uptime, without needing a sweeper task.
         seen.retain(|_, exp| *exp > now);
-        if seen.insert(claims.jti.clone(), claims.exp).is_some() {
+        let acceptance_end = claims
+            .exp
+            .saturating_add(nebula_common::ticket::CLOCK_SKEW.whole_seconds());
+        if seen.insert(claims.jti.clone(), acceptance_end).is_some() {
             return Err(TicketError::Replayed);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn claims(exp: i64) -> TicketClaims {
+        serde_json::from_value(serde_json::json!({
+            "iss":"issuer","aud":"nebula-gateway","jti":"single-use",
+            "iat":exp-60,"exp":exp,
+            "sid":nebula_common::SessionId::new(),"tid":nebula_common::TenantId::new(),
+            "uid":nebula_common::UserId::new(),"mid":nebula_common::MachineId::new(),
+            "rid":nebula_common::ResourceId::new(),"role":"VIEWER",
+            "policy":nebula_common::SessionPolicy::view_only(),
+            "agent_key":"agent","relay_addr":"relay","relay_pin":"pin"
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn consumption_is_atomic_and_replay_cache_covers_clock_skew() {
+        let verifier = TicketVerifier::new(
+            ManagerClient::new("http://unused.test", None).unwrap(),
+            "issuer",
+        );
+        let claims = claims(time::OffsetDateTime::now_utc().unix_timestamp() - 1);
+        let (first, second) = tokio::join!(verifier.consume(&claims), verifier.consume(&claims));
+        assert!(matches!(
+            (first, second),
+            (Ok(()), Err(TicketError::Replayed)) | (Err(TicketError::Replayed), Ok(()))
+        ));
+    }
+
+    #[tokio::test]
+    async fn claims_expired_while_waiting_for_admission_are_not_consumed() {
+        let verifier = TicketVerifier::new(
+            ManagerClient::new("http://unused.test", None).unwrap(),
+            "issuer",
+        );
+        let claims = claims(time::OffsetDateTime::now_utc().unix_timestamp() - 31);
+        assert!(matches!(
+            verifier.consume(&claims).await,
+            Err(TicketError::Invalid)
+        ));
+        assert!(verifier.seen.lock().await.is_empty());
     }
 }

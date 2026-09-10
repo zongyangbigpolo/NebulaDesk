@@ -2,16 +2,44 @@
 use nebula_desktop_protocol::{Event, Launch, SessionState};
 
 pub fn run() -> anyhow::Result<()> {
+    run_with_keyboard(crate::shortcuts::Configuration::default())
+}
+
+pub fn run_with_keyboard(keyboard: crate::shortcuts::Configuration) -> anyhow::Result<()> {
     let launch = (|| {
         let launch: Launch = nebula_desktop_protocol::read_message(&mut std::io::stdin().lock())?
             .ok_or_else(|| anyhow::anyhow!("desktop launch missing"))?;
         launch.validate()?;
-        let ticket = launch.ticket.try_into()?;
-        anyhow::Ok((ticket, launch.resource_name))
+        let mut ticket: crate::SessionTicket = launch.ticket.try_into()?;
+        ticket.application_windows = launch.application_windows;
+        anyhow::Ok((ticket, launch.resource_name, launch.application_windows))
     })();
     match launch {
-        Ok((ticket, name)) => crate::session::run_managed(ticket, &name)
-            .map_err(|_| anyhow::anyhow!("native session failed")),
+        Ok((ticket, name, application_windows)) => {
+            let result = if application_windows {
+                crate::application::run_with_keyboard(ticket, true, keyboard)
+            } else {
+                crate::session::run_managed(ticket, &name)
+            };
+            if application_windows
+                && result.as_ref().is_err_and(|error| {
+                    error
+                        .downcast_ref::<crate::application::ReportedFailure>()
+                        .is_none()
+                })
+            {
+                // Covers errors before the native loop starts, without reflecting secrets.
+                nebula_desktop_protocol::write_message(
+                    &mut std::io::stdout().lock(),
+                    &Event::State {
+                        state: SessionState::Failed,
+                        path: None,
+                        error: Some("Native session could not start or was disconnected".into()),
+                    },
+                )?;
+            }
+            result.map_err(|_| anyhow::anyhow!("native session failed"))
+        }
         Err(_) => {
             // No parser error is reflected: it may quote bearer data.
             nebula_desktop_protocol::write_message(

@@ -291,6 +291,7 @@ impl Gateway {
                     outbound,
                     connection: stable,
                     credential: credential.clone(),
+                    application_windows: hello.application_windows,
                 },
             )
             .await
@@ -386,7 +387,7 @@ impl Gateway {
         )
         .await??;
 
-        let claims = match self.tickets.redeem(&hello.ticket).await {
+        let claims = match self.tickets.verify(&hello.ticket).await {
             Ok(claims) => claims,
             Err(error) => {
                 // Deliberately uniform: which of expired, forged and already
@@ -395,6 +396,14 @@ impl Gateway {
                 return reject(&mut send, &conn, "the ticket was not accepted").await;
             }
         };
+        // Preserve desktop redemption behavior. APP tickets are spent only once
+        // both peers can actually receive the application-specific request.
+        if !claims.launch_target.is_application() {
+            if let Err(error) = self.tickets.consume(&claims).await {
+                tracing::info!(%error, "refused a client ticket");
+                return reject(&mut send, &conn, "the ticket was not accepted").await;
+            }
+        }
 
         let Some(tunnel) = self.tunnels.get(claims.mid).await else {
             tracing::info!(machine = %claims.mid, session = %claims.sid, "no agent tunnel for the ticketed machine");
@@ -416,16 +425,17 @@ impl Gateway {
 
         // The agent is told first so it is already dialling the relay while
         // the client is still reading its acknowledgement.
-        let request = GatewayMessage::StartSession(SessionRequest {
-            session: claims.sid,
-            resource_id: claims.rid.as_uuid(),
-            policy: claims.policy,
-            role: claims.role,
-            relay_addr: claims.relay_addr.clone(),
-            relay_pin: claims.relay_pin.clone(),
-            pair_token: agent_token,
-            client_key: hello.noise_public_key.clone(),
-        });
+        let request =
+            match session_request(&claims, &hello, tunnel.application_windows, agent_token) {
+                Ok(request) => GatewayMessage::StartSession(Box::new(request)),
+                Err(reason) => return reject(&mut send, &conn, reason).await,
+            };
+        if claims.launch_target.is_application() {
+            if let Err(error) = self.tickets.consume(&claims).await {
+                tracing::info!(%error, "refused a client ticket");
+                return reject(&mut send, &conn, "the ticket was not accepted").await;
+            }
+        }
         if tunnel.outbound.send(request).await.is_err() {
             self.report(
                 claims.sid.as_uuid(),
@@ -507,6 +517,37 @@ impl Gateway {
 /// How long to wait for a refusal to reach the peer before hanging up.
 const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Forward verified authority verbatim. Neither the gateway nor client may
+/// reinterpret an APP target as desktop, widen policy or substitute its argv.
+fn session_request(
+    claims: &nebula_common::TicketClaims,
+    hello: &ClientHello,
+    agent_application_windows: bool,
+    pair_token: String,
+) -> Result<SessionRequest, &'static str> {
+    claims
+        .launch_target
+        .validate(claims.rid, claims.policy)
+        .map_err(|_| "the ticket was not accepted")?;
+    if claims.launch_target.is_application()
+        && (!hello.application_windows || !agent_application_windows)
+    {
+        return Err("application windows are not supported");
+    }
+    Ok(SessionRequest {
+        session: claims.sid,
+        resource_id: claims.rid.as_uuid(),
+        launch_target: claims.launch_target.clone(),
+        signed_ticket: Some(hello.ticket.clone()),
+        policy: claims.policy,
+        role: claims.role,
+        relay_addr: claims.relay_addr.clone(),
+        relay_pin: claims.relay_pin.clone(),
+        pair_token,
+        client_key: hello.noise_public_key.clone(),
+    })
+}
+
 /// Refuse a client without saying why.
 async fn reject(
     send: &mut quinn::SendStream,
@@ -542,5 +583,57 @@ impl Gateway {
     #[must_use]
     pub fn transport(&self) -> &TransportConfig {
         &self.transport
+    }
+}
+
+#[cfg(test)]
+mod application_tests {
+    use super::*;
+    use nebula_common::{ApplicationLaunch, LaunchTarget, ResourceId, SessionPolicy, TicketClaims};
+
+    #[test]
+    fn application_forwarding_is_opt_in_and_preserves_authority() {
+        let rid = ResourceId::new();
+        let launch = ApplicationLaunch {
+            launch_path: "/trusted/editor".into(),
+            launch_args: vec!["literal; argument".into()],
+            working_dir: None,
+        };
+        let mut claims: TicketClaims = serde_json::from_value(serde_json::json!({
+            "iss":"issuer","aud":"nebula-gateway","jti":"ticket","iat":0,"exp":60,
+            "sid":nebula_common::SessionId::new(),"tid":nebula_common::TenantId::new(),
+            "uid":nebula_common::UserId::new(),"mid":nebula_common::MachineId::new(),"rid":rid,
+            "role":"CONTROLLER","policy":SessionPolicy::view_only(),
+            "agent_key":"agent","relay_addr":"relay","relay_pin":"pin"
+        }))
+        .unwrap();
+        claims.launch_target = LaunchTarget::Application {
+            resource_id: rid,
+            version: launch.version(),
+            launch,
+        };
+        let mut hello = ClientHello {
+            ticket: "original-manager-JWT".into(),
+            noise_public_key: "client".into(),
+            client_version: "test".into(),
+            application_windows: false,
+        };
+        assert!(session_request(&claims, &hello, true, "pair".into()).is_err());
+        hello.application_windows = true;
+        assert!(session_request(&claims, &hello, false, "pair".into()).is_err());
+        let request = session_request(&claims, &hello, true, "pair".into()).unwrap();
+        assert_eq!(
+            request.signed_ticket.as_deref(),
+            Some(hello.ticket.as_str())
+        );
+        assert_eq!(request.launch_target, claims.launch_target);
+        assert_eq!(request.policy, claims.policy);
+        assert_eq!(request.resource_id, claims.rid.as_uuid());
+        assert_eq!(request.relay_addr, claims.relay_addr);
+        claims.policy.audio = true;
+        assert!(session_request(&claims, &hello, true, "pair".into()).is_err());
+        claims.launch_target = LaunchTarget::Desktop;
+        hello.application_windows = false;
+        assert!(session_request(&claims, &hello, false, "pair".into()).is_ok());
     }
 }

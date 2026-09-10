@@ -3,12 +3,14 @@
 //! Deliberately dependency-light: identifiers, a common error type and the
 //! observability bootstrap. Anything protocol-specific belongs in `ndp-proto`.
 
+pub mod application;
 pub mod ids;
 pub mod obs;
 pub mod ticket;
 
+pub use application::{ApplicationCapability, ApplicationLaunch, LaunchTarget};
 pub use ids::{MachineId, RelayId, ResourceId, SessionId, TenantId, UserId};
-pub use ticket::{Jwk, Jwks, SessionPolicy, SessionRole, TicketClaims};
+pub use ticket::{Jwk, Jwks, SessionPolicy, SessionRole, TicketAuthority, TicketClaims};
 
 /// Errors that are meaningful across component boundaries.
 #[derive(Debug, thiserror::Error)]

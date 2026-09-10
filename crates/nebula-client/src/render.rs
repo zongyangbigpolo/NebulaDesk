@@ -268,6 +268,11 @@ impl Renderer {
         write(&self.queue, &planes.v, cw, ch, &picture.v);
     }
 
+    /// Discard stale GPU planes after a remote geometry or lifecycle change.
+    pub fn clear_picture(&mut self) {
+        self.planes = None;
+    }
+
     /// Draw the current picture, letterboxed to keep its shape.
     pub fn draw(&mut self) -> anyhow::Result<()> {
         self.draw_frame(None).map(|_| ())

@@ -1700,6 +1700,7 @@ async fn app_consumers_never_receive_launch_metadata_or_a_desktop_session() {
         ] {
             assert!(detail.get(field).unwrap().is_null(), "{field} leaked");
         }
+
         for field in [
             "launch_path",
             "launch_args",
@@ -1735,6 +1736,144 @@ async fn app_consumers_never_receive_launch_metadata_or_a_desktop_session() {
         .await
         .unwrap();
     assert_eq!(sessions, 0);
+}
+
+#[tokio::test]
+async fn app_admission_binds_a_capability_gated_publisher_snapshot() {
+    let app = App::start().await;
+    let (gateway, _) = app.infrastructure().await;
+    let (_, owner) = app.user("native-app-owner@acme.test", "USER").await;
+    let (machine, credential) = app.machine_as("native-app-machine", &owner).await;
+    let publications = format!("/v1/machines/{machine}/resources");
+    let resource = app
+        .post(
+            &publications,
+            Some(&owner),
+            json!({
+                "kind":"APP", "name":"Editor", "launch_path":"/Applications/Editor",
+                "launch_args":["--document","a; literal"], "working_dir":"/workspace"
+            }),
+        )
+        .await
+        .expect_status(StatusCode::CREATED)
+        .json();
+    let id = resource["id"].as_str().unwrap();
+    let path = format!("/v1/resources/{id}");
+    app.post(
+        "/v1/machines/heartbeat",
+        None,
+        json!({
+            "status":"ONLINE", "gateway_id":gateway
+        }),
+    )
+    .with_machine(&credential)
+    .await
+    .expect_status(StatusCode::NO_CONTENT);
+    app.post(
+        "/v1/sessions",
+        Some(&owner),
+        json!({
+            "resource_id":id, "application_windows":true
+        }),
+    )
+    .await
+    .expect_status(StatusCode::CONFLICT);
+    app.post(
+        "/v1/machines/heartbeat",
+        None,
+        json!({
+            "status":"ONLINE", "gateway_id":gateway,
+            "capabilities":{"application":{
+                "supported":true,"protocol_version":1,"max_surfaces":32,"reason":null
+            }}
+        }),
+    )
+    .with_machine(&credential)
+    .await
+    .expect_status(StatusCode::NO_CONTENT);
+    let old = app
+        .get(&path, Some(&owner))
+        .await
+        .expect_status(StatusCode::OK)
+        .json();
+    assert_eq!(old["launch_supported"], false);
+    let capable = app
+        .get(&format!("{path}?application_windows=true"), Some(&owner))
+        .await
+        .expect_status(StatusCode::OK)
+        .json();
+    assert_eq!(capable["launch_supported"], true);
+    let listed = app
+        .get("/v1/resources?application_windows=true", Some(&owner))
+        .await
+        .expect_status(StatusCode::OK)
+        .json();
+    let listed = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == resource["id"])
+        .unwrap();
+    assert_eq!(listed["policy"], capable["policy"]);
+    for key in ["clipboard", "audio", "file_transfer"] {
+        assert_eq!(capable["policy"][key], false);
+        assert_eq!(listed["policy"][key], false);
+        assert_eq!(listed[format!("allow_{key}")], false);
+        assert_eq!(capable[format!("allow_{key}")], false);
+    }
+    app.post("/v1/sessions", Some(&owner), json!({"resource_id":id}))
+        .await
+        .expect_status(StatusCode::CONFLICT);
+    let ticket = app
+        .post(
+            "/v1/sessions",
+            Some(&owner),
+            json!({
+                "resource_id":id, "application_windows":true,
+                "launch_path":"/untrusted/override"
+            }),
+        )
+        .await
+        .expect_status(StatusCode::CREATED)
+        .json();
+    let claims = decode_claims(ticket["ticket"].as_str().unwrap());
+    assert_eq!(claims["launch_target"]["kind"], "application");
+    assert_eq!(claims["launch_target"]["resource_id"], resource["id"]);
+    assert_eq!(
+        claims["launch_target"]["launch"]["launch_path"],
+        "/Applications/Editor"
+    );
+    assert_eq!(
+        claims["launch_target"]["launch"]["launch_args"],
+        json!(["--document", "a; literal"])
+    );
+    assert_eq!(claims["policy"], capable["policy"]);
+    let version = claims["launch_target"]["version"].clone();
+    app.patch(
+        &path,
+        Some(&owner),
+        json!({"launch_args":["--new-document"]}),
+    )
+    .await
+    .expect_status(StatusCode::NO_CONTENT);
+    let next = app
+        .post(
+            "/v1/sessions",
+            Some(&owner),
+            json!({
+                "resource_id":id, "application_windows":true
+            }),
+        )
+        .await
+        .expect_status(StatusCode::CREATED)
+        .json();
+    let next_claims = decode_claims(next["ticket"].as_str().unwrap());
+    assert_ne!(next_claims["launch_target"]["version"], version);
+    assert_eq!(
+        decode_claims(ticket["ticket"].as_str().unwrap()),
+        claims,
+        "the admitted logical session keeps its original snapshot"
+    );
 }
 
 #[tokio::test]

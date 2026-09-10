@@ -20,6 +20,8 @@ use core_graphics::event::{
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 use ndp_proto::{InputEvent, InputKind, KeyCode, Modifiers, MouseButton};
+use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
+use objc2_foundation::{NSPoint, NSProcessInfo};
 use std::time::{Duration, Instant};
 
 use crate::media::InputInjector;
@@ -103,9 +105,96 @@ impl InputInjector for MacInput {
     }
 }
 
+type ScopedBounds = (f64, f64, f64, f64);
+
+/// Synchronous, process-directed input, revalidated on the posting thread.
+pub(crate) struct ApplicationInput {
+    events: Option<
+        std::sync::mpsc::SyncSender<(InputEvent, std::sync::mpsc::Sender<anyhow::Result<()>>)>,
+    >,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ApplicationInput {
+    pub(crate) fn new(
+        pid: i32,
+        window: u32,
+        alive: impl Fn() -> bool + Send + 'static,
+        validate: impl Fn() -> anyhow::Result<ScopedBounds> + Send + 'static,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(trusted(), ACCESSIBILITY);
+        anyhow::ensure!(
+            pid > 0 && window != 0,
+            "invalid window-directed input target"
+        );
+        let (events, inbox) = std::sync::mpsc::sync_channel::<(
+            InputEvent,
+            std::sync::mpsc::Sender<anyhow::Result<()>>,
+        )>(8);
+        let (ready, started) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("nebula-app-input".into())
+            .spawn(move || {
+                let mut desktop = match Desktop::new() {
+                    Ok(mut desktop) => {
+                        desktop.target_pid = Some(pid);
+                        desktop.target_window = Some(window);
+                        desktop.target_alive = Some(Box::new(alive));
+                        let _ = ready.send(Ok(()));
+                        desktop
+                    }
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                        return;
+                    }
+                };
+                while let Ok((event, reply)) = inbox.recv() {
+                    let result = validate().and_then(|bounds| {
+                        desktop.bounds = bounds;
+                        desktop.apply(&event)
+                    });
+                    if result.is_err() {
+                        desktop.release_all();
+                    }
+                    let _ = reply.send(result);
+                }
+            })?;
+        started
+            .recv()
+            .map_err(|_| anyhow::anyhow!("scoped input startup failed"))??;
+        Ok(Self {
+            events: Some(events),
+            worker: Some(worker),
+        })
+    }
+
+    pub(crate) fn inject(&self, event: &InputEvent) -> anyhow::Result<()> {
+        let (reply, result) = std::sync::mpsc::channel();
+        self.events
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("scoped input stopped"))?
+            .send((*event, reply))
+            .map_err(|_| anyhow::anyhow!("scoped input stopped"))?;
+        result
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| anyhow::anyhow!("scoped input validation timed out"))?
+    }
+}
+
+impl Drop for ApplicationInput {
+    fn drop(&mut self) {
+        drop(self.events.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
 /// The CoreGraphics state, owned by the injection thread and never leaving it.
 struct Desktop {
     source: CGEventSource,
+    target_pid: Option<i32>,
+    target_window: Option<u32>,
+    target_alive: Option<Box<dyn Fn() -> bool + Send>>,
     /// The desktop area input is mapped onto, in global display space.
     bounds: (f64, f64, f64, f64),
     /// Where the pointer was last put, so a button event with no preceding
@@ -233,6 +322,9 @@ impl Desktop {
         let frame = CGDisplay::main().bounds();
         Ok(Self {
             source,
+            target_pid: None,
+            target_window: None,
+            target_alive: None,
             bounds: (
                 frame.origin.x,
                 frame.origin.y,
@@ -281,7 +373,7 @@ impl Desktop {
                     self.clicks
                         .update(button, false, self.last, self.clock.elapsed()),
                 );
-                event.post(CGEventTapLocation::HID);
+                self.post(&event);
             }
         }
         self.clicks.last = None;
@@ -294,9 +386,39 @@ impl Desktop {
         for code in self.keys.release_all().into_iter().rev() {
             if let Ok(event) = CGEvent::new_keyboard_event(self.source.clone(), code, false) {
                 apply_modifiers(&event, Modifiers::NONE);
-                event.post(CGEventTapLocation::HID);
+                self.post(&event);
             }
         }
+    }
+
+    fn post(&self, event: &CGEvent) -> bool {
+        if self.target_alive.as_ref().is_some_and(|alive| !alive()) {
+            return false;
+        }
+        if let Some(pid) = self.target_pid {
+            if matches!(
+                event.get_type(),
+                CGEventType::MouseMoved
+                    | CGEventType::LeftMouseDown
+                    | CGEventType::LeftMouseUp
+                    | CGEventType::RightMouseDown
+                    | CGEventType::RightMouseUp
+                    | CGEventType::OtherMouseDown
+                    | CGEventType::OtherMouseUp
+                    | CGEventType::LeftMouseDragged
+                    | CGEventType::RightMouseDragged
+                    | CGEventType::OtherMouseDragged
+            ) {
+                let Some(window) = self.target_window else {
+                    return false;
+                };
+                return post_window_mouse(event, pid, window, self.bounds);
+            }
+            event.post_to_pid(pid);
+        } else {
+            event.post(CGEventTapLocation::HID);
+        }
+        true
     }
 }
 
@@ -353,7 +475,7 @@ impl Desktop {
                     bounds = ?self.bounds,
                     "posting native pointer movement (display points)"
                 );
-                cg.post(CGEventTapLocation::HID);
+                anyhow::ensure!(self.post(&cg), "scoped pointer conversion unavailable");
             }
 
             InputKind::MouseDown | InputKind::MouseUp => {
@@ -384,7 +506,7 @@ impl Desktop {
                     button = ?event.button,
                     "posting native pointer button (display points)"
                 );
-                cg.post(CGEventTapLocation::HID);
+                anyhow::ensure!(self.post(&cg), "scoped pointer conversion unavailable");
 
                 if down {
                     if !self.held.contains(&event.button) {
@@ -401,8 +523,18 @@ impl Desktop {
                 // line-based scrolls exactly as it would for a real wheel.
                 let horizontal = wheel_lines(&mut self.wheel[0], event.scroll_x);
                 let vertical = wheel_lines(&mut self.wheel[1], event.scroll_y);
-                if vertical != 0 || horizontal != 0 {
-                    post_scroll(vertical, horizontal, event.modifiers);
+                if (vertical != 0 || horizontal != 0)
+                    && self.target_alive.as_ref().is_none_or(|alive| alive())
+                {
+                    let location = self.target_pid.map(|_| self.point(event.x, event.y));
+                    post_scroll(
+                        vertical,
+                        horizontal,
+                        event.modifiers,
+                        self.target_pid,
+                        location,
+                        self.target_window.map(|window| (window, self.bounds)),
+                    );
                 }
             }
 
@@ -430,7 +562,7 @@ impl Desktop {
                     flags = cg_flags(modifiers).bits(),
                     "posting native physical key"
                 );
-                cg.post(CGEventTapLocation::HID);
+                self.post(&cg);
             }
 
             InputKind::PointerLeave => self.release_buttons(event.modifiers),
@@ -483,7 +615,14 @@ extern "C" {
 /// declared here. Line units, not pixels: the wire carries lines, and macOS
 /// then applies its own acceleration and natural-direction preference exactly
 /// as it would for a real wheel, which is what makes scrolling feel local.
-fn post_scroll(vertical: i32, horizontal: i32, modifiers: Modifiers) {
+fn post_scroll(
+    vertical: i32,
+    horizontal: i32,
+    modifiers: Modifiers,
+    pid: Option<i32>,
+    location: Option<CGPoint>,
+    window: Option<(u32, ScopedBounds)>,
+) {
     // Units: 0 is pixels, 1 is lines.
     const LINE: u32 = 1;
     // The HID tap, the same place physical devices deliver to.
@@ -498,9 +637,151 @@ fn post_scroll(vertical: i32, horizontal: i32, modifiers: Modifiers) {
             return;
         }
         CGEventSetFlags(event, cg_flags(modifiers).bits());
-        CGEventPost(TAP_HID, event);
+        if let Some(location) = location {
+            CGEventSetLocation(event, location);
+        }
+        if let Some(pid) = pid {
+            if let Some(((window, bounds), point)) = window.zip(location) {
+                if let Some(local) = window_local_point(point, bounds) {
+                    let spec = WindowPointer {
+                        window,
+                        local,
+                        kind: CGEventType::MouseMoved,
+                        flags: cg_flags(modifiers).bits(),
+                        click_count: 0,
+                        button: 0,
+                    };
+                    with_window_event(&spec, |bound| {
+                        CGEventSetType(bound, CGEventType::ScrollWheel as u32);
+                        for field in [
+                            EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1,
+                            EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2,
+                            EventField::SCROLL_WHEEL_EVENT_FIXED_POINT_DELTA_AXIS_1,
+                            EventField::SCROLL_WHEEL_EVENT_FIXED_POINT_DELTA_AXIS_2,
+                            EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1,
+                            EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2,
+                            EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS,
+                        ] {
+                            CGEventSetIntegerValueField(
+                                bound,
+                                field,
+                                CGEventGetIntegerValueField(event, field),
+                            );
+                        }
+                        CGEventPostToPid(pid, bound);
+                    });
+                }
+            }
+        } else {
+            CGEventPost(TAP_HID, event);
+        }
         CFRelease(event);
     }
+}
+
+struct WindowPointer {
+    window: u32,
+    local: CGPoint,
+    kind: CGEventType,
+    flags: u64,
+    click_count: i64,
+    button: i64,
+}
+
+fn with_window_event(spec: &WindowPointer, post: impl FnOnce(*mut std::ffi::c_void)) -> bool {
+    if spec.window == 0 || !spec.local.x.is_finite() || !spec.local.y.is_finite() {
+        return false;
+    }
+    objc2::rc::autoreleasepool(|_| {
+        let pressure = if matches!(
+            spec.kind,
+            CGEventType::LeftMouseDown
+                | CGEventType::RightMouseDown
+                | CGEventType::OtherMouseDown
+                | CGEventType::LeftMouseDragged
+                | CGEventType::RightMouseDragged
+                | CGEventType::OtherMouseDragged
+        ) {
+            1.0
+        } else {
+            0.0
+        };
+        let make = |point| {
+            NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+            NSEventType(spec.kind as usize), point, NSEventModifierFlags(spec.flags as usize),
+            NSProcessInfo::processInfo().systemUptime(), spec.window as isize, None,
+            0, spec.click_count as isize, pressure,
+        )
+        };
+        // A foreign-window CG bridge flips in the sender's screen space. Measure
+        // that public conversion instead of assuming a display pixel/point scale.
+        // Never mutate CGEvent.location: that invalidates its window-local point.
+        let Some(reference) = make(NSPoint { x: 0.0, y: 0.0 }) else {
+            return false;
+        };
+        let Some(reference_event) = reference.CGEvent() else {
+            return false;
+        };
+        let origin =
+            unsafe { CGEventGetLocation(std::ptr::from_ref(&*reference_event).cast_mut().cast()) };
+        if !origin.x.is_finite() || !origin.y.is_finite() {
+            return false;
+        }
+        let Some(native) = make(NSPoint {
+            x: spec.local.x - origin.x,
+            y: origin.y - spec.local.y,
+        }) else {
+            return false;
+        };
+        let Some(event) = native.CGEvent() else {
+            return false;
+        };
+        let raw = std::ptr::from_ref(&*event).cast_mut().cast();
+        let serialized = unsafe { CGEventGetLocation(raw) };
+        if !serialized.x.is_finite()
+            || !serialized.y.is_finite()
+            || (serialized.x - spec.local.x).abs() > 0.01
+            || (serialized.y - spec.local.y).abs() > 0.01
+        {
+            return false;
+        }
+        // Button number is a public field; AppKit's factory otherwise defaults
+        // extra-button events to the middle button.
+        unsafe {
+            CGEventSetIntegerValueField(raw, EventField::MOUSE_EVENT_BUTTON_NUMBER, spec.button);
+        }
+        post(raw);
+        true
+    })
+}
+
+fn post_window_mouse(event: &CGEvent, pid: i32, window: u32, bounds: ScopedBounds) -> bool {
+    let Some(local) = window_local_point(event.location(), bounds) else {
+        return false;
+    };
+    with_window_event(
+        &WindowPointer {
+            window,
+            local,
+            kind: event.get_type(),
+            flags: event.get_flags().bits(),
+            click_count: event.get_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE),
+            button: event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER),
+        },
+        |bound| unsafe { CGEventPostToPid(pid, bound) },
+    )
+}
+
+fn window_local_point(global: CGPoint, bounds: ScopedBounds) -> Option<CGPoint> {
+    let point = CGPoint::new(global.x - bounds.0, global.y - bounds.1);
+    ([global.x, global.y, bounds.0, bounds.1, bounds.2, bounds.3]
+        .iter()
+        .all(|value| value.is_finite())
+        && bounds.2 > 0.0
+        && bounds.3 > 0.0
+        && (0.0..=bounds.2).contains(&point.x)
+        && (0.0..=bounds.3).contains(&point.y))
+    .then_some(point)
 }
 
 /// What to do about a machine that has not been granted Accessibility.
@@ -528,12 +809,18 @@ extern "C" {
         ...
     ) -> *mut std::ffi::c_void;
     fn CGEventPost(tap: u32, event: *mut std::ffi::c_void);
+    fn CGEventPostToPid(pid: i32, event: *mut std::ffi::c_void);
     fn CGEventSetFlags(event: *mut std::ffi::c_void, flags: u64);
+    fn CGEventSetLocation(event: *mut std::ffi::c_void, point: CGPoint);
+    fn CGEventGetLocation(event: *mut std::ffi::c_void) -> CGPoint;
+    fn CGEventSetIntegerValueField(event: *mut std::ffi::c_void, field: u32, value: i64);
+    fn CGEventGetIntegerValueField(event: *mut std::ffi::c_void, field: u32) -> i64;
+    fn CGEventSetType(event: *mut std::ffi::c_void, kind: u32);
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
-    fn CFRelease(object: *mut std::ffi::c_void);
+    fn CFRelease(object: *const std::ffi::c_void);
 }
 
 /// Set the modifier flags a synthesised event is seen with.
@@ -744,6 +1031,35 @@ fn virtual_key(key: KeyCode) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_pointer_coordinates_use_owned_window_top_left_not_display_origin() {
+        let point =
+            window_local_point(CGPoint::new(294.0, 334.0), (180.0, 58.0, 600.0, 412.0)).unwrap();
+        assert_eq!((point.x, point.y), (114.0, 276.0));
+        assert!(
+            window_local_point(CGPoint::new(179.0, 334.0), (180.0, 58.0, 600.0, 412.0)).is_none()
+        );
+        assert!(
+            window_local_point(CGPoint::new(f64::NAN, 334.0), (180.0, 58.0, 600.0, 412.0))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn scoped_pointer_binding_rejects_missing_native_target() {
+        assert!(!with_window_event(
+            &WindowPointer {
+                window: 0,
+                local: CGPoint::new(1.0, 1.0),
+                kind: CGEventType::MouseMoved,
+                flags: 0,
+                click_count: 0,
+                button: 0,
+            },
+            |_| panic!("missing target must never post")
+        ));
+    }
 
     #[test]
     fn click_counts_match_down_and_up_and_expire() {

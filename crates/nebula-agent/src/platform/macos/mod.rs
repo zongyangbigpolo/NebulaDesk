@@ -4,6 +4,7 @@
 //! input. All three are the paths the system itself uses, which is what makes
 //! a session feel like sitting at the machine rather than watching it.
 
+pub mod application;
 pub mod audio;
 pub mod capture;
 pub mod input;
@@ -16,6 +17,17 @@ use crate::media::{AudioSource, InputInjector, Platform, VideoSource};
 pub struct MacOs;
 
 impl Platform for MacOs {
+    fn application_capability(&self) -> nebula_common::ApplicationCapability {
+        application::capability()
+    }
+
+    fn application(
+        &self,
+        launch: &nebula_common::ApplicationLaunch,
+    ) -> anyhow::Result<Box<dyn crate::application::ApplicationBackend>> {
+        Ok(Box::new(application::MacApplication::launch(launch)?))
+    }
+
     fn video(&self) -> anyhow::Result<Box<dyn VideoSource>> {
         Ok(Box::new(capture::MacVideo::new()))
     }

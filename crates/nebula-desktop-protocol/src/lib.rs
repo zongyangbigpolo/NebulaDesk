@@ -9,6 +9,24 @@ pub const MAX_FILES: usize = 64;
 
 /// Fixed, non-sensitive guidance; never substitute a peer's raw error text.
 pub const REMOTE_SESSION_ENDED: &str = "The remote session ended unexpectedly. Check screen recording permission and sharing on the remote computer.";
+/// Fixed startup guidance. Never append executable paths or native error text.
+pub const APPLICATION_START_FAILED: &str = "The remote application could not start. Ask its publisher to check the application configuration and try again.";
+/// Fixed capability guidance; never imply a desktop-capture fallback exists.
+pub const APPLICATION_BACKEND_UNAVAILABLE: &str = "Application-only windows are unavailable on the remote computer. Update the remote agent or ask its publisher to check application-window support.";
+/// Fixed permission guidance; does not grant or modify any OS permissions.
+pub const APPLICATION_PERMISSION_REQUIRED: &str = "The remote application needs screen recording or accessibility permission. Ask its publisher to check permissions on the remote computer, then try again.";
+
+/// Exact allowlist for host presentation of native-session error guidance.
+/// Unknown peer/native text must still be replaced with generic guidance.
+pub fn is_safe_session_error(message: &str) -> bool {
+    matches!(
+        message,
+        REMOTE_SESSION_ENDED
+            | APPLICATION_START_FAILED
+            | APPLICATION_BACKEND_UNAVAILABLE
+            | APPLICATION_PERMISSION_REQUIRED
+    )
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,7 +56,16 @@ pub struct Launch {
     pub version: u32,
     pub resource_id: String,
     pub resource_name: String,
+    /// Expected native per-surface mode. The signed target and negotiated NDP
+    /// application Hello remain authoritative; no desktop fallback is allowed.
+    /// Omitted for desktop launches so older strict IPC readers remain compatible.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub application_windows: bool,
     pub ticket: LaunchTicket,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Launch {
@@ -52,6 +79,15 @@ impl Launch {
             || self.ticket.session_id.is_empty()
         {
             return Err(invalid("incomplete desktop launch"));
+        }
+        if self.application_windows
+            && (self.ticket.policy.audio
+                || self.ticket.policy.clipboard
+                || self.ticket.policy.file_transfer)
+        {
+            return Err(invalid(
+                "application launch contains unsupported global permissions",
+            ));
         }
         Ok(())
     }
@@ -179,6 +215,42 @@ pub fn write_message<T: Serialize>(writer: &mut impl Write, message: &T) -> io::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_error_allowlist_accepts_only_fixed_complete_guidance() {
+        for guidance in [
+            REMOTE_SESSION_ENDED,
+            APPLICATION_START_FAILED,
+            APPLICATION_BACKEND_UNAVAILABLE,
+            APPLICATION_PERMISSION_REQUIRED,
+        ] {
+            assert!(is_safe_session_error(guidance));
+            assert!(!is_safe_session_error(&format!("{guidance} /private/path")));
+        }
+        assert!(!is_safe_session_error("native-error SECRET-TICKET"));
+    }
+
+    #[test]
+    fn legacy_desktop_launch_omits_application_mode_and_app_policy_is_scoped() {
+        let value = serde_json::json!({
+            "version":1,"resource_id":"resource","resource_name":"Editor",
+            "ticket":{"session_id":"session","ticket":"test-ticket","gateway_addr":"gateway",
+                "gateway_pin":"pin","agent_key":"key","policy":{
+                    "input":true,"audio":false,"clipboard":false,"file_transfer":false
+                }}
+        });
+        let mut launch: Launch = serde_json::from_value(value.clone()).unwrap();
+        assert!(!launch.application_windows);
+        assert_eq!(serde_json::to_value(&launch).unwrap(), value);
+        assert!(launch.validate().is_ok());
+        launch.application_windows = true;
+        assert!(launch.validate().is_ok());
+        launch.ticket.policy.audio = true;
+        assert!(launch.validate().is_err());
+        launch.ticket.policy.audio = false;
+        launch.ticket.policy.clipboard = true;
+        assert!(launch.validate().is_err());
+    }
 
     #[test]
     fn bounded_reader_rejects_unterminated_oversize_and_secret_errors() {

@@ -65,6 +65,9 @@ pub struct SessionTicket {
     /// that would be silently refused.
     #[serde(default = "nebula_common::SessionPolicy::view_only")]
     pub policy: nebula_common::SessionPolicy,
+    /// Non-sensitive expected-mode hint. Missing means legacy desktop only.
+    #[serde(default)]
+    pub application_windows: bool,
 }
 
 impl std::fmt::Debug for SessionTicket {
@@ -73,6 +76,7 @@ impl std::fmt::Debug for SessionTicket {
             .debug_struct("SessionTicket")
             .field("session_id", &self.session_id)
             .field("policy", &self.policy)
+            .field("application_windows", &self.application_windows)
             .finish_non_exhaustive()
     }
 }
@@ -96,6 +100,7 @@ impl TryFrom<nebula_desktop_protocol::LaunchTicket> for SessionTicket {
                 clipboard: ticket.policy.clipboard,
                 file_transfer: ticket.policy.file_transfer,
             },
+            application_windows: false,
         })
     }
 }
@@ -116,6 +121,7 @@ struct Token {
 struct OpenSession<'a> {
     resource_id: &'a str,
     client_os: &'a str,
+    application_windows: bool,
 }
 
 impl ManagerClient {
@@ -159,6 +165,7 @@ impl ManagerClient {
         let response = self
             .http
             .get(format!("{}/v1/resources", self.base))
+            .query(&[("application_windows", true)])
             .bearer_auth(&self.token)
             .send()
             .await?;
@@ -174,6 +181,7 @@ impl ManagerClient {
             .json(&OpenSession {
                 resource_id,
                 client_os: client_os(),
+                application_windows: true,
             })
             .send()
             .await?;
@@ -208,9 +216,7 @@ async fn read<T: for<'de> Deserialize<'de>>(
 
 /// What to tell the manager this client is running on.
 ///
-/// The agent uses it to decide keyboard conventions — a Mac client sends
-/// Command where a Windows client sends Control, and only the far side can
-/// sensibly translate that.
+/// Diagnostic metadata, not permission to globally remap keyboard modifiers.
 const fn client_os() -> &'static str {
     if cfg!(target_os = "macos") {
         "MACOS"
@@ -224,6 +230,54 @@ const fn client_os() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manager_mode_hint_defaults_to_desktop_without_copying_launch_configuration() {
+        let mut value = serde_json::json!({
+            "session_id": uuid::Uuid::nil(), "ticket": "opaque-bearer",
+            "gateway_addr": "localhost:443", "gateway_pin": "pin", "agent_key": "key"
+        });
+        let desktop: SessionTicket = serde_json::from_value(value.clone()).unwrap();
+        assert!(!desktop.application_windows);
+        value["application_windows"] = serde_json::json!(true);
+        let application: SessionTicket = serde_json::from_value(value).unwrap();
+        assert!(application.application_windows);
+        assert!(!format!("{application:?}").contains("opaque-bearer"));
+    }
+
+    #[tokio::test]
+    async fn resource_listing_advertises_native_application_support() {
+        async fn resources(
+            axum::extract::Query(query): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >,
+        ) -> axum::Json<Vec<serde_json::Value>> {
+            assert_eq!(
+                query.get("application_windows").map(String::as_str),
+                Some("true")
+            );
+            axum::Json(Vec::new())
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route("/v1/resources", axum::routing::get(resources)),
+            )
+            .await
+            .unwrap();
+        });
+        let client = ManagerClient {
+            http: reqwest::Client::new(),
+            base: format!("http://{address}"),
+            token: "test-only".into(),
+        };
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), client.resources()).await;
+        server.abort();
+        assert!(result.unwrap().unwrap().is_empty());
+    }
 
     #[test]
     fn launch_ticket_preserves_authorization_and_redacts_debug() {

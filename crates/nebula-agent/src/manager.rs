@@ -47,6 +47,13 @@ pub struct ManagerClient {
     http: reqwest::Client,
     base: String,
     credential: Option<String>,
+    signing: std::sync::Arc<tokio::sync::Mutex<Option<CachedKeys>>>,
+}
+
+#[derive(Debug)]
+struct CachedKeys {
+    fetched: std::time::Instant,
+    authority: nebula_common::TicketAuthority,
 }
 
 impl ManagerClient {
@@ -58,6 +65,7 @@ impl ManagerClient {
                 .build()?,
             base: base.trim_end_matches('/').to_string(),
             credential,
+            signing: Default::default(),
         })
     }
 
@@ -97,13 +105,90 @@ impl ManagerClient {
         parse(response).await
     }
 
+    /// Verify every supplied authority against the enrolled manager, including desktops.
+    pub async fn verify_session_authority(
+        &self,
+        request: &ndp_signal::SessionRequest,
+        machine: nebula_common::MachineId,
+        agent_key: &str,
+    ) -> anyhow::Result<()> {
+        if request.signed_ticket.is_none() && !request.launch_target.is_application() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            request.signed_ticket.is_some(),
+            "application authority is missing"
+        );
+        let mut cache = self.signing.lock().await;
+        if let Some(keys) = cache
+            .as_ref()
+            .filter(|keys| keys.fetched.elapsed() < Duration::from_secs(300))
+        {
+            if request
+                .verify_signed_authority(
+                    &keys.authority.jwks,
+                    &keys.authority.issuer,
+                    machine,
+                    agent_key,
+                )
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+        let response = self
+            .http
+            .get(format!("{}/v1/machines/session-authority", self.base))
+            .header("Authorization", format!("Machine {}", self.credential()?))
+            .send()
+            .await?;
+        anyhow::ensure!(
+            response.url().as_str() == format!("{}/v1/machines/session-authority", self.base),
+            "manager signing key redirects are not accepted"
+        );
+        let authority: nebula_common::TicketAuthority = parse(response).await?;
+        *cache = Some(CachedKeys {
+            fetched: std::time::Instant::now(),
+            authority,
+        });
+        request.verify_signed_authority(
+            &cache.as_ref().expect("cached manager keys").authority.jwks,
+            &cache
+                .as_ref()
+                .expect("cached manager keys")
+                .authority
+                .issuer,
+            machine,
+            agent_key,
+        )?;
+        Ok(())
+    }
+
     /// Report liveness and, optionally, which gateway now holds the tunnel.
     pub async fn heartbeat(&self, status: &str, gateway: Option<Uuid>) -> anyhow::Result<()> {
+        self.heartbeat_with_application(
+            status,
+            gateway,
+            nebula_common::ApplicationCapability::default(),
+        )
+        .await
+    }
+
+    /// Report a probed native application capability alongside liveness.
+    pub async fn heartbeat_with_application(
+        &self,
+        status: &str,
+        gateway: Option<Uuid>,
+        application: nebula_common::ApplicationCapability,
+    ) -> anyhow::Result<()> {
         let response = self
             .http
             .post(format!("{}/v1/machines/heartbeat", self.base))
             .header("Authorization", format!("Machine {}", self.credential()?))
-            .json(&serde_json::json!({ "status": status, "gateway_id": gateway }))
+            .json(&serde_json::json!({
+                "status": status, "gateway_id": gateway,
+                "capabilities": { "application": application }
+            }))
             .send()
             .await?;
         if response.status().is_success() {

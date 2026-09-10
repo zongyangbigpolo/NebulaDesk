@@ -39,6 +39,54 @@ Send completion requires the receiver's verified final ACK; receive completion
 requires hash verification and publication. Unconfirmed transfers fail when
 the session ends.
 
+## Application windows
+
+APP resources use independent **local native windows**, not a desktop player or a
+cropped desktop fallback. Each authorized surface has its own hardware decoder,
+bounded reorder buffer and latest-frame mailbox. Removed IDs are never reused.
+The client requires explicit application negotiation; old or incompatible hosts
+fail visibly instead of opening a desktop. Connection/first-video startup is
+bounded to 30 seconds. Session-wide clipboard, file transfer and audio are not
+enabled in application mode. Application `Connected` is emitted only after an
+actual decoded picture is available. Video is tagged with both geometry
+generation and a per-surface sequence; multipath's global sequence is not a
+decoder sequence.
+
+Closing a native window asks the remote application to close normally. The local
+window remains until the remote surface is removed, so Save/Cancel dialogs still
+work. In a view-only session, local close disconnects the view rather than
+requesting an unauthorized remote document close. Focus, resize and minimize are surface-scoped. Mac child-window ownership
+and Windows owner/enable hooks complement client-side modal input gating.
+Wayland/winit currently lacks a public top-level transient-parent API: modal input
+is gated, but compositor-enforced parent stacking/grouping is not implemented.
+These windows are presentation isolation, **not a security sandbox**.
+The macOS global application menu is not represented or forwarded yet. Use
+in-window controls or keyboard shortcuts; the client never substitutes a capture
+of the desktop menu bar.
+
+Keyboard input defaults to physical mappings, including existing desktop
+sessions. Semantic editing shortcuts are opt-in per resource:
+
+```sh
+nebula-client connect "Editor" --keyboard-mode semantic \
+  --keyboard-profile editing --host-os macos
+```
+
+The same options are supported on `desktop-session`, so the supervising host can
+select them per resource without adding executable paths or credentials to IPC.
+`Launch.application_windows` must be true to enter application mode; absent/false
+keeps the existing desktop implementation. Direct clients also require the
+manager's `SessionTicket.application_windows` hint to match the requested resource
+kind; missing hints remain desktop-only. `--host-os` is an optional override of
+the negotiated host advisory. Unknown host conventions preserve physical input.
+
+The editing profile maps common C/V/X/A/S/F/Z chords between Control and Command
+when the client/host conventions differ. `--keyboard-profile terminal` preserves
+Control+C; modifiers are not globally remapped. Local task-switch chords remain
+local. Text/IME composition is **not implemented**; application windows explicitly
+disable IME and use physical key events, rather than pretending single-character
+metadata is a composition protocol.
+
 ## Fonts
 
 Chinese labels use an installed OS CJK font (PingFang/Heiti/Songti on macOS,

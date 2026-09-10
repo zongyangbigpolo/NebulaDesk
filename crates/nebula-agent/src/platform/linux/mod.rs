@@ -2,6 +2,7 @@
 //!
 //! See docs/linux-media.md for native packages and compositor requirements.
 
+mod application_policy;
 mod audio;
 mod capture;
 pub mod h264;
@@ -24,6 +25,22 @@ pub struct Linux {
 }
 
 impl Platform for Linux {
+    fn application_capability(&self) -> nebula_common::ApplicationCapability {
+        nebula_common::ApplicationCapability {
+            reason: Some(
+                nebula_common::application::ApplicationUnavailableReason::IsolationUnavailable,
+            ),
+            ..nebula_common::ApplicationCapability::default()
+        }
+    }
+
+    fn application(
+        &self,
+        _launch: &nebula_common::ApplicationLaunch,
+    ) -> anyhow::Result<Box<dyn crate::application::ApplicationBackend>> {
+        anyhow::bail!("{}", application_policy::APP_UNAVAILABLE)
+    }
+
     fn session_scope(&self, allow_input: bool) -> anyhow::Result<Option<Arc<dyn Platform>>> {
         Ok(Some(Arc::new(Self {
             allow_input,
@@ -78,6 +95,25 @@ fn desktop_session() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generic_portal_cannot_admit_published_application_targets() {
+        let platform = Linux::default();
+        assert!(!platform.application_capability().is_supported());
+        let launch = nebula_common::ApplicationLaunch {
+            launch_path: "/definitely-not-launched".into(),
+            launch_args: vec![],
+            working_dir: None,
+        };
+        let error = platform
+            .application(&launch)
+            .err()
+            .expect("must refuse APP mode");
+        assert!(error
+            .to_string()
+            .contains("not a trusted PID/window identity"));
+        assert!(platform.input().is_err());
+    }
 
     #[test]
     fn input_permission_is_scoped_without_opening_a_desktop() {

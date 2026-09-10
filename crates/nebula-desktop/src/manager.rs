@@ -89,12 +89,27 @@ impl Manager {
     }
 
     fn endpoint(&self, path: &str) -> Result<Url> {
+        let (path, application_windows) = match path.strip_suffix("?application_windows=true") {
+            Some(resource_path)
+                if resource_path == "v1/resources"
+                    || resource_path
+                        .strip_prefix("v1/resources/")
+                        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok()) =>
+            {
+                (resource_path, true)
+            }
+            _ => (path, false),
+        };
         if !path.starts_with("v1/") || path.contains("..") || path.contains(['?', '#', '\\']) {
             return Err(DesktopError::protocol());
         }
-        let url = self.base.join(path).map_err(|_| DesktopError::protocol())?;
+        let mut url = self.base.join(path).map_err(|_| DesktopError::protocol())?;
         if url.origin() != self.base.origin() {
             return Err(DesktopError::protocol());
+        }
+        if application_windows {
+            url.query_pairs_mut()
+                .append_pair("application_windows", "true");
         }
         Ok(url)
     }
@@ -316,9 +331,28 @@ mod tests {
             "../auth",
             "v1/../auth",
             "v1/resources?token=secret",
+            "v1/resources?token=secret&application_windows=true",
+            "v1/resources?application_windows=true&token=secret",
+            "v1/auth/login?application_windows=true",
+            "v1/resources/../workspace?application_windows=true",
             "v1/\\evil.test",
         ] {
             assert!(manager.endpoint(path).is_err());
+        }
+    }
+
+    #[test]
+    fn native_application_opt_in_is_limited_to_resource_reads() {
+        let manager = Manager::new("https://manager.example/proxy", false).unwrap();
+        for resource_path in [
+            "v1/resources",
+            "v1/resources/00000000-0000-0000-0000-000000000000",
+        ] {
+            let path = format!("{resource_path}?application_windows=true");
+            assert_eq!(
+                manager.endpoint(&path).unwrap().as_str(),
+                format!("https://manager.example/proxy/{path}")
+            );
         }
     }
 

@@ -154,6 +154,7 @@ async fn redeem(
             ticket: ticket.ticket.clone(),
             noise_public_key: hex::encode(keys.public().as_bytes()),
             client_version: env!("CARGO_PKG_VERSION").to_string(),
+            application_windows: true,
         },
     )
     .await?;

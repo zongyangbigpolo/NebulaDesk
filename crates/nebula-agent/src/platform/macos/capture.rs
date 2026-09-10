@@ -25,6 +25,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Instant;
 
+use screencapturekit::cg::CGRect;
 use screencapturekit::cm::CMSampleBuffer;
 use screencapturekit::cv::CVPixelBuffer;
 use screencapturekit::shareable_content::SCShareableContent;
@@ -62,6 +63,42 @@ const PERMISSION: &str = "cannot capture this display. Grant Screen Recording to
      agent again. If it is already listed, remove it and re-add it: the permission is tied to \
      the exact binary and a rebuild invalidates it";
 
+fn validate_isolated_window(target: CGRect, content: CGRect) -> anyhow::Result<()> {
+    let valid = |r: CGRect| {
+        [r.origin.x, r.origin.y, r.size.width, r.size.height]
+            .iter()
+            .all(|n| n.is_finite())
+            && r.size.width > 0.0
+            && r.size.height > 0.0
+    };
+    let same = |a: CGRect, b: CGRect| {
+        [
+            a.origin.x - b.origin.x,
+            a.origin.y - b.origin.y,
+            a.size.width - b.size.width,
+            a.size.height - b.size.height,
+        ]
+        .iter()
+        .all(|n| n.abs() < 0.5)
+    };
+    anyhow::ensure!(
+        valid(target) && valid(content),
+        "invalid isolated capture rectangle"
+    );
+    anyhow::ensure!(
+        same(target, content),
+        "native window filter unexpectedly expanded"
+    );
+    Ok(())
+}
+
+fn configure_isolated_window(config: &mut SCStreamConfiguration) {
+    // Native sheet shadows can span the containing document. Exclude those
+    // shadows and child compositing rather than cropping any parent capture.
+    config.set_ignores_shadows_single_window(true);
+    config.set_includes_child_windows(false);
+}
+
 /// Check the calling process's current grant without showing a consent prompt.
 #[must_use]
 pub fn screen_capture_allowed() -> bool {
@@ -76,6 +113,7 @@ extern "C" {
 
 /// Captures the main display and encodes it in hardware.
 pub struct MacVideo {
+    window: Option<(u32, i32)>,
     keyframe: Arc<AtomicBool>,
     bitrate: Arc<AtomicU32>,
     running: Arc<AtomicBool>,
@@ -93,38 +131,83 @@ impl MacVideo {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            window: None,
             keyframe: Arc::new(AtomicBool::new(false)),
             bitrate: Arc::new(AtomicU32::new(0)),
             running: Arc::new(AtomicBool::new(false)),
             worker: None,
         }
     }
+
+    /// Capture this WindowServer surface only, never its enclosing display.
+    pub fn window(window: u32, owner_pid: i32) -> Self {
+        let mut source = Self::new();
+        source.window = Some((window, owner_pid));
+        source
+    }
 }
 
 impl VideoSource for MacVideo {
+    fn preserves_frame_provenance(&self) -> bool {
+        true
+    }
+
     fn start(&mut self, config: VideoConfig, sink: FrameSink) -> anyhow::Result<()> {
         // A machine without permission fails both ways depending on macOS
         // version and TCC history: an error, or an empty display list. Both
         // mean the same thing to whoever has to fix it, so both say so.
+        let preparing = Instant::now();
         let content = SCShareableContent::get()
             .map_err(|error| anyhow::anyhow!("{}: {error:?}", PERMISSION))?;
-        let displays = content.displays();
-        let display = displays
-            .first()
-            .ok_or_else(|| anyhow::anyhow!(PERMISSION))?;
-
-        // Capture at the size the client asked for and let ScreenCaptureKit
-        // do the scaling: it is already compositing, so scaling there is free
-        // and scaling in the encoder is not.
-        let (width, height) = fit(
-            display.width(),
-            display.height(),
-            config.width,
-            config.height,
-        );
-
-        let filter = SCContentFilter::create().with_display(display).build();
-        let stream_config = SCStreamConfiguration::new()
+        let (filter, source_width, source_height) = if let Some((id, pid)) = self.window {
+            let windows = content.windows();
+            let window = windows
+                .iter()
+                .find(|window| {
+                    window.window_id() == id
+                        && window
+                            .owning_application()
+                            .is_some_and(|app| app.process_id() == pid)
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("the authorized application surface is unavailable")
+                })?;
+            let bounds = window.frame();
+            let filter = SCContentFilter::create().with_window(window).build();
+            validate_isolated_window(bounds, filter.content_rect())?;
+            tracing::debug!(window = id, target = ?bounds, filter = ?filter.content_rect(),
+                "isolated application window capture");
+            (
+                filter,
+                bounds.size.width.round() as u32,
+                bounds.size.height.round() as u32,
+            )
+        } else {
+            let displays = content.displays();
+            let display = displays
+                .first()
+                .ok_or_else(|| anyhow::anyhow!(PERMISSION))?;
+            (
+                SCContentFilter::create().with_display(display).build(),
+                display.width(),
+                display.height(),
+            )
+        };
+        let (width, height) = if self.window.is_some() {
+            anyhow::ensure!(
+                config.width >= 2
+                    && config.height >= 2
+                    && config.width <= 8192
+                    && config.height <= 8192
+                    && config.width % 2 == 0
+                    && config.height % 2 == 0,
+                "invalid application capture geometry"
+            );
+            (config.width, config.height)
+        } else {
+            fit(source_width, source_height, config.width, config.height)
+        };
+        let mut stream_config = SCStreamConfiguration::new()
             .with_width(width)
             .with_height(height)
             // NV12 video range: the one format ScreenCaptureKit produces and
@@ -137,15 +220,22 @@ impl VideoSource for MacVideo {
             // needs the client to know the remote pointer's shape as well as
             // its position, and a client that draws nothing shows a session
             // that appears not to respond to the mouse at all.
-            .with_shows_cursor(true);
+            .with_shows_cursor(self.window.is_none());
+        if self.window.is_some() {
+            configure_isolated_window(&mut stream_config);
+        }
 
         // ScreenCaptureKit delivers on its own dispatch queue, so frames
         // cross into Rust here and are handed to a thread that owns the
         // encoder. The encoder is neither Sync nor safe to touch from an
         // arbitrary queue, and a bounded channel means a slow encoder drops
         // frames rather than growing a backlog of stale ones.
-        let (frames, incoming) = mpsc::sync_channel::<CMSampleBuffer>(QUEUE_DEPTH as usize);
+        let (frames, incoming) =
+            mpsc::sync_channel::<(CMSampleBuffer, FrameSink)>(QUEUE_DEPTH as usize);
+        let producer = sink.clone();
         let mut stream = SCStream::new(&filter, &stream_config);
+        tracing::info!(window = ?self.window, elapsed_ms = preparing.elapsed().as_millis(),
+            "native capture stream configured");
         stream.add_output_handler(
             move |sample: CMSampleBuffer, kind: SCStreamOutputType| {
                 if kind == SCStreamOutputType::Screen {
@@ -153,7 +243,7 @@ impl VideoSource for MacVideo {
                     // newest frame is wrong — drop nothing and let the next
                     // one through — but there is no way to replace the queued
                     // one, so the newest is what goes.
-                    let _ = frames.try_send(sample);
+                    let _ = frames.try_send((sample, producer.for_frame()));
                 }
             },
             SCStreamOutputType::Screen,
@@ -166,9 +256,11 @@ impl VideoSource for MacVideo {
         running.store(true, Ordering::Relaxed);
 
         let (ready, started) = mpsc::channel::<anyhow::Result<()>>();
+        let window = self.window;
         let worker = std::thread::Builder::new()
             .name("nebula-capture".into())
             .spawn(move || {
+                let initializing = Instant::now();
                 let encoder = match encoder_for(width, height, config.fps, config.bitrate) {
                     Ok(encoder) => encoder,
                     Err(error) => {
@@ -176,6 +268,11 @@ impl VideoSource for MacVideo {
                         return;
                     }
                 };
+                tracing::info!(
+                    ?window,
+                    elapsed_ms = initializing.elapsed().as_millis(),
+                    "native capture encoder initialized"
+                );
                 // Only now is capture actually running. Reporting success
                 // before this point meant a stream that refused to start
                 // produced a session that connected, showed nothing, and
@@ -187,10 +284,13 @@ impl VideoSource for MacVideo {
                     )));
                     return;
                 }
+                tracing::info!(?window, "native capture stream started");
                 let _ = ready.send(Ok(()));
                 pump(
                     Capture {
                         encoder,
+                        window,
+                        encoded_any: false,
                         width,
                         height,
                         fps: config.fps,
@@ -202,7 +302,11 @@ impl VideoSource for MacVideo {
                     &bitrate,
                     &running,
                 );
-                let _ = stream.stop_capture();
+                tracing::info!(?window, "stopping native capture stream");
+                match stream.stop_capture() {
+                    Ok(()) => tracing::info!(?window, "native capture stream stopped"),
+                    Err(error) => tracing::warn!(?window, ?error, "native capture stop failed"),
+                }
                 running.store(false, Ordering::Relaxed);
             })?;
 
@@ -224,10 +328,12 @@ impl VideoSource for MacVideo {
     fn stop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
         if let Some(worker) = self.worker.take() {
+            tracing::info!(window = ?self.window, "joining native capture worker");
             // The thread ends when the sample channel closes, which happens
             // when the stream is torn down; joining keeps the display
             // released before the next session tries to claim it.
             let _ = worker.join();
+            tracing::info!(window = ?self.window, "native capture worker joined");
         }
     }
 }
@@ -245,6 +351,8 @@ impl Drop for MacVideo {
 /// fails in ways that are hard to attribute.
 struct Capture {
     encoder: Encoder,
+    window: Option<(u32, i32)>,
+    encoded_any: bool,
     width: u32,
     height: u32,
     fps: u32,
@@ -282,7 +390,7 @@ impl<T> CaptureFrames<T> {
 /// Encode captured frames until capture stops or the client goes away.
 fn pump(
     mut capture: Capture,
-    incoming: &mpsc::Receiver<CMSampleBuffer>,
+    incoming: &mpsc::Receiver<(CMSampleBuffer, FrameSink)>,
     sink: &FrameSink,
     keyframe: &AtomicBool,
     bitrate: &AtomicU32,
@@ -290,6 +398,9 @@ fn pump(
 ) {
     let started = Instant::now();
     let mut frames = CaptureFrames::new();
+    // VideoToolbox returns frames in submission order (reordering is disabled).
+    // Keep the native-image epoch through both the encoder and source queues.
+    let mut pending = std::collections::VecDeque::new();
 
     loop {
         // Waking periodically rather than blocking outright is what makes
@@ -313,6 +424,7 @@ fn pump(
             match encoder_for(capture.width, capture.height, capture.fps, wanted) {
                 Ok(replacement) => {
                     capture.encoder = replacement;
+                    pending.clear();
                     capture.bitrate = wanted;
                     // A fresh session has no reference frames, so the first
                     // frame out of it must be a keyframe or the client
@@ -326,35 +438,60 @@ fn pump(
         // Idle ScreenCaptureKit notifications may have no image buffer. They
         // must neither replace the last usable image nor consume an IDR request.
         // The bridge returns a +1 reference; this owner balances it exactly once.
-        let buffer = sample.and_then(|sample| CVPixelBuffer::from_raw(sample.image_buffer_ptr()));
-        if let Some((buffer, force_key_frame)) = frames.select(buffer, keyframe) {
-            // SAFETY: the cached owner keeps this same-format capture surface
-            // alive until VideoToolbox has retained it for asynchronous encoding.
-            if let Err(error) = unsafe {
-                capture
-                    .encoder
-                    .encode_pixel_buffer(buffer.as_ptr(), &EncodeOptions { force_key_frame })
-            } {
-                tracing::warn!(?error, "the encoder rejected a frame");
+        let buffer = sample.and_then(|(sample, provenance)| {
+            CVPixelBuffer::from_raw(sample.image_buffer_ptr()).map(|buffer| (buffer, provenance))
+        });
+        if frames.last.is_none() && buffer.is_some() {
+            tracing::info!(window = ?capture.window, "native capture received first image buffer");
+        }
+        if let Some(((buffer, provenance), force_key_frame)) = frames.select(buffer, keyframe) {
+            if !provenance.is_current() || pending.len() >= 32 {
                 keyframe.store(true, Ordering::Relaxed);
+            } else {
+                // SAFETY: the cached owner keeps this same-format capture surface
+                // alive until VideoToolbox has retained it for asynchronous encoding.
+                if let Err(error) = unsafe {
+                    capture
+                        .encoder
+                        .encode_pixel_buffer(buffer.as_ptr(), &EncodeOptions { force_key_frame })
+                } {
+                    tracing::warn!(?error, "the encoder rejected a frame");
+                    keyframe.store(true, Ordering::Relaxed);
+                } else {
+                    pending.push_back(provenance.clone());
+                }
             }
         }
         // Encoding is asynchronous: a cached IDR may complete after submission
         // even when the desktop supplies no further usable capture samples.
-        if !drain(&mut capture, sink, keyframe, started) {
+        if !drain(&mut capture, &mut pending, keyframe, started) {
             return;
         }
     }
 }
 
 /// Forward completed output, including completion during a static desktop.
-fn drain(capture: &mut Capture, sink: &FrameSink, keyframe: &AtomicBool, started: Instant) -> bool {
+fn drain(
+    capture: &mut Capture,
+    pending: &mut std::collections::VecDeque<FrameSink>,
+    keyframe: &AtomicBool,
+    started: Instant,
+) -> bool {
     loop {
         match capture.encoder.next_frame() {
             Ok(Some(frame)) => {
+                let Some(sink) = pending.pop_front() else {
+                    tracing::error!("native encoder returned a frame without capture provenance");
+                    return false;
+                };
                 let data = avcc(&frame);
                 if data.is_empty() {
                     continue;
+                }
+                if !capture.encoded_any {
+                    tracing::info!(window = ?capture.window, keyframe = frame.keyframe,
+                        "native capture encoded first frame");
+                    capture.encoded_any = true;
                 }
                 let encoded = EncodedFrame {
                     keyframe: frame.keyframe,
@@ -422,6 +559,17 @@ fn encoder_for(width: u32, height: u32, fps: u32, bitrate: u32) -> anyhow::Resul
     .map_err(|error| anyhow::anyhow!("could not create a VideoToolbox encoder: {error:?}"))
 }
 
+/// Verify VideoToolbox can allocate the encoder used by application captures.
+pub(crate) fn application_encoder_available() -> anyhow::Result<()> {
+    let mut config = SCStreamConfiguration::new();
+    config.set_includes_child_windows(true);
+    anyhow::ensure!(
+        config.includes_child_windows(),
+        "independent application window capture requires macOS 14.2 or newer"
+    );
+    encoder_for(64, 64, 30, 500_000).map(drop)
+}
+
 /// Serialise a frame as AVCC, with parameter sets ahead of every keyframe.
 ///
 /// The encoder reports parameter sets out of band. Putting them in front of
@@ -480,6 +628,36 @@ fn even(value: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attached_sheet_requires_its_own_filter_not_a_scaled_parent() {
+        let document = CGRect::new(130.0, 93.0, 600.0, 412.0);
+        let sheet = CGRect::new(300.0, 230.0, 260.0, 138.0);
+        validate_isolated_window(document, document).unwrap();
+        validate_isolated_window(sheet, sheet).unwrap();
+        assert!(validate_isolated_window(sheet, document).is_err());
+    }
+
+    #[test]
+    fn window_filter_rejects_expansion_and_invalid_geometry() {
+        let document = CGRect::new(130.0, 93.0, 600.0, 412.0);
+        let sheet = CGRect::new(300.0, 230.0, 260.0, 138.0);
+        assert!(validate_isolated_window(sheet, CGRect::new(0.0, 0.0, 1920.0, 1080.0)).is_err());
+        assert!(
+            validate_isolated_window(CGRect::new(120.0, 230.0, 260.0, 138.0), document).is_err()
+        );
+        assert!(validate_isolated_window(CGRect::new(f64::NAN, 0.0, 1.0, 1.0), document).is_err());
+    }
+
+    #[test]
+    fn isolated_window_configuration_excludes_children_and_group_shadows_without_crop() {
+        let mut config = SCStreamConfiguration::new();
+        let uncropped = config.source_rect();
+        configure_isolated_window(&mut config);
+        assert!(!config.includes_child_windows());
+        assert!(config.ignores_shadows_single_window());
+        assert_eq!(config.source_rect(), uncropped);
+    }
 
     #[test]
     fn fitting_preserves_the_display_shape() {
@@ -585,7 +763,7 @@ mod tests {
                     fps: 30,
                     bitrate: 4_000_000,
                 },
-                tx,
+                tx.into(),
             )
             .expect("capture should start");
 

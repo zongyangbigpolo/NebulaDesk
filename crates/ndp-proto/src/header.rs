@@ -39,6 +39,8 @@ pub enum MsgKind {
     QosReport = 0x0a,
     /// Peer address candidates for the optional direct-path upgrade.
     PathCandidates = 0x0b,
+    /// Negotiated application-surface lifecycle and scoped interaction.
+    Application = 0x0c,
 
     // ---- media plane ----
     /// One encoded video frame (or codec configuration when
@@ -85,6 +87,7 @@ impl MsgKind {
             0x09 => Self::CursorPos,
             0x0a => Self::QosReport,
             0x0b => Self::PathCandidates,
+            0x0c => Self::Application,
             0x20 => Self::VideoFrame,
             0x21 => Self::AudioFrame,
             0x40 => Self::InputEvent,
