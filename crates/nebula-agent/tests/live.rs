@@ -692,6 +692,7 @@ mod native_app {
         scroll_target: FixturePoint,
         slider_value: f64,
         slider_drag: FixtureDrag,
+        miniaturized: bool,
     }
 
     #[derive(Clone, Copy, serde::Deserialize)]
@@ -898,6 +899,7 @@ mod native_app {
         removed: BTreeSet<u8>,
         media: BTreeMap<u8, Media>,
         unavailable: BTreeSet<u8>,
+        minimize_target: Option<u8>,
         recovering: BTreeMap<u8, tokio::time::Instant>,
         stage: &'static str,
         fixture_pid: Option<u32>,
@@ -917,6 +919,7 @@ mod native_app {
                 removed: BTreeSet::new(),
                 media: BTreeMap::new(),
                 unavailable: BTreeSet::new(),
+                minimize_target: None,
                 recovering: BTreeMap::new(),
                 stage: "initial capture / APP negotiation",
                 fixture_pid: None,
@@ -1026,32 +1029,50 @@ mod native_app {
                             assert_eq!(message.header.kind, MsgKind::Application);
                             assert!(self.ready, "surface appeared before APP Hello/HelloAck");
                             assert!(!surface.modal && surface.parent_surface_id.is_none());
-                            assert!(!surface.minimized);
+                            if surface.minimized {
+                                assert_eq!(
+                                    self.minimize_target,
+                                    Some(surface.surface_id),
+                                    "only the explicitly minimized document may be minimized"
+                                );
+                            }
                             let id = surface.surface_id;
                             let generation = surface.geometry_generation;
+                            let minimized = surface.minimized;
+                            let was_minimized =
+                                self.registry.get(id).is_some_and(|old| old.minimized);
                             self.registry.upsert(surface).unwrap();
                             self.live.insert(id);
                             if self.unavailable.remove(&id) {
                                 eprintln!("native APP stage {}: surface {id} resumed metadata, generation {generation}; awaiting fresh keyframe", self.stage);
                             }
                             if let Some(media) = self.media.get_mut(&id) {
-                                if media.generation != generation {
+                                if minimized || was_minimized || media.generation != generation {
                                     media.invalidate();
                                 }
+                            }
+                            if minimized {
+                                // An intentional pause needs no capture recovery
+                                // until Focus restores the same authorized surface.
+                                self.recovering.remove(&id);
+                            } else if was_minimized {
+                                self.recovering.insert(id, tokio::time::Instant::now());
                             }
                             assert!(
                                 self.live.len() + self.removed.len() <= 2,
                                 "the two-document fixture exposed an extra native surface; \
                                  do not hide capture-status/AX widgets with title filtering"
                             );
-                            self.send(
-                                client,
-                                ControlMessage::Application(App::RequestKeyframe {
-                                    surface_id: id,
-                                    geometry_generation: generation,
-                                }),
-                            )
-                            .await;
+                            if !minimized {
+                                self.send(
+                                    client,
+                                    ControlMessage::Application(App::RequestKeyframe {
+                                        surface_id: id,
+                                        geometry_generation: generation,
+                                    }),
+                                )
+                                .await;
+                            }
                         }
                         ControlMessage::Application(App::SurfaceUnavailable {
                             surface_id,
@@ -1064,9 +1085,11 @@ mod native_app {
                             // Capture loss is not window destruction. Repeated
                             // notices must not extend the recovery deadline.
                             self.unavailable.insert(surface_id);
-                            self.recovering
-                                .entry(surface_id)
-                                .or_insert_with(tokio::time::Instant::now);
+                            if !self.surface(surface_id).minimized {
+                                self.recovering
+                                    .entry(surface_id)
+                                    .or_insert_with(tokio::time::Instant::now);
+                            }
                             self.media.entry(surface_id).or_default().invalidate();
                             eprintln!("native APP stage {}: surface {surface_id} temporarily unavailable; retaining its ID, allowing {:?} to resume", self.stage, CAPTURE_RECOVERY_TIMEOUT);
                         }
@@ -1130,6 +1153,9 @@ mod native_app {
                     let Ok(surface) = self.registry.validate_frame(video.display, &frame) else {
                         return;
                     };
+                    if surface.minimized {
+                        return;
+                    }
                     assert!(self.ready);
                     assert_eq!(
                         (u32::from(video.width), u32::from(video.height)),
@@ -1216,7 +1242,8 @@ mod native_app {
             self.media
                 .get(&id)
                 .filter(|media| {
-                    !self.unavailable.contains(&id)
+                    !surface.minimized
+                        && !self.unavailable.contains(&id)
                         && media.generation == surface.geometry_generation
                 })
                 .map_or(0, |media| media.pictures)
@@ -1267,7 +1294,7 @@ mod native_app {
         discovery: FixtureDiscovery,
         first: u8,
         second: u8,
-    ) {
+    ) -> (Fixture, Value, Value) {
         probe.stage("fixture discovery");
         let fixture = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
@@ -1595,6 +1622,7 @@ mod native_app {
             "fixture PID {} confirmed scoped native keys, Reset click, wheel scrolling and slider drag",
             fixture.pid
         );
+        (fixture, selected, sibling)
     }
 
     // Raw protocol/media assertions complement, not replace, native Client
@@ -1673,7 +1701,8 @@ mod native_app {
             probe.media[&second].picture_hash
         );
 
-        scoped_input(&mut probe, client, incoming, fixture_start, first, second).await;
+        let (fixture, selected_document, sibling_document) =
+            scoped_input(&mut probe, client, incoming, fixture_start, first, second).await;
 
         probe.stage("post-input recovery before resize");
         tokio::time::timeout(Duration::from_secs(25), async {
@@ -1726,6 +1755,131 @@ mod native_app {
         })
         .await
         .expect("resized document must publish a new generation and valid new-sized pictures");
+
+        // APP v1 exposes Minimize and Focus (which restores on macOS), without
+        // a separate Restore command or per-command capability bit.
+        probe.stage("Minimize first document / real NSWindow.isMiniaturized");
+        let before_minimize = [probe.surface(first), probe.surface(second)];
+        let minimize_started = TimingMark::now();
+        probe.minimize_target = Some(first);
+        probe
+            .send(
+                client,
+                ControlMessage::Application(App::Minimize {
+                    surface_id: first,
+                    geometry_generation: before_minimize[0].geometry_generation,
+                }),
+            )
+            .await;
+        let minimize_sent = TimingMark::now();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                probe.receive(client, incoming).await;
+                assert_eq!(probe.live, BTreeSet::from([first, second]));
+                assert!(
+                    probe.removed.is_empty(),
+                    "Minimize must not retire either surface ID"
+                );
+                if let Some(status) = fixture.read() {
+                    assert!(!status.window(&sibling_document).miniaturized);
+                    if status.window(&selected_document).miniaturized
+                        && probe.surface(first).minimized
+                    {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("Minimize must update both real NSWindow state and retained surface metadata");
+        timing(
+            "minimize_native_evidence",
+            minimize_started,
+            Some(minimize_sent),
+            0,
+        );
+        let paused_count = probe.total_pictures(first);
+        let sibling_count = probe.total_pictures(second);
+        probe.stage("sibling streams while first document remains minimized");
+        let steady = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < steady {
+            probe.receive(client, incoming).await;
+            assert_eq!(probe.live, BTreeSet::from([first, second]));
+            assert!(probe.removed.is_empty());
+            assert!(probe.surface(first).minimized && !probe.surface(second).minimized);
+        }
+        assert_eq!(
+            probe.total_pictures(first),
+            paused_count,
+            "minimized/in-flight media must not count as ready"
+        );
+        assert_eq!(probe.pictures(first), 0);
+        assert!(
+            probe.total_pictures(second) >= sibling_count + 5 && probe.pictures(second) >= 5,
+            "sibling must keep decoding while the first window is minimized"
+        );
+        let minimized_status = fixture.read().expect("fixture status while minimized");
+        assert!(minimized_status.window(&selected_document).miniaturized);
+        assert!(!minimized_status.window(&sibling_document).miniaturized);
+
+        probe.stage("Focus restores minimized document / fresh current decoded media");
+        let minimized = probe.surface(first);
+        assert!(
+            minimized.geometry_generation > before_minimize[0].geometry_generation,
+            "minimization must invalidate the previous capture generation"
+        );
+        let restore_started = TimingMark::now();
+        probe
+            .send(
+                client,
+                ControlMessage::Application(App::Focus {
+                    surface_id: first,
+                    geometry_generation: minimized.geometry_generation,
+                }),
+            )
+            .await;
+        let restore_sent = TimingMark::now();
+        tokio::time::timeout(Duration::from_secs(25), async {
+            loop {
+                probe.receive(client, incoming).await;
+                assert_eq!(probe.live, BTreeSet::from([first, second]));
+                assert!(
+                    probe.removed.is_empty(),
+                    "Focus must restore, not replace, the minimized surface"
+                );
+                if let Some(status) = fixture.read() {
+                    assert!(!status.window(&sibling_document).miniaturized);
+                    if !status.window(&selected_document).miniaturized
+                        && !probe.surface(first).minimized
+                        && probe.surface(first).geometry_generation > minimized.geometry_generation
+                        && probe.pictures(first) >= 5
+                        && probe.total_pictures(first) >= paused_count + 5
+                        && probe.recovering.is_empty()
+                    {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("Focus must restore real NSWindow and fresh decoded media on the same surface ID");
+        timing(
+            "focus_restore_native_and_media_evidence",
+            restore_started,
+            Some(restore_sent),
+            0,
+        );
+        for (index, id) in [first, second].into_iter().enumerate() {
+            let mut restored = probe.surface(id);
+            assert!(restored.geometry_generation >= before_minimize[index].geometry_generation);
+            restored.geometry_generation = before_minimize[index].geometry_generation;
+            assert_eq!(
+                restored, before_minimize[index],
+                "minimize/restore must preserve document identity and geometry"
+            );
+        }
+        probe.minimize_target = None;
+        eprintln!("fixture PID {} confirmed Minimize and Focus restore for surface {first}, with sibling {second} streaming and no Remove", fixture.pid);
 
         probe.stage("normal Close first document");
         let surface = probe.surface(first);
