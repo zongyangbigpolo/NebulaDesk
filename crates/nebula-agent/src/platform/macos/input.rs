@@ -149,10 +149,20 @@ impl ApplicationInput {
                     }
                 };
                 while let Ok((event, reply)) = inbox.recv() {
-                    let result = validate().and_then(|bounds| {
+                    let started = Instant::now();
+                    let checked = validate();
+                    let validation = started.elapsed();
+                    let result = checked.and_then(|bounds| {
                         desktop.bounds = bounds;
                         desktop.apply(&event)
                     });
+                    if started.elapsed() >= Duration::from_millis(100) {
+                        tracing::info!(
+                            kind = ?event.kind, validation_ms = validation.as_millis(),
+                            apply_ms = (started.elapsed() - validation).as_millis(),
+                            "scoped posting-thread input was slow"
+                        );
+                    }
                     if result.is_err() {
                         desktop.release_all();
                     }
@@ -313,13 +323,24 @@ impl Clicks {
 
 impl Desktop {
     fn new() -> anyhow::Result<Self> {
+        let started = Instant::now();
         // `HIDSystemState` makes injected events indistinguishable from real
         // ones to applications, which is what makes modifier-aware apps
         // behave. A private state would be visible as synthetic.
         let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
             .map_err(|()| anyhow::anyhow!("could not create a CoreGraphics event source"))?;
-
+        let source_time = started.elapsed();
         let frame = CGDisplay::main().bounds();
+        let display_time = started.elapsed() - source_time;
+        let click_interval = double_click_interval();
+        if started.elapsed() >= Duration::from_millis(100) {
+            tracing::info!(
+                source_ms = source_time.as_millis(),
+                display_ms = display_time.as_millis(),
+                click_ms = (started.elapsed() - source_time - display_time).as_millis(),
+                "native input initialization was slow"
+            );
+        }
         Ok(Self {
             source,
             target_pid: None,
@@ -337,7 +358,7 @@ impl Desktop {
             ),
             held: Vec::new(),
             keys: HeldKeys::default(),
-            clicks: Clicks::new(double_click_interval()),
+            clicks: Clicks::new(click_interval),
             clock: Instant::now(),
             wheel: [0.0; 2],
         })
@@ -392,9 +413,11 @@ impl Desktop {
     }
 
     fn post(&self, event: &CGEvent) -> bool {
+        let started = Instant::now();
         if self.target_alive.as_ref().is_some_and(|alive| !alive()) {
             return false;
         }
+        let alive_time = started.elapsed();
         if let Some(pid) = self.target_pid {
             if matches!(
                 event.get_type(),
@@ -412,11 +435,26 @@ impl Desktop {
                 let Some(window) = self.target_window else {
                     return false;
                 };
-                return post_window_mouse(event, pid, window, self.bounds);
+                let result = post_window_mouse(event, pid, window, self.bounds);
+                if started.elapsed() >= Duration::from_millis(100) {
+                    tracing::info!(
+                        alive_ms = alive_time.as_millis(),
+                        post_ms = (started.elapsed() - alive_time).as_millis(),
+                        "scoped native pointer post was slow"
+                    );
+                }
+                return result;
             }
             event.post_to_pid(pid);
         } else {
             event.post(CGEventTapLocation::HID);
+        }
+        if started.elapsed() >= Duration::from_millis(100) {
+            tracing::info!(
+                alive_ms = alive_time.as_millis(),
+                post_ms = (started.elapsed() - alive_time).as_millis(),
+                "native event post was slow"
+            );
         }
         true
     }
@@ -688,11 +726,42 @@ struct WindowPointer {
     button: i64,
 }
 
+pub(crate) fn prepare_window_events(window: u32) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static PREPARING: AtomicBool = AtomicBool::new(false);
+    if PREPARING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let started = std::thread::Builder::new()
+        .name("nebula-window-events".into())
+        .spawn(move || {
+            // Prime AppKit's public event bridge while SCK starts. Construct
+            // and discard only: never post a synthetic warm-up input event.
+            if !with_window_event(
+                &WindowPointer {
+                    window,
+                    local: CGPoint::new(0.0, 0.0),
+                    kind: CGEventType::MouseMoved,
+                    flags: 0,
+                    click_count: 1,
+                    button: 0,
+                },
+                |_| {},
+            ) {
+                PREPARING.store(false, Ordering::Release);
+            }
+        });
+    if started.is_err() {
+        PREPARING.store(false, Ordering::Release);
+    }
+}
+
 fn with_window_event(spec: &WindowPointer, post: impl FnOnce(*mut std::ffi::c_void)) -> bool {
     if spec.window == 0 || !spec.local.x.is_finite() || !spec.local.y.is_finite() {
         return false;
     }
     objc2::rc::autoreleasepool(|_| {
+        let started = Instant::now();
         let pressure = if matches!(
             spec.kind,
             CGEventType::LeftMouseDown
@@ -750,7 +819,15 @@ fn with_window_event(spec: &WindowPointer, post: impl FnOnce(*mut std::ffi::c_vo
         unsafe {
             CGEventSetIntegerValueField(raw, EventField::MOUSE_EVENT_BUTTON_NUMBER, spec.button);
         }
+        let constructed = started.elapsed();
         post(raw);
+        if started.elapsed() >= Duration::from_millis(100) {
+            tracing::info!(
+                construction_ms = constructed.as_millis(),
+                delivery_ms = (started.elapsed() - constructed).as_millis(),
+                "public window-event delivery was slow"
+            );
+        }
         true
     })
 }

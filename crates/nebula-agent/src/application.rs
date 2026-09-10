@@ -305,10 +305,40 @@ pub(crate) enum WorkerCommand {
     Keyframe(u8),
 }
 
+pub(crate) struct CommandSender(std::sync::mpsc::SyncSender<(std::time::Instant, WorkerCommand)>);
+
+impl CommandSender {
+    #[cfg(test)]
+    fn send(
+        &self,
+        command: WorkerCommand,
+    ) -> Result<(), std::sync::mpsc::SendError<WorkerCommand>> {
+        self.0
+            .send((std::time::Instant::now(), command))
+            .map_err(|std::sync::mpsc::SendError((_, command))| std::sync::mpsc::SendError(command))
+    }
+
+    pub(crate) fn try_send(
+        &self,
+        command: WorkerCommand,
+    ) -> Result<(), std::sync::mpsc::TrySendError<WorkerCommand>> {
+        self.0
+            .try_send((std::time::Instant::now(), command))
+            .map_err(|error| match error {
+                std::sync::mpsc::TrySendError::Full((_, command)) => {
+                    std::sync::mpsc::TrySendError::Full(command)
+                }
+                std::sync::mpsc::TrySendError::Disconnected((_, command)) => {
+                    std::sync::mpsc::TrySendError::Disconnected(command)
+                }
+            })
+    }
+}
+
 pub(crate) struct Worker {
     pub(crate) events: tokio::sync::mpsc::Receiver<WorkerEvent>,
     pub(crate) frames: tokio::sync::mpsc::Receiver<SurfaceFrame>,
-    pub(crate) commands: std::sync::mpsc::SyncSender<WorkerCommand>,
+    pub(crate) commands: CommandSender,
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -624,7 +654,7 @@ pub(crate) fn spawn(
     use std::time::{Duration, Instant};
     let (event_tx, events) = tokio::sync::mpsc::channel(64);
     let (frame_tx, frames) = tokio::sync::mpsc::channel(8);
-    let (commands, inbox) = std::sync::mpsc::sync_channel(64);
+    let (commands, inbox) = std::sync::mpsc::sync_channel::<(Instant, WorkerCommand)>(64);
     let stopped = Arc::new(AtomicBool::new(false));
     let stop = stopped.clone();
     // Synthetic encoders also work on the native worker during unit tests.
@@ -665,11 +695,28 @@ pub(crate) fn spawn(
                 let mut had_surface = false;
                 while !stop.load(Ordering::Acquire) && !frame_tx.is_closed() {
                     for _ in 0..64 {
-                        let command = match inbox.try_recv() {
+                        let (queued, command) = match inbox.try_recv() {
                             Ok(command) => command,
                             Err(std::sync::mpsc::TryRecvError::Empty) => break,
                             Err(std::sync::mpsc::TryRecvError::Disconnected) => return Ok(()),
                         };
+                        let queue_ms = queued.elapsed().as_millis();
+                        if queue_ms >= 100 {
+                            let kind = match &command {
+                                WorkerCommand::Keyframe(_)
+                                | WorkerCommand::Client(ApplicationMessage::RequestKeyframe {
+                                    ..
+                                }) => "keyframe",
+                                WorkerCommand::Client(ApplicationMessage::Input { .. }) => "input",
+                                WorkerCommand::Client(ApplicationMessage::Focus { .. }) => "focus",
+                                _ => "control",
+                            };
+                            tracing::info!(
+                                queue_ms,
+                                kind,
+                                "native application command queue was slow"
+                            );
+                        }
                         if let Err(error) = runtime.command(command, input_allowed) {
                             runtime.backend.release_input();
                             tracing::debug!(%error, "scoped application command rejected");
@@ -715,7 +762,7 @@ pub(crate) fn spawn(
     Ok(Worker {
         events,
         frames,
-        commands,
+        commands: CommandSender(commands),
         stopped,
     })
 }

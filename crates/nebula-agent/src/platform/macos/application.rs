@@ -16,6 +16,7 @@ use objc2_app_kit::{
     NSApplicationActivationOptions, NSRunningApplication, NSWorkspace, NSWorkspaceOpenConfiguration,
 };
 use objc2_foundation::{NSArray, NSError, NSString, NSURL};
+#[cfg(test)]
 use screencapturekit::shareable_content::SCShareableContent;
 
 use crate::application::{ApplicationBackend, NativeSurface};
@@ -116,9 +117,40 @@ impl Bounds {
 #[derive(Clone)]
 struct Window {
     cg_id: u32,
+    ax_identity: Option<AxIdentity>,
     resumable_from: Option<u32>,
     bounds: Bounds,
     surface: NativeSurface,
+}
+
+#[derive(Debug)]
+struct AxIdentity(*const c_void);
+
+// This retained identity is only compared with CFEqual, never queried or
+// mutated across workers. Live attributes always come from fresh AX elements.
+unsafe impl Send for AxIdentity {}
+unsafe impl Sync for AxIdentity {}
+
+impl AxIdentity {
+    fn new(element: &Ax) -> Self {
+        Self(unsafe { CFRetain(element.0) })
+    }
+
+    fn matches(&self, element: &Ax) -> bool {
+        unsafe { CFEqual(self.0, element.0) }
+    }
+}
+
+impl Clone for AxIdentity {
+    fn clone(&self) -> Self {
+        Self(unsafe { CFRetain(self.0) })
+    }
+}
+
+impl Drop for AxIdentity {
+    fn drop(&mut self) {
+        unsafe { CFRelease(self.0) }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -291,26 +323,57 @@ impl MacApplication {
 }
 
 fn validate_window(identity: &Identity, window: &Window, focus: bool) -> anyhow::Result<Ax> {
+    let started = Instant::now();
     identity.check()?;
+    let identity_time = started.elapsed();
     let (pid, bounds) = live_window(window.cg_id)?;
     anyhow::ensure!(
         pid == identity.pid && window.bounds == bounds,
         "surface disappeared or moved"
     );
+    let geometry_time = started.elapsed();
     let app = Ax::application(identity.pid)?;
-    let mut candidates = app.window_tree()?;
-    let mut matching = candidates
-        .iter()
-        .enumerate()
-        .filter(|(_, (w, _))| w.bounds().is_ok_and(|b| b.matches(window.bounds)));
-    let (index, (element, _)) = matching
-        .next()
+    let expected = window
+        .ax_identity
+        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("surface AX identity unavailable"))?;
-    anyhow::ensure!(matching.next().is_none(), "ambiguous AX surface identity");
+    let mut roots = app.children("AXWindows")?;
+    let roots_time = started.elapsed();
+    let element = if focus {
+        let mut current = app.attribute("AXFocusedUIElement")?;
+        let mut remaining = 32;
+        loop {
+            let role = current.string("AXRole")?;
+            if role == "AXWindow" || role == "AXSheet" {
+                anyhow::ensure!(
+                    expected.matches(&current),
+                    "surface is modal-blocked or lost focus"
+                );
+                break current;
+            }
+            remaining -= 1;
+            anyhow::ensure!(remaining > 0, "focused AX ancestry exceeds bound");
+            current = current.attribute("AXParent")?;
+        }
+    } else if let Some(index) = roots.iter().position(|root| expected.matches(root)) {
+        roots.swap_remove(index)
+    } else {
+        app.window_tree()?
+            .into_iter()
+            .find(|(element, _)| expected.matches(element))
+            .map(|(element, _)| element)
+            .ok_or_else(|| anyhow::anyhow!("surface AX identity unavailable"))?
+    };
+    anyhow::ensure!(
+        element.bounds()?.matches(bounds),
+        "surface AX geometry changed"
+    );
+    let target_time = started.elapsed();
     anyhow::ensure!(
         element.owns_content(identity.pid)?,
         "surface content belongs to another process"
     );
+    let content_time = started.elapsed();
     if focus {
         anyhow::ensure!(
             !element.boolean("AXMinimized").unwrap_or(false),
@@ -322,45 +385,49 @@ fn validate_window(identity: &Identity, window: &Window, focus: bool) -> anyhow:
         );
         // AXFocusedWindow commonly remains the document while its sheet owns
         // keyboard focus. Never send process-directed keys through that parent.
-        let children = element.children("AXChildren")?;
-        let mut modal_blocked = false;
-        for child in children {
-            modal_blocked |= child.string("AXRole")? == "AXSheet";
-        }
-        let mut modal_scope = BTreeSet::new();
-        let mut ancestor = Some(index);
-        while let Some(current) = ancestor {
-            anyhow::ensure!(modal_scope.insert(current), "cyclic AX modal ancestry");
-            ancestor = candidates[current].1;
-        }
-        for (candidate_index, (candidate, parent)) in candidates.iter().enumerate() {
-            if parent.is_none()
-                && !modal_scope.contains(&candidate_index)
-                && candidate.boolean("AXModal")?
-            {
+        let mut modal_blocked = !element.sheets(true)?.is_empty();
+        let root_index = if let Some(index) = roots
+            .iter()
+            .position(|root| unsafe { CFEqual(root.0, element.0) })
+        {
+            index
+        } else {
+            let mut parent = element.attribute("AXParent")?;
+            let mut remaining = 32;
+            loop {
+                if let Some(index) = roots
+                    .iter()
+                    .position(|root| unsafe { CFEqual(root.0, parent.0) })
+                {
+                    break index;
+                }
+                remaining -= 1;
+                anyhow::ensure!(remaining > 0, "surface has no live AX root");
+                parent = parent.attribute("AXParent")?;
+            }
+        };
+        for (index, candidate) in roots.iter().enumerate() {
+            if index != root_index && candidate.boolean("AXModal")? {
                 modal_blocked = true;
             }
         }
-        let mut nearest = None;
-        let mut focused_element = Some(app.attribute("AXFocusedUIElement")?);
-        for depth in 0..32 {
-            let Some(current) = focused_element else {
-                break;
-            };
-            let role = current.string("AXRole")?;
-            if role == "AXWindow" || role == "AXSheet" {
-                nearest = Some(unsafe { CFEqual(current.0, element.0) });
-                break;
-            }
-            anyhow::ensure!(depth < 31, "focused AX ancestry exceeds bound");
-            focused_element = Some(current.attribute("AXParent")?);
-        }
         anyhow::ensure!(
-            focus_matches_surface(modal_blocked, nearest),
+            focus_matches_surface(modal_blocked, Some(true)),
             "surface is modal-blocked or lost focus"
         );
     }
-    Ok(candidates.swap_remove(index).0)
+    if started.elapsed() >= Duration::from_millis(100) {
+        tracing::info!(
+            identity_ms = identity_time.as_millis(),
+            geometry_ms = (geometry_time - identity_time).as_millis(),
+            roots_ms = (roots_time - geometry_time).as_millis(),
+            target_ms = (target_time - roots_time).as_millis(),
+            content_ms = (content_time - target_time).as_millis(),
+            focus_ms = (started.elapsed() - content_time).as_millis(),
+            "native window validation was slow"
+        );
+    }
+    Ok(element)
 }
 
 fn focus_matches_surface(modal_blocked: bool, nearest_surface_matches: Option<bool>) -> bool {
@@ -368,12 +435,24 @@ fn focus_matches_surface(modal_blocked: bool, nearest_surface_matches: Option<bo
 }
 
 fn live_window(id: u32) -> anyhow::Result<(i32, Bounds)> {
-    let windows = Ax(unsafe { CGWindowListCopyWindowInfo(8, id) });
-    anyhow::ensure!(
-        !windows.0.is_null() && unsafe { CFArrayGetCount(windows.0) } == 1,
-        "surface unavailable"
-    );
-    let info = unsafe { CFArrayGetValueAtIndex(windows.0, 0) };
+    let windows = cg_window_list()?;
+    for index in 0..unsafe { CFArrayGetCount(windows.0) } {
+        let info = unsafe { CFArrayGetValueAtIndex(windows.0, index) };
+        anyhow::ensure!(!info.is_null(), "invalid window metadata");
+        let number = unsafe { CFDictionaryGetValue(info, kCGWindowNumber) };
+        let mut candidate = 0i64;
+        if !number.is_null()
+            && unsafe { CFNumberGetValue(number, 4, (&mut candidate as *mut i64).cast()) }
+            && candidate == i64::from(id)
+        {
+            return cg_window_geometry(info);
+        }
+    }
+    anyhow::bail!("surface unavailable")
+}
+
+fn cg_window_geometry(info: *const c_void) -> anyhow::Result<(i32, Bounds)> {
+    anyhow::ensure!(!info.is_null(), "surface metadata unavailable");
     let owner = unsafe { CFDictionaryGetValue(info, kCGWindowOwnerPID) };
     let geometry = unsafe { CFDictionaryGetValue(info, kCGWindowBounds) };
     anyhow::ensure!(
@@ -398,6 +477,51 @@ fn live_window(id: u32) -> anyhow::Result<(i32, Bounds)> {
             height: rectangle[3],
         },
     ))
+}
+
+fn cg_window_list() -> anyhow::Result<Ax> {
+    // WindowServer metadata is cheap and fresh; SCShareableContent may block
+    // for seconds. Only actual capture creation needs SCK window objects.
+    let windows = Ax(unsafe { CGWindowListCopyWindowInfo(0, 0) });
+    anyhow::ensure!(
+        !windows.0.is_null() && unsafe { CFGetTypeID(windows.0) == CFArrayGetTypeID() },
+        "surface enumeration unavailable"
+    );
+    let count = unsafe { CFArrayGetCount(windows.0) };
+    anyhow::ensure!(
+        (0..=16384).contains(&count),
+        "window enumeration exceeds bound"
+    );
+    Ok(windows)
+}
+
+fn application_windows(owner_pid: i32) -> anyhow::Result<Vec<(u32, Bounds)>> {
+    let windows = cg_window_list()?;
+    let count = unsafe { CFArrayGetCount(windows.0) };
+    let mut owned = Vec::new();
+    for index in 0..count {
+        let info = unsafe { CFArrayGetValueAtIndex(windows.0, index) };
+        anyhow::ensure!(!info.is_null(), "invalid window metadata");
+        let owner = unsafe { CFDictionaryGetValue(info, kCGWindowOwnerPID) };
+        let mut pid = 0i32;
+        if owner.is_null()
+            || !unsafe { CFNumberGetValue(owner, 3, (&mut pid as *mut i32).cast()) }
+            || pid != owner_pid
+        {
+            continue;
+        }
+        let number = unsafe { CFDictionaryGetValue(info, kCGWindowNumber) };
+        let mut id = 0i64;
+        anyhow::ensure!(
+            !number.is_null()
+                && unsafe { CFNumberGetValue(number, 4, (&mut id as *mut i64).cast()) }
+                && id > 0,
+            "owned window number unavailable"
+        );
+        let (_, bounds) = cg_window_geometry(info)?;
+        owned.push((u32::try_from(id)?, bounds));
+    }
+    Ok(owned)
 }
 
 impl ApplicationBackend for MacApplication {
@@ -427,41 +551,34 @@ impl ApplicationBackend for MacApplication {
             self.unavailable.clear();
             return Ok(Vec::new());
         }
+        let started = Instant::now();
         self.identity.check()?;
-        let content =
-            SCShareableContent::get().map_err(|_| anyhow::anyhow!("surface enumeration failed"))?;
+        let windows = application_windows(self.identity.pid)?;
+        let cg_elapsed = started.elapsed();
         let app = Ax::application(self.identity.pid)?;
         let tree = match app.window_tree() {
             Ok(tree) => tree,
             Err(error) => return self.ax_not_ready(error),
         };
+        // Reuse only within this snapshot, never as cross-refresh authority.
+        let ax_bounds: Vec<_> = tree.iter().map(|(ax, _)| ax.bounds().ok()).collect();
+        let ax_elapsed = started.elapsed() - cg_elapsed;
         let mut current = BTreeMap::new();
         let previously_unavailable = std::mem::take(&mut self.unavailable);
         let mut ax_to_native = Vec::new();
         let mut parents = Vec::new();
         let mut rejected = BTreeSet::new();
-        for window in content.windows().iter().filter(|w| {
-            w.owning_application()
-                .is_some_and(|app| app.process_id() == self.identity.pid)
-        }) {
-            let cg_id = window.window_id();
+        for (cg_id, bounds) in windows {
             if self.retired.contains(&cg_id) {
                 continue;
             }
-            let frame = window.frame();
-            let bounds = Bounds {
-                x: frame.origin.x,
-                y: frame.origin.y,
-                width: frame.size.width,
-                height: frame.size.height,
-            };
             if !bounds.valid() {
                 continue;
             }
             let mut matching = tree
                 .iter()
                 .enumerate()
-                .filter(|(_, (ax, _))| ax.bounds().is_ok_and(|b| b.matches(bounds)));
+                .filter(|(index, _)| ax_bounds[*index].is_some_and(|b| b.matches(bounds)));
             let Some((ax_index, (element, parent))) = matching.next() else {
                 continue;
             };
@@ -505,6 +622,10 @@ impl ApplicationBackend for MacApplication {
             let resumable_from = previous
                 .filter(|old| {
                     old.bounds == bounds
+                        && old
+                            .ax_identity
+                            .as_ref()
+                            .is_some_and(|identity| identity.matches(element))
                         && old.surface.minimized == minimized
                         && previously_unavailable.contains(&old.surface.native_id)
                 })
@@ -512,6 +633,10 @@ impl ApplicationBackend for MacApplication {
             let generation = match previous {
                 Some(old)
                     if old.bounds == bounds
+                        && old
+                            .ax_identity
+                            .as_ref()
+                            .is_some_and(|identity| identity.matches(element))
                         && old.surface.minimized == minimized
                         && resumable_from.is_none() =>
                 {
@@ -531,7 +656,7 @@ impl ApplicationBackend for MacApplication {
             let surface = NativeSurface {
                 native_id,
                 parent: None,
-                title: window.title().unwrap_or_default(),
+                title: element.string("AXTitle").unwrap_or_default(),
                 width,
                 height,
                 scale: 1.0,
@@ -543,6 +668,7 @@ impl ApplicationBackend for MacApplication {
                 native_id,
                 Window {
                     cg_id,
+                    ax_identity: Some(AxIdentity::new(element)),
                     resumable_from,
                     bounds,
                     surface,
@@ -573,14 +699,18 @@ impl ApplicationBackend for MacApplication {
                     self.retired.insert(old.cg_id);
                     continue;
                 }
-                // AX and SCK are independent snapshots. During a resize or
+                // AX and WindowServer are independent snapshots. During a resize or
                 // minimize they can disagree briefly; only a vanished native
                 // handle retires the session ID. Input still checks live bounds.
                 if live_window(old.cg_id).is_ok_and(|(pid, _)| pid == self.identity.pid) {
                     let mut preserved = old.clone();
                     let candidates: Vec<_> = tree
                         .iter()
-                        .filter(|(ax, _)| ax.bounds().is_ok_and(|b| b.matches(old.bounds)))
+                        .enumerate()
+                        .filter(|(index, _)| {
+                            ax_bounds[*index].is_some_and(|b| b.matches(old.bounds))
+                        })
+                        .map(|(_, candidate)| candidate)
                         .collect();
                     if candidates.len() == 1 {
                         if let Ok(minimized) = candidates[0].0.boolean("AXMinimized") {
@@ -639,6 +769,14 @@ impl ApplicationBackend for MacApplication {
         {
             self.release_input();
         }
+        if started.elapsed() >= Duration::from_millis(100) {
+            tracing::info!(
+                cg_ms = cg_elapsed.as_millis(),
+                ax_ms = ax_elapsed.as_millis(),
+                total_ms = started.elapsed().as_millis(),
+                "native application metadata snapshot was slow"
+            );
+        }
         Ok(self.windows.values().map(|w| w.surface.clone()).collect())
     }
 
@@ -649,6 +787,7 @@ impl ApplicationBackend for MacApplication {
             .ok_or_else(|| anyhow::anyhow!("unknown application surface"))?;
         anyhow::ensure!(!window.surface.minimized, "surface is minimized");
         validate_window(&self.identity, window, false)?;
+        input::prepare_window_events(window.cg_id);
         Ok(Box::new(capture::MacVideo::window(
             window.cg_id,
             self.identity.pid,
@@ -656,8 +795,13 @@ impl ApplicationBackend for MacApplication {
     }
 
     fn input(&mut self, native_id: u64, generation: u32, event: &InputEvent) -> anyhow::Result<()> {
+        let started = Instant::now();
+        let mut validation = Duration::ZERO;
+        let mut setup = Duration::ZERO;
         let result = (|| {
-            let (window, _) = self.checked_window(native_id, generation, true)?;
+            let checked = self.checked_window(native_id, generation, true);
+            validation = started.elapsed();
+            let (window, _) = checked?;
             if self
                 .input
                 .as_ref()
@@ -678,12 +822,22 @@ impl ApplicationBackend for MacApplication {
                 )?;
                 self.input = Some((native_id, generation, injector));
             }
+            setup = started.elapsed() - validation;
             self.input
                 .as_ref()
                 .expect("scoped injector")
                 .2
                 .inject(event)
         })();
+        if started.elapsed() >= Duration::from_millis(100) {
+            tracing::info!(
+                kind = ?event.kind, validation_ms = validation.as_millis(),
+                setup_ms = setup.as_millis(),
+                post_ms = (started.elapsed() - validation - setup).as_millis(),
+                error = ?result.as_ref().err().map(ToString::to_string),
+                "scoped native input dispatch was slow"
+            );
+        }
         if matches!(
             event.kind,
             ndp_proto::InputKind::MouseDown | ndp_proto::InputKind::MouseUp
@@ -704,10 +858,16 @@ impl ApplicationBackend for MacApplication {
     }
 
     fn operate(&mut self, native_id: u64, command: &ApplicationMessage) -> anyhow::Result<()> {
+        let started = Instant::now();
         let (_, generation) = command
             .command_target()
             .ok_or_else(|| anyhow::anyhow!("not an application command"))?;
         self.release_input();
+        if matches!(command, ApplicationMessage::Focus { .. })
+            && self.checked_window(native_id, generation, true).is_ok()
+        {
+            return Ok(());
+        }
         let (_, element) = self.checked_window(native_id, generation, false)?;
         match command {
             ApplicationMessage::Focus { .. } => {
@@ -718,14 +878,23 @@ impl ApplicationBackend for MacApplication {
                     self.identity.pid,
                 )
                 .ok_or_else(|| anyhow::anyhow!("owned application exited"))?;
-                #[allow(deprecated)]
-                let activated = app
-                    .activateWithOptions(NSApplicationActivationOptions::ActivateIgnoringOtherApps);
-                anyhow::ensure!(activated, "application activation failed");
+                if !Ax::application(self.identity.pid)?.boolean("AXFrontmost")? {
+                    #[allow(deprecated)]
+                    let activated = app.activateWithOptions(
+                        NSApplicationActivationOptions::ActivateIgnoringOtherApps,
+                    );
+                    anyhow::ensure!(activated, "application activation failed");
+                }
                 element.perform("AXRaise")?;
                 // Sheets need not expose AXMain. Raising the exact AX element
                 // is the native focus operation; input verifies the result.
                 let _ = element.set_boolean("AXMain", true);
+                if started.elapsed() >= Duration::from_millis(100) {
+                    tracing::info!(
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "scoped native focus was slow"
+                    );
+                }
             }
             ApplicationMessage::Resize { width, height, .. } => {
                 anyhow::ensure!(
@@ -781,6 +950,13 @@ impl Ax {
         if root_pid != owner_pid {
             return Ok(false);
         }
+        // A standard window's close button is a direct native ownership
+        // witness, avoiding an editor's dynamically changing content subtree.
+        if let Ok(button) = self.attribute("AXCloseButton") {
+            if self.owns_child(&button, owner_pid)? {
+                return Ok(true);
+            }
+        }
         let children = match self.children("AXChildren") {
             Ok(children) => children,
             Err(error)
@@ -795,21 +971,9 @@ impl Ax {
         let mut content = Vec::new();
         for child in &children {
             let child_pid = child.process_id()?;
-            let mut associated = false;
-            for name in ["AXWindow", "AXTopLevelUIElement"] {
-                match child.attribute(name) {
-                    Ok(window) => associated |= unsafe { CFEqual(window.0, self.0) },
-                    Err(error)
-                        if error
-                            .downcast_ref::<AxAttributeError>()
-                            .is_some_and(|error| matches!(error.status, -25205 | -25212)) => {}
-                    Err(error) => return Err(error),
-                }
-                // Eligibility requires one app-owned forward association, not
-                // an exhaustive walk of every dynamically changing control.
-                if child_pid == owner_pid && associated {
-                    return Ok(true);
-                }
+            let associated = self.owns_child(child, owner_pid)?;
+            if associated {
+                return Ok(true);
             }
             content.push((child_pid, associated));
         }
@@ -852,6 +1016,24 @@ impl Ax {
             &content,
             activation_owned,
         ))
+    }
+
+    fn owns_child(&self, child: &Ax, owner_pid: i32) -> anyhow::Result<bool> {
+        if child.process_id()? != owner_pid {
+            return Ok(false);
+        }
+        for name in ["AXWindow", "AXTopLevelUIElement"] {
+            match child.attribute(name) {
+                Ok(window) if unsafe { CFEqual(window.0, self.0) } => return Ok(true),
+                Ok(_) => {}
+                Err(error)
+                    if error
+                        .downcast_ref::<AxAttributeError>()
+                        .is_some_and(|error| matches!(error.status, -25205 | -25212)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
     }
 
     fn application(pid: i32) -> anyhow::Result<Self> {
@@ -913,23 +1095,63 @@ impl Ax {
         let mut index = 0;
         while index < windows.len() {
             anyhow::ensure!(windows.len() <= 64, "AX window hierarchy exceeds bound");
-            let children = windows[index].0.children("AXChildren").unwrap_or_default();
-            for child in children {
-                if child.string("AXRole").is_ok_and(|role| role == "AXSheet") {
-                    if let Some(existing) = windows
-                        .iter()
-                        .position(|(existing, _)| unsafe { CFEqual(existing.0, child.0) })
-                    {
-                        anyhow::ensure!(existing != index, "cyclic AX sheet relationship");
-                        windows[existing].1 = Some(index);
-                    } else {
-                        windows.push((child, Some(index)));
-                    }
+            for child in windows[index].0.sheets(false)? {
+                if let Some(existing) = windows
+                    .iter()
+                    .position(|(existing, _)| unsafe { CFEqual(existing.0, child.0) })
+                {
+                    anyhow::ensure!(existing != index, "cyclic AX sheet relationship");
+                    windows[existing].1 = Some(index);
+                } else {
+                    windows.push((child, Some(index)));
                 }
             }
             index += 1;
         }
         Ok(windows)
+    }
+
+    fn sheets(&self, strict: bool) -> anyhow::Result<Vec<Self>> {
+        match self.children("AXSheets") {
+            Ok(sheets) => Ok(sheets),
+            Err(error)
+                if error
+                    .downcast_ref::<AxAttributeError>()
+                    .is_some_and(|error| error.status == -25212) =>
+            {
+                // This optional collection has no value when no sheet is
+                // attached. CannotComplete/InvalidUIElement still fail closed.
+                Ok(Vec::new())
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<AxAttributeError>()
+                    .is_some_and(|error| error.status == -25205) =>
+            {
+                // Older/custom AX implementations may expose sheets only via
+                // children. Standard windows need no per-control role RPCs.
+                let mut sheets = Vec::new();
+                let children = self.children("AXChildren");
+                let children = if strict {
+                    children?
+                } else {
+                    children.unwrap_or_default()
+                };
+                for child in children {
+                    let role = child.string("AXRole");
+                    let is_sheet = if strict {
+                        role? == "AXSheet"
+                    } else {
+                        role.is_ok_and(|role| role == "AXSheet")
+                    };
+                    if is_sheet {
+                        sheets.push(child);
+                    }
+                }
+                Ok(sheets)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn string(&self, name: &str) -> anyhow::Result<String> {
@@ -1105,6 +1327,7 @@ extern "C" {
         rectangle: *mut c_void,
     ) -> bool;
     static kCGWindowOwnerPID: *const c_void;
+    static kCGWindowNumber: *const c_void;
     static kCGWindowBounds: *const c_void;
 }
 
@@ -1240,6 +1463,7 @@ mod tests {
             42,
             Window {
                 cg_id: 100,
+                ax_identity: None,
                 resumable_from: None,
                 bounds: Bounds {
                     x: 10.0,
