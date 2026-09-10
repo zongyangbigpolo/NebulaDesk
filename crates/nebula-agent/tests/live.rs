@@ -897,6 +897,8 @@ mod native_app {
         registry: SurfaceRegistry,
         live: BTreeSet<u8>,
         removed: BTreeSet<u8>,
+        expected_surface_count: usize,
+        live_surface_limit: usize,
         media: BTreeMap<u8, Media>,
         unavailable: BTreeSet<u8>,
         minimize_target: Option<u8>,
@@ -917,6 +919,8 @@ mod native_app {
                 registry: SurfaceRegistry::new(MAX_APPLICATION_SURFACES).unwrap(),
                 live: BTreeSet::new(),
                 removed: BTreeSet::new(),
+                expected_surface_count: 2,
+                live_surface_limit: 2,
                 media: BTreeMap::new(),
                 unavailable: BTreeSet::new(),
                 minimize_target: None,
@@ -1059,8 +1063,9 @@ mod native_app {
                                 self.recovering.insert(id, tokio::time::Instant::now());
                             }
                             assert!(
-                                self.live.len() + self.removed.len() <= 2,
-                                "the two-document fixture exposed an extra native surface; \
+                                self.live.len() <= self.live_surface_limit
+                                    && self.live.len() + self.removed.len() <= self.expected_surface_count,
+                                "the fixture exposed a native surface outside the explicitly expected document count; \
                                  do not hide capture-status/AX widgets with title filtering"
                             );
                             if !minimized {
@@ -1106,7 +1111,11 @@ mod native_app {
                             assert_eq!(message.header.kind, MsgKind::Bye);
                             assert_eq!(reason, ByeReason::UserClosed);
                             assert!(self.ready && self.live.is_empty());
-                            assert_eq!(self.removed.len(), 2, "Bye must follow both removes");
+                            assert_eq!(
+                                self.removed.len(),
+                                self.expected_surface_count,
+                                "Bye must follow every expected document remove"
+                            );
                             self.bye = true;
                         }
                         other => panic!("unexpected native APP control: {other:?}"),
@@ -1625,6 +1634,200 @@ mod native_app {
         (fixture, selected, sibling)
     }
 
+    async fn late_document(
+        probe: &mut Probe,
+        client: &Session,
+        incoming: &mut SessionReceiver,
+        fixture: &Fixture,
+        originals: [u8; 2],
+    ) {
+        probe.stage("late New Document / scoped Cmd+N");
+        let before = fixture
+            .wait(
+                probe,
+                client,
+                incoming,
+                "two original clean documents",
+                |status| {
+                    status.windows.len() == 2
+                        && status
+                            .windows
+                            .iter()
+                            .all(|window| !window.dirty && !window.miniaturized)
+                },
+            )
+            .await;
+        let metadata = originals.map(|id| probe.surface(id));
+        let counts = originals.map(|id| probe.total_pictures(id));
+        let unchanged_originals = |probe: &Probe| {
+            for (index, id) in originals.iter().enumerate() {
+                assert!(
+                    probe.live.contains(id),
+                    "late document operation removed an original"
+                );
+                let mut current = probe.surface(*id);
+                assert!(current.geometry_generation >= metadata[index].geometry_generation);
+                current.geometry_generation = metadata[index].geometry_generation;
+                assert_eq!(
+                    current, metadata[index],
+                    "late document operation changed original geometry/title/ID"
+                );
+            }
+        };
+        probe
+            .send(
+                client,
+                ControlMessage::Application(App::Focus {
+                    surface_id: originals[0],
+                    geometry_generation: probe.surface(originals[0]).geometry_generation,
+                }),
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(probe.live.len(), 2);
+        assert!(probe.removed.is_empty());
+        // Only this explicit request permits one additional native surface.
+        // Cmd+N invokes the fixture's existing key equivalent, not APP global menus.
+        probe.expected_surface_count = 3;
+        probe.live_surface_limit = 3;
+        let started = TimingMark::now();
+        probe
+            .input(
+                client,
+                originals[0],
+                InputEvent::key(InputKind::KeyDown, KeyCode(0x11), Modifiers::META),
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        probe
+            .input(
+                client,
+                originals[0],
+                InputEvent::key(InputKind::KeyUp, KeyCode(0x11), Modifiers::NONE),
+            )
+            .await;
+        let last_send = TimingMark::now();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (new_surface, new_document) = tokio::time::timeout(Duration::from_secs(25), async {
+            loop {
+                probe.receive(client, incoming).await;
+                unchanged_originals(probe);
+                assert!(probe.removed.is_empty());
+                let Some(status) = fixture.read() else { continue; };
+                assert!((2..=3).contains(&status.windows.len()), "Cmd+N must create exactly one real document");
+                for original in &before.windows {
+                    let current = status.window(&original.id);
+                    assert_eq!(current.window_number, original.window_number);
+                    assert_eq!(current.text, original.text);
+                    assert_eq!(current.dirty, original.dirty);
+                }
+                if status.windows.len() != 3 || probe.live.len() != 3 { continue; }
+                let added: Vec<_> = status.windows.iter().filter(|window|
+                    !before.windows.iter().any(|old| old.id == window.id)
+                ).collect();
+                assert_eq!(added.len(), 1);
+                assert!(!added[0].dirty && !added[0].miniaturized);
+                assert!(before.windows.iter().all(|old| old.window_number != added[0].window_number));
+                let new_surface = *probe.live.iter().find(|id| !originals.contains(id)).unwrap();
+                assert_eq!(probe.surface(new_surface).title, added[0].title,
+                    "the third surface must be the new fixture document, not an OS helper");
+                if probe.pictures(new_surface) >= 5 {
+                    return (new_surface, added[0].id.clone());
+                }
+            }
+        }).await.expect("scoped Cmd+N must create a real third window with a distinct independently decoded surface");
+        timing(
+            "late_document_created_and_decoded",
+            started,
+            Some(last_send),
+            2 * 30,
+        );
+        assert!(probe.media[&new_surface].received_sequences.contains(&0));
+        for id in originals {
+            assert_ne!(
+                probe.media[&new_surface].picture_hash,
+                probe.media[&id].picture_hash
+            );
+        }
+        probe.stage("three actual documents independently stream");
+        let new_count = probe.total_pictures(new_surface);
+        let steady = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < steady || !probe.recovering.is_empty() {
+            probe.receive(client, incoming).await;
+            unchanged_originals(probe);
+            assert_eq!(
+                probe.live,
+                BTreeSet::from([originals[0], originals[1], new_surface])
+            );
+            assert!(probe.removed.is_empty());
+        }
+        assert!(
+            probe.total_pictures(new_surface) >= new_count + 5 && probe.pictures(new_surface) >= 5
+        );
+        for (index, id) in originals.iter().enumerate() {
+            assert!(probe.total_pictures(*id) >= counts[index] + 5 && probe.pictures(*id) >= 5);
+        }
+        eprintln!("fixture PID {}: late document {} -> new surface {}, originals {:?} still stream unchanged",
+            fixture.pid, new_document, new_surface, originals);
+
+        probe.stage("close only late document / retain original two");
+        let close_started = TimingMark::now();
+        probe
+            .send(
+                client,
+                ControlMessage::Application(App::Close {
+                    surface_id: new_surface,
+                    geometry_generation: probe.surface(new_surface).geometry_generation,
+                }),
+            )
+            .await;
+        let close_sent = TimingMark::now();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                probe.receive(client, incoming).await;
+                unchanged_originals(probe);
+                if let Some(status) = fixture.read() {
+                    if probe.removed.contains(&new_surface)
+                        && status.windows.len() == 2
+                        && !status
+                            .windows
+                            .iter()
+                            .any(|window| window.id == new_document)
+                    {
+                        for original in &before.windows {
+                            status.window(&original.id);
+                        }
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("normal Close must retire only the new surface and real third window");
+        timing(
+            "late_document_close_evidence",
+            close_started,
+            Some(close_sent),
+            0,
+        );
+        probe.live_surface_limit = 2;
+        assert_eq!(probe.removed, BTreeSet::from([new_surface]));
+        let counts = originals.map(|id| probe.total_pictures(id));
+        let steady = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < steady || !probe.recovering.is_empty() {
+            probe.receive(client, incoming).await;
+            unchanged_originals(probe);
+            assert_eq!(probe.live, BTreeSet::from(originals));
+            assert_eq!(probe.removed, BTreeSet::from([new_surface]));
+            assert!(!probe.bye);
+        }
+        for (index, id) in originals.iter().enumerate() {
+            assert!(probe.total_pictures(*id) >= counts[index] + 5 && probe.pictures(*id) >= 5);
+        }
+        eprintln!("fixture PID {}: retired only late surface {}; original surfaces {:?} continue decoding",
+            fixture.pid, new_surface, originals);
+    }
+
     // Raw protocol/media assertions complement, not replace, native Client
     // screenshot acceptance. Reset through actual scoped input leaves both
     // documents clean so normal Close requires no save-sheet interaction.
@@ -1703,6 +1906,7 @@ mod native_app {
 
         let (fixture, selected_document, sibling_document) =
             scoped_input(&mut probe, client, incoming, fixture_start, first, second).await;
+        late_document(&mut probe, client, incoming, &fixture, [first, second]).await;
 
         probe.stage("post-input recovery before resize");
         tokio::time::timeout(Duration::from_secs(25), async {
@@ -1760,6 +1964,7 @@ mod native_app {
         // a separate Restore command or per-command capability bit.
         probe.stage("Minimize first document / real NSWindow.isMiniaturized");
         let before_minimize = [probe.surface(first), probe.surface(second)];
+        let previously_removed = probe.removed.clone();
         let minimize_started = TimingMark::now();
         probe.minimize_target = Some(first);
         probe
@@ -1777,7 +1982,7 @@ mod native_app {
                 probe.receive(client, incoming).await;
                 assert_eq!(probe.live, BTreeSet::from([first, second]));
                 assert!(
-                    probe.removed.is_empty(),
+                    probe.removed == previously_removed,
                     "Minimize must not retire either surface ID"
                 );
                 if let Some(status) = fixture.read() {
@@ -1805,7 +2010,7 @@ mod native_app {
         while tokio::time::Instant::now() < steady {
             probe.receive(client, incoming).await;
             assert_eq!(probe.live, BTreeSet::from([first, second]));
-            assert!(probe.removed.is_empty());
+            assert_eq!(probe.removed, previously_removed);
             assert!(probe.surface(first).minimized && !probe.surface(second).minimized);
         }
         assert_eq!(
@@ -1844,7 +2049,7 @@ mod native_app {
                 probe.receive(client, incoming).await;
                 assert_eq!(probe.live, BTreeSet::from([first, second]));
                 assert!(
-                    probe.removed.is_empty(),
+                    probe.removed == previously_removed,
                     "Focus must restore, not replace, the minimized surface"
                 );
                 if let Some(status) = fixture.read() {
