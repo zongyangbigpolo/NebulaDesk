@@ -675,6 +675,7 @@ mod native_app {
         pid: u32,
         key_down_codes: Vec<u16>,
         key_up_codes: Vec<u16>,
+        mouse_events: Vec<FixtureMouseEvent>,
         windows: Vec<FixtureWindow>,
     }
 
@@ -682,16 +683,56 @@ mod native_app {
     struct FixtureWindow {
         id: Value,
         title: String,
+        window_number: i64,
         dirty: bool,
         text: String,
         reset_presses: u64,
-        reset_button: ResetButton,
+        reset_button: FixturePoint,
+        scroll_offset: f64,
+        scroll_target: FixturePoint,
+        slider_value: f64,
+        slider_drag: FixtureDrag,
+    }
+
+    #[derive(Clone, Copy, serde::Deserialize)]
+    struct FixturePoint {
+        x: f32,
+        y: f32,
+    }
+
+    impl FixturePoint {
+        fn pointer(self, kind: InputKind, button: MouseButton) -> InputEvent {
+            assert!(
+                self.x.is_finite()
+                    && self.y.is_finite()
+                    && (0.0..=1.0).contains(&self.x)
+                    && (0.0..=1.0).contains(&self.y)
+            );
+            let mut event = InputEvent::mouse_move(self.x, self.y, Modifiers::NONE);
+            event.kind = kind;
+            event.button = button;
+            event
+        }
     }
 
     #[derive(serde::Deserialize)]
-    struct ResetButton {
-        x: f32,
-        y: f32,
+    struct FixtureDrag {
+        start: FixturePoint,
+        end: FixturePoint,
+        end_in_window: FixturePoint,
+        expected_value: f64,
+        value_tolerance: f64,
+        point_tolerance: f64,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct FixtureMouseEvent {
+        #[serde(rename = "type")]
+        kind: u32,
+        document_id: Option<Value>,
+        window_number: i64,
+        local_x: f64,
+        local_y: f64,
     }
 
     impl FixtureStatus {
@@ -799,6 +840,7 @@ mod native_app {
                 serde_json::from_slice(&std::fs::read(&self.path).ok()?).ok()?;
             assert_eq!(status.pid, self.pid, "filename PID must match fixture JSON");
             assert!(status.key_down_codes.len() <= 128 && status.key_up_codes.len() <= 128);
+            assert!(status.mouse_events.len() <= 32);
             Some(status)
         }
 
@@ -1379,8 +1421,178 @@ mod native_app {
             reset.window(&sibling).reset_presses,
             before.window(&sibling).reset_presses
         );
+
+        probe.stage("scoped wheel changes actual scroll-view content offset");
+        let wheel_started = TimingMark::now();
+        let mut last_wheel_send = wheel_started;
+        let scroll_before = reset.window(&selected).scroll_offset;
+        assert!(scroll_before.is_finite());
+        let target = reset.window(&selected).scroll_target;
+        for kind in [InputKind::MouseMove, InputKind::Wheel] {
+            let mut event = target.pointer(kind, MouseButton::None);
+            if kind == InputKind::Wheel {
+                event.scroll_y = -6.0;
+            }
+            probe.input(client, first, event).await;
+            last_wheel_send = TimingMark::now();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let scrolled = fixture
+            .wait(
+                probe,
+                client,
+                incoming,
+                "actual scroll-view content offset change",
+                |status| {
+                    let offset = status.window(&selected).scroll_offset;
+                    offset.is_finite() && offset >= 0.0 && offset != scroll_before
+                },
+            )
+            .await;
+        timing(
+            "wheel_scroll_evidence",
+            wheel_started,
+            Some(last_wheel_send),
+            2 * 50,
+        );
+        assert_eq!(
+            scrolled.window(&sibling).scroll_offset,
+            reset.window(&sibling).scroll_offset
+        );
+        assert_eq!(
+            scrolled.window(&sibling).slider_value,
+            reset.window(&sibling).slider_value
+        );
+        assert_eq!(
+            scrolled.window(&selected).slider_value,
+            reset.window(&selected).slider_value
+        );
         eprintln!(
-            "fixture PID {} confirmed scoped native key down/up [0, 11, 8] and Reset click",
+            "fixture PID {}: scroll offset {} -> {}",
+            fixture.pid,
+            scroll_before,
+            scrolled.window(&selected).scroll_offset
+        );
+
+        probe.stage("scoped held-left-button drag changes actual slider value");
+        let drag_started = TimingMark::now();
+        let slider_before = scrolled.window(&selected).slider_value;
+        assert!(slider_before.is_finite() && (0.0..=1.0).contains(&slider_before));
+        let points = &scrolled.window(&selected).slider_drag;
+        assert!(points.expected_value.is_finite() && (0.0..=1.0).contains(&points.expected_value));
+        assert!(
+            points.value_tolerance.is_finite()
+                && points.value_tolerance > 0.0
+                && points.value_tolerance < (points.expected_value - slider_before).abs()
+        );
+        assert!(points.point_tolerance.is_finite() && points.point_tolerance > 0.0);
+        assert_ne!(
+            (points.start.x, points.start.y),
+            (points.end.x, points.end.y)
+        );
+        for (kind, button) in [
+            (InputKind::MouseMove, MouseButton::None),
+            (InputKind::MouseDown, MouseButton::Left),
+        ] {
+            probe
+                .input(client, first, points.start.pointer(kind, button))
+                .await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        for step in 1..=4 {
+            let fraction = step as f32 / 4.0;
+            let position = FixturePoint {
+                x: points.start.x + (points.end.x - points.start.x) * fraction,
+                y: points.start.y + (points.end.y - points.start.y) * fraction,
+            };
+            probe
+                .input(
+                    client,
+                    first,
+                    position.pointer(InputKind::MouseDrag, MouseButton::Left),
+                )
+                .await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        probe
+            .input(
+                client,
+                first,
+                points.end.pointer(InputKind::MouseUp, MouseButton::Left),
+            )
+            .await;
+        let last_drag_send = TimingMark::now();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let dragged = fixture
+            .wait(
+                probe,
+                client,
+                incoming,
+                "final slider endpoint value and selected-document MouseDrag/MouseUp",
+                |status| {
+                    let value = status.window(&selected).slider_value;
+                    let at_end = |event: &FixtureMouseEvent| {
+                        event.document_id.as_ref() == Some(&selected)
+                            && event.window_number == scrolled.window(&selected).window_number
+                            && (event.local_x - f64::from(points.end_in_window.x)).abs()
+                                <= points.point_tolerance
+                            && (event.local_y - f64::from(points.end_in_window.y)).abs()
+                                <= points.point_tolerance
+                    };
+                    let Some(up_index) = status
+                        .mouse_events
+                        .iter()
+                        .rposition(|event| event.document_id.as_ref() == Some(&selected))
+                    else {
+                        return false;
+                    };
+                    // AppKit NSEventType: leftMouseUp=2, leftMouseDragged=6.
+                    status.mouse_events[up_index].kind == 2
+                        && at_end(&status.mouse_events[up_index])
+                        && status.mouse_events[..up_index]
+                            .iter()
+                            .any(|event| event.kind == 6 && at_end(event))
+                        && value.is_finite()
+                        && (0.0..=1.0).contains(&value)
+                        && value != slider_before
+                        && (value - points.expected_value).abs() <= points.value_tolerance
+                },
+            )
+            .await;
+        timing(
+            "slider_drag_evidence",
+            drag_started,
+            Some(last_drag_send),
+            7 * 50,
+        );
+        assert_eq!(
+            dragged.window(&sibling).slider_value,
+            reset.window(&sibling).slider_value
+        );
+        assert_eq!(
+            dragged.window(&sibling).scroll_offset,
+            reset.window(&sibling).scroll_offset
+        );
+        for id in [&selected, &sibling] {
+            assert_eq!(dragged.window(id).text, reset.window(id).text);
+            assert_eq!(dragged.window(id).dirty, reset.window(id).dirty);
+            assert_eq!(
+                dragged.window(id).reset_presses,
+                reset.window(id).reset_presses
+            );
+        }
+        eprintln!(
+            "fixture PID {}: completed slider drag {} -> {} (expected {}, tolerance {}), final MouseDrag/MouseUp at window-local ({}, {})",
+            fixture.pid,
+            slider_before,
+            dragged.window(&selected).slider_value,
+            points.expected_value,
+            points.value_tolerance,
+            points.end_in_window.x,
+            points.end_in_window.y
+        );
+        eprintln!(
+            "fixture PID {} confirmed scoped native keys, Reset click, wheel scrolling and slider drag",
             fixture.pid
         );
     }

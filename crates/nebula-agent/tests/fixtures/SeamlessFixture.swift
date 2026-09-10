@@ -1,11 +1,17 @@
 import AppKit
 
+final class ScrollContent: NSView {
+    override var isFlipped: Bool { true }
+}
+
 final class Document: NSObject, NSWindowDelegate, NSTextFieldDelegate {
     let id: Int
     let window: NSWindow
     let field = NSTextField()
     let counter = NSTextField(labelWithString: "")
     let resetButton = NSButton(title: "Reset fixture", target: nil, action: nil)
+    let scrollView = NSScrollView()
+    let slider = NSSlider(value: 0.25, minValue: 0, maxValue: 1, target: nil, action: nil)
     var tick = 0
     var dirty = false
     var closeRequests = 0
@@ -43,6 +49,29 @@ final class Document: NSObject, NSWindowDelegate, NSTextFieldDelegate {
         field.autoresizingMask = [.width, .minYMargin]
         content.addSubview(counter)
         content.addSubview(field)
+        scrollView.frame = NSRect(x: 24, y: 24, width: 260, height: 80)
+        scrollView.borderType = .bezelBorder
+        scrollView.hasVerticalScroller = true
+        let rows = ScrollContent(frame: NSRect(x: 0, y: 0, width: 240, height: 600))
+        for index in 0..<25 {
+            let row = NSTextField(labelWithString: "Scroll row \(index + 1)")
+            row.frame = NSRect(x: 8, y: index * 24, width: 220, height: 20)
+            rows.addSubview(row)
+        }
+        scrollView.documentView = rows
+        scrollView.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(scrollChanged),
+            name: NSView.boundsDidChangeNotification, object: scrollView.contentView)
+        content.addSubview(scrollView)
+        let sliderLabel = NSTextField(labelWithString: "Drag fixture slider")
+        sliderLabel.frame = NSRect(x: 320, y: 80, width: 240, height: 20)
+        content.addSubview(sliderLabel)
+        slider.frame = NSRect(x: 320, y: 42, width: 240, height: 28)
+        slider.isContinuous = true
+        slider.target = self
+        slider.action = #selector(sliderChanged)
+        content.addSubview(slider)
         window.contentView = content
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             guard let self else { return }
@@ -52,6 +81,11 @@ final class Document: NSObject, NSWindowDelegate, NSTextFieldDelegate {
         }
         window.makeKeyAndOrderFront(nil)
     }
+
+    deinit { NotificationCenter.default.removeObserver(self) }
+
+    @objc func scrollChanged(_ notification: Notification) { owner?.report() }
+    @objc func sliderChanged(_ sender: NSSlider) { owner?.report() }
 
     func controlTextDidChange(_ notification: Notification) {
         dirty = true
@@ -66,10 +100,38 @@ final class Document: NSObject, NSWindowDelegate, NSTextFieldDelegate {
     }
 
     var resetPoint: [String: Double] {
-        let rect = window.convertToScreen(resetButton.convert(resetButton.bounds, to: nil))
+        normalizedCenter(of: resetButton, rect: resetButton.bounds)
+    }
+
+    func normalizedCenter(of view: NSView, rect: NSRect) -> [String: Double] {
+        let rect = window.convertToScreen(view.convert(rect, to: nil))
         return [
             "x": (rect.midX - window.frame.minX) / window.frame.width,
             "y": (window.frame.maxY - rect.midY) / window.frame.height
+        ]
+    }
+
+    var scrollPoint: [String: Double] {
+        normalizedCenter(of: scrollView.contentView, rect: scrollView.contentView.bounds)
+    }
+
+    var sliderDragPoints: [String: Any] {
+        let cell = slider.cell as! NSSliderCell
+        let knob = cell.knobRect(flipped: slider.isFlipped)
+        let bar = cell.barRect(flipped: slider.isFlipped)
+        let destination = NSRect(x: bar.maxX - knob.width / 2, y: knob.midY, width: 0, height: 0)
+        let localEnd = slider.convert(destination, to: nil)
+        let pixelInPoints = 1 / window.backingScaleFactor
+        // One physical pixel of rounding along the actual knob travel.
+        let valueTolerance = (slider.maxValue - slider.minValue) * pixelInPoints
+            / max(1, bar.width - knob.width)
+        return [
+            "start": normalizedCenter(of: slider, rect: knob),
+            "end": normalizedCenter(of: slider, rect: destination),
+            "end_in_window": ["x": localEnd.midX, "y": localEnd.midY],
+            "expected_value": slider.maxValue,
+            "value_tolerance": valueTolerance,
+            "point_tolerance": pixelInPoints
         ]
     }
 
@@ -121,7 +183,7 @@ final class Fixture: NSObject, NSApplicationDelegate {
     lazy var latestStatus = statusDirectory.appendingPathComponent("nebula-seamless-fixture-status.json")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        inputMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .leftMouseDown, .leftMouseUp]) { [weak self] event in
+        inputMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .leftMouseDown, .leftMouseUp, .leftMouseDragged, .scrollWheel]) { [weak self] event in
             if let self {
                 if event.type == .keyDown {
                     self.keyDownCodes.append(Int(event.keyCode))
@@ -137,10 +199,14 @@ final class Fixture: NSObject, NSApplicationDelegate {
                         "window_number": event.windowNumber,
                         "window_resolved": event.window != nil,
                         "local_x": point.x, "local_y": point.y,
-                        "button": event.buttonNumber,
-                        "click_count": event.clickCount,
                         "pressed_buttons": NSEvent.pressedMouseButtons
                     ]
+                    if event.type == .scrollWheel {
+                        diagnostic["scroll_delta_y"] = event.scrollingDeltaY
+                    } else {
+                        diagnostic["button"] = event.buttonNumber
+                        diagnostic["click_count"] = event.clickCount
+                    }
                     if let cg = event.cgEvent {
                         diagnostic["cg_x"] = cg.location.x
                         diagnostic["cg_y"] = cg.location.y
@@ -219,7 +285,11 @@ final class Fixture: NSObject, NSApplicationDelegate {
                     "miniaturized": $0.window.isMiniaturized,
                     "sheet": $0.window.attachedSheet != nil,
                     "close_requests": $0.closeRequests, "cancelled_closes": $0.cancelledCloses,
-                    "reset_presses": $0.resetPresses, "reset_button": $0.resetPoint
+                    "reset_presses": $0.resetPresses, "reset_button": $0.resetPoint,
+                    "scroll_offset": $0.scrollView.contentView.bounds.origin.y,
+                    "scroll_target": $0.scrollPoint,
+                    "slider_value": $0.slider.doubleValue,
+                    "slider_drag": $0.sliderDragPoints
                 ] as [String: Any]
             }
         ]

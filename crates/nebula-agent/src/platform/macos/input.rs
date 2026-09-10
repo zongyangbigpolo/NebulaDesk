@@ -647,10 +647,16 @@ extern "C" {
     fn NXCloseEventStatus(handle: u32);
 }
 
+fn line_scroll_event(vertical: i32, horizontal: i32) -> *mut std::ffi::c_void {
+    const LINE: u32 = 1;
+    // Avoid variadic ABI differences: on Apple ARM64 the original function's
+    // wheel1 is a fixed register argument, not part of its stack varargs.
+    unsafe { CGEventCreateScrollWheelEvent2(std::ptr::null(), LINE, 2, vertical, horizontal, 0) }
+}
+
 /// Post a scroll event.
 ///
-/// `core-graphics` does not wrap `CGEventCreateScrollWheelEvent`, so it is
-/// declared here. Line units, not pixels: the wire carries lines, and macOS
+/// Line units, not pixels: the wire carries lines, and macOS
 /// then applies its own acceleration and natural-direction preference exactly
 /// as it would for a real wheel, which is what makes scrolling feel local.
 fn post_scroll(
@@ -661,8 +667,6 @@ fn post_scroll(
     location: Option<CGPoint>,
     window: Option<(u32, ScopedBounds)>,
 ) {
-    // Units: 0 is pixels, 1 is lines.
-    const LINE: u32 = 1;
     // The HID tap, the same place physical devices deliver to.
     const TAP_HID: u32 = 0;
 
@@ -670,7 +674,7 @@ fn post_scroll(
         // A null source means "no particular device", which is what a
         // synthesised scroll should look like; the wheel deltas carry all the
         // meaning here.
-        let event = CGEventCreateScrollWheelEvent(std::ptr::null(), LINE, 2, vertical, horizontal);
+        let event = line_scroll_event(vertical, horizontal);
         if event.is_null() {
             return;
         }
@@ -879,11 +883,13 @@ extern "C" {
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
-    fn CGEventCreateScrollWheelEvent(
+    fn CGEventCreateScrollWheelEvent2(
         source: *const std::ffi::c_void,
         units: u32,
         wheel_count: u32,
-        ...
+        wheel1: i32,
+        wheel2: i32,
+        wheel3: i32,
     ) -> *mut std::ffi::c_void;
     fn CGEventPost(tap: u32, event: *mut std::ffi::c_void);
     fn CGEventPostToPid(pid: i32, event: *mut std::ffi::c_void);
@@ -1108,6 +1114,24 @@ fn virtual_key(key: KeyCode) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_line_scroll_preserves_both_signed_axes() {
+        for (vertical, horizontal) in [(-6, 3), (6, -3), (0, -6), (-1, 0)] {
+            let event = line_scroll_event(vertical, horizontal);
+            assert!(!event.is_null());
+            let (actual_vertical, actual_horizontal) = unsafe {
+                let axes = (
+                    CGEventGetIntegerValueField(event, EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1),
+                    CGEventGetIntegerValueField(event, EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2),
+                );
+                CFRelease(event);
+                axes
+            };
+            assert_eq!(actual_vertical, i64::from(vertical));
+            assert_eq!(actual_horizontal, i64::from(horizontal));
+        }
+    }
 
     #[test]
     fn scoped_pointer_coordinates_use_owned_window_top_left_not_display_origin() {
