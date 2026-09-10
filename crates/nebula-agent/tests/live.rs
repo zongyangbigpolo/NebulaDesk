@@ -639,6 +639,37 @@ mod native_app {
     // allow both starts plus fresh keyframe decoding, but never extend on retry.
     const CAPTURE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 
+    #[derive(Clone, Copy)]
+    struct TimingMark {
+        instant: tokio::time::Instant,
+        unix_ms: u128,
+    }
+
+    impl TimingMark {
+        fn now() -> Self {
+            Self {
+                instant: tokio::time::Instant::now(),
+                unix_ms: SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            }
+        }
+    }
+
+    // Observation latency includes fixture reporting/polling, not just injection.
+    // Declared delays are intentional sleeps, excluding scheduler overshoot.
+    fn timing(event: &str, start: TimingMark, last_send: Option<TimingMark>, delays_ms: u64) {
+        let observed = TimingMark::now();
+        eprintln!(
+            "native APP timing {event}: start_unix_ms={} observed_unix_ms={} elapsed_ms={:.3} intentional_delays_ms={} last_send_unix_ms={:?} last_send_to_observed_ms={:?}",
+            start.unix_ms, observed.unix_ms,
+            observed.instant.duration_since(start.instant).as_secs_f64() * 1000.0,
+            delays_ms, last_send.map(|mark| mark.unix_ms),
+            last_send.map(|mark| observed.instant.duration_since(mark.instant).as_secs_f64() * 1000.0)
+        );
+    }
+
     #[derive(serde::Deserialize)]
     struct FixtureStatus {
         pid: u32,
@@ -819,6 +850,7 @@ mod native_app {
     }
 
     struct Probe {
+        started: TimingMark,
         registry: SurfaceRegistry,
         live: BTreeSet<u8>,
         removed: BTreeSet<u8>,
@@ -837,6 +869,7 @@ mod native_app {
     impl Probe {
         fn new() -> Self {
             Self {
+                started: TimingMark::now(),
                 registry: SurfaceRegistry::new(MAX_APPLICATION_SURFACES).unwrap(),
                 live: BTreeSet::new(),
                 removed: BTreeSet::new(),
@@ -1110,6 +1143,14 @@ mod native_app {
                         media.picture_hash = Some(blake3::hash(picture.y_plane()));
                         media.pictures += 1;
                         media.total_pictures += 1;
+                        if media.total_pictures == 1 {
+                            timing(
+                                &format!("first_decoded_surface_{}", video.display),
+                                self.started,
+                                None,
+                                0,
+                            );
+                        }
                         if media.pictures >= 5 && self.recovering.remove(&video.display).is_some() {
                             eprintln!("native APP stage {}: surface {} recovered with five current decoded pictures", self.stage, video.display);
                         }
@@ -1224,6 +1265,8 @@ mod native_app {
             "new fixture must have no prior keyboard input"
         );
         probe.stage("focus first document");
+        let focus_started = TimingMark::now();
+        let mut last_key_send = focus_started;
         probe
             .send(
                 client,
@@ -1240,6 +1283,7 @@ mod native_app {
                 probe
                     .input(client, first, InputEvent::key(kind, key, Modifiers::NONE))
                     .await;
+                last_key_send = TimingMark::now();
                 tokio::time::sleep(Duration::from_millis(30)).await;
             }
         }
@@ -1252,6 +1296,12 @@ mod native_app {
                 |status| status.key_down_codes == [0, 11, 8] && status.key_up_codes == [0, 11, 8],
             )
             .await;
+        timing(
+            "focus_to_abc_evidence",
+            focus_started,
+            Some(last_key_send),
+            100 + 6 * 30,
+        );
         assert_eq!(typed.window(&sibling).text, before.window(&sibling).text);
         assert_eq!(typed.window(&sibling).dirty, before.window(&sibling).dirty);
         probe.stage("dismiss completion popup with scoped Escape");
@@ -1285,6 +1335,8 @@ mod native_app {
         let presses = window.reset_presses;
         let (x, y) = (window.reset_button.x, window.reset_button.y);
         probe.stage("scoped Reset mouse input and NSButton evidence");
+        let reset_started = TimingMark::now();
+        let mut last_mouse_send = reset_started;
         assert!(
             x.is_finite() && y.is_finite() && (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y)
         );
@@ -1299,6 +1351,7 @@ mod native_app {
                 event.button = MouseButton::Left;
             }
             probe.input(client, first, event).await;
+            last_mouse_send = TimingMark::now();
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let reset = fixture
@@ -1313,6 +1366,12 @@ mod native_app {
                 },
             )
             .await;
+        timing(
+            "reset_click_evidence",
+            reset_started,
+            Some(last_mouse_send),
+            3 * 50,
+        );
         assert_eq!(reset.window(&selected).reset_presses, presses + 1);
         assert_eq!(reset.window(&sibling).text, before.window(&sibling).text);
         assert_eq!(reset.window(&sibling).dirty, before.window(&sibling).dirty);
@@ -1335,6 +1394,7 @@ mod native_app {
         fixture_start: FixtureDiscovery,
     ) {
         let mut probe = Probe::new();
+        timing("control_hello_start", probe.started, None, 0);
         probe
             .send(
                 client,
@@ -1366,6 +1426,12 @@ mod native_app {
         })
         .await
         .expect("exactly two documents must independently decode");
+        timing(
+            "two_windows_ready_five_pictures_each",
+            probe.started,
+            None,
+            0,
+        );
         let ids: Vec<_> = probe.live.iter().copied().collect();
         let (first, second) = (ids[0], ids[1]);
         probe.stage("initial steady two-document media");

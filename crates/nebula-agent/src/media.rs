@@ -103,6 +103,14 @@ impl FrameSink {
         }
     }
 
+    /// Remaining bounded queue slots, excluding outstanding send permits.
+    pub fn capacity(&self) -> usize {
+        match &self.output {
+            FrameOutput::Desktop(output) => output.capacity(),
+            FrameOutput::Application { output, .. } => output.capacity(),
+        }
+    }
+
     fn note_frame(&self, frame: &EncodedFrame) {
         if frame.keyframe {
             if let FrameOutput::Application {
@@ -533,6 +541,29 @@ impl InputInjector for DiscardInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_sink_capacity_tracks_both_output_queues() {
+        let (desktop, _received) = mpsc::channel(1);
+        let sink = FrameSink::from(desktop.clone());
+        assert_eq!(sink.capacity(), 1);
+        let permit = desktop.try_reserve().unwrap();
+        assert_eq!(sink.capacity(), 0);
+        drop(permit);
+        assert_eq!(sink.capacity(), 1);
+
+        let (application, _received) = mpsc::channel(1);
+        let sink = FrameSink::application(
+            application.clone(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        );
+        assert_eq!(sink.capacity(), 1);
+        let permit = application.try_reserve().unwrap();
+        assert_eq!(sink.capacity(), 0);
+        drop(permit);
+        assert_eq!(sink.capacity(), 1);
+    }
 
     #[tokio::test]
     async fn the_synthetic_source_produces_decodable_audio() {

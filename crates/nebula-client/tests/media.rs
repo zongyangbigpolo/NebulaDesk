@@ -34,7 +34,7 @@ fn a_captured_screen_decodes_back_into_a_picture() {
                 fps: 30,
                 bitrate: 6_000_000,
             },
-            frames_tx,
+            frames_tx.into(),
         )
         .expect(
             "capture must start; check the platform's desktop, permission and GPU requirements",
