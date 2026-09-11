@@ -17,6 +17,7 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
 zeroize.workspace = true
 thiserror.workspace = true
 nebula-agent.workspace = true

@@ -4161,6 +4161,7 @@ dependencies = [
  "nebula-desktop-protocol",
  "reqwest 0.12.28",
  "rfd",
+ "rustls",
  "serde",
  "serde_json",
  "tauri",

@@ -144,17 +144,10 @@ impl Manager {
     }
 
     pub async fn authenticate(self, path: &str, body: &serde_json::Value) -> Result<Account> {
-        let pair: TokenPair = self.request(Method::POST, path, None, Some(body)).await
-            .map_err(|error| {
-                if path == "v1/auth/accept-invitation" && error.code == "unauthorized" {
-                    DesktopError::new(
-                        "invalid_invitation",
-                        "The invitation is invalid, expired, used, revoked, or does not match the email. Ask your organization administrator for a new invitation.",
-                    )
-                } else {
-                    error
-                }
-            })?;
+        let pair: TokenPair = self
+            .request(Method::POST, path, None, Some(body))
+            .await
+            .map_err(|error| authentication_error(path, error))?;
         let credentials = Credentials {
             access: Zeroizing::new(pair.access_token),
             refresh: Zeroizing::new(pair.refresh_token),
@@ -190,6 +183,20 @@ impl Manager {
             workspace,
             credentials: Mutex::new(credentials),
         })
+    }
+}
+
+fn authentication_error(path: &str, error: DesktopError) -> DesktopError {
+    match (path, error.code) {
+        ("v1/auth/login", "unauthorized") => DesktopError::new(
+            "invalid_credentials",
+            "Check the workspace identifier, email and password, or whether the account is disabled.",
+        ),
+        ("v1/auth/accept-invitation", "unauthorized") => DesktopError::new(
+            "invalid_invitation",
+            "The invitation is invalid, expired, used, revoked, or does not match the email. Ask your organization administrator for a new invitation.",
+        ),
+        _ => error,
     }
 }
 
@@ -291,6 +298,28 @@ impl Account {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_rejection_is_distinct_from_expired_sessions_and_network_errors() {
+        let unauthorized = DesktopError::new("unauthorized", "Sign in again.");
+        assert_eq!(
+            authentication_error("v1/auth/login", unauthorized.clone()).code,
+            "invalid_credentials"
+        );
+        assert_eq!(
+            authentication_error("v1/auth/refresh", unauthorized.clone()).code,
+            "unauthorized"
+        );
+        assert_eq!(
+            authentication_error("v1/auth/accept-invitation", unauthorized).code,
+            "invalid_invitation"
+        );
+        let timeout = DesktopError::new("network_timeout", "Timed out.");
+        assert_eq!(
+            authentication_error("v1/auth/login", timeout).code,
+            "network_timeout"
+        );
+    }
 
     #[test]
     fn manager_url_safety() {

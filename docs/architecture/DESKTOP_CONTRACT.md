@@ -26,6 +26,16 @@ The `request` is an object tagged by `op` (snake_case). Successful replies are
 JSON values with the following shapes; failures reject with `{code,message}`.
 The frontend catches and displays errors and does not replace them with demo data.
 
+Login retains the masked password in the current form's memory while pending and
+after failure so the user can retry. Success, changing the server, changing the
+account flow or leaving the form clears it; browser storage is never used.
+Registration and invitation submissions retain their existing secret-clearing policy.
+Transport failures distinguish `network_timeout`, `network_connection`,
+`tls_certificate`, `tls` and other `network` errors without exposing raw URLs or
+error-chain details. Login rejection uses `invalid_credentials`; `unauthorized`
+continues to identify an expired or rejected authenticated session. The UI
+localizes these codes instead of presenting every failure as a TLS problem.
+
 | Request | Reply |
 | --- | --- |
 | `{op:"connection_settings"}` | `{manager_url:string \| null}` (validated runtime/build HTTPS default, or last successful address for this app lifetime) |

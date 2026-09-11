@@ -91,8 +91,10 @@ function AccountForm({ api, busy, error, demo, onAuthenticate, mode, changeMode,
     const request: AuthenticationRequest = mode === 'login' ? { op: 'login', ...server, tenant: tenant.trim(), email: email.trim(), password } :
       mode === 'register' ? { op: 'register', ...server, ...identity, workspace_slug: tenant.trim(), workspace_name: workspaceName.trim(), workspace_kind: kind } :
         { op: 'accept_invitation', ...server, ...identity, token: token.trim() };
-    setPassword(''); setConfirm(''); setToken('');
-    await onAuthenticate(request);
+    if (signup) { setPassword(''); setConfirm(''); setToken(''); }
+    if (await onAuthenticate(request)) {
+      setPassword(''); setConfirm(''); setToken('');
+    }
   }
   return <form onSubmit={submit} {...exactInput}>
     <LockKeyhole size={28} /><h1>{heading}</h1>

@@ -1,10 +1,53 @@
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 import { App } from '../App';
-import { account, fakeApi, host, resource, session } from './fixtures';
+import { account, deferred, fakeApi, host, resource, session } from './fixtures';
 
 describe('desktop presentation and actions', () => {
+  it('retains the password during login and failure for retry, but not after successful logout', async () => {
+    const user = userEvent.setup();
+    const first = deferred<typeof account>();
+    let attempts = 0;
+    const api = fakeApi({ account: () => null, login: () => ++attempts === 1 ? first.promise : account });
+    render(<App api={api} />);
+    await user.type(await screen.findByLabelText('工作空间地址'), 'https://manager.test');
+    await user.type(screen.getByLabelText('工作空间标识'), 'test');
+    await user.type(screen.getByLabelText('邮箱'), 'user@example.test');
+    await user.type(screen.getByLabelText('密码'), 'retry-password');
+    await user.click(screen.getByRole('button', { name: '登录' }));
+    expect(screen.getByLabelText('密码')).toHaveValue('retry-password');
+    expect(screen.getByLabelText('密码')).toBeDisabled();
+    await act(async () => first.reject({ code: 'network_timeout', message: 'The request timed out.' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('连接服务器超时');
+    expect(screen.getByLabelText('密码')).toHaveValue('retry-password');
+    expect(localStorage.length).toBe(0);
+    expect(sessionStorage.length).toBe(0);
+    await user.click(screen.getByRole('button', { name: '登录' }));
+    await screen.findByRole('navigation');
+    const requests = api.calls.filter(call => call.op === 'login');
+    expect(requests).toHaveLength(2);
+    expect(requests[1]).toEqual(requests[0]);
+    await user.click(screen.getByRole('button', { name: /账号与设置/ }));
+    await user.click(screen.getByRole('button', { name: '退出登录' }));
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '退出登录' }));
+    expect(await screen.findByLabelText('密码')).toHaveValue('');
+  });
+
+  it('clears retained login passwords when changing server or account flow', async () => {
+    const user = userEvent.setup();
+    render(<App api={fakeApi({ account: () => null })} />);
+    const address = await screen.findByLabelText('工作空间地址');
+    await user.type(address, 'https://manager.test');
+    await user.type(screen.getByLabelText('密码'), 'private-password');
+    await user.clear(address);
+    expect(screen.getByLabelText('密码')).toHaveValue('');
+    await user.type(screen.getByLabelText('密码'), 'another-password');
+    await user.click(screen.getByRole('button', { name: '创建账号' }));
+    await user.click(screen.getByRole('button', { name: '返回登录' }));
+    expect(screen.getByLabelText('密码')).toHaveValue('');
+  });
+
   it('preserves exact login identifiers instead of applying native spelling corrections', async () => {
     const user = userEvent.setup();
     const api = fakeApi({ account: () => null, login: () => account });
