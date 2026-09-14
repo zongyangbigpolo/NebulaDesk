@@ -142,7 +142,7 @@ impl AxIdentity {
     }
 
     fn element(&self) -> Ax {
-        Ax(unsafe { CFRetain(self.0) })
+        Ax(unsafe { CFRetain(self.0) }, None)
     }
 }
 
@@ -299,13 +299,15 @@ impl MacApplication {
 
     fn ax_not_ready(&mut self, error: anyhow::Error) -> anyhow::Result<Vec<NativeSurface>> {
         let identity = self.identity.clone();
-        self.ax_not_ready_with(error, |window| revalidate_capture_window(&identity, window))
+        self.ax_not_ready_with(error, |window, deadline| {
+            revalidate_capture_window(&identity, window, deadline)
+        })
     }
 
     fn ax_not_ready_with(
         &mut self,
         error: anyhow::Error,
-        mut verify: impl FnMut(&Window) -> anyhow::Result<()>,
+        mut verify: impl FnMut(&Window, Instant) -> anyhow::Result<()>,
     ) -> anyhow::Result<Vec<NativeSurface>> {
         if !error
             .downcast_ref::<AxAttributeError>()
@@ -328,6 +330,9 @@ impl MacApplication {
         let discovery_timeout = error
             .downcast_ref::<AxAttributeError>()
             .is_some_and(|error| error.attribute == "AXWindows" && error.status == -25204);
+        // Soft wall-clock budget: synchronous CG/LaunchServices calls cannot
+        // be interrupted. AX RPCs share the remaining budget; late results
+        // are rejected and no further verifier is started.
         let deadline = Instant::now() + Duration::from_millis(250);
         for window in self.windows.values() {
             // This is continuity, never discovery or recovery. In particular,
@@ -339,7 +344,8 @@ impl MacApplication {
                 && !window.surface.minimized
                 && !window.surface.modal
                 && window.surface.parent.is_none()
-                && verify(window).is_ok()
+                && verify(window, deadline).is_ok()
+                && Instant::now() < deadline
             {
                 self.unavailable.remove(&window.surface.native_id);
             }
@@ -360,9 +366,24 @@ impl MacApplication {
     }
 }
 
-fn revalidate_capture_window(identity: &Identity, window: &Window) -> anyhow::Result<()> {
+fn check_deadline(deadline: Option<Instant>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        deadline.is_none_or(|deadline| Instant::now() < deadline),
+        "native revalidation budget exhausted"
+    );
+    Ok(())
+}
+
+fn revalidate_capture_window(
+    identity: &Identity,
+    window: &Window,
+    deadline: Instant,
+) -> anyhow::Result<()> {
+    check_deadline(Some(deadline))?;
     identity.check()?;
+    check_deadline(Some(deadline))?;
     let (pid, bounds) = live_window_with_options(window.cg_id, 1)?;
+    check_deadline(Some(deadline))?;
     anyhow::ensure!(
         pid == identity.pid && bounds == window.bounds,
         "surface is not visible with unchanged ownership and geometry"
@@ -375,13 +396,15 @@ fn revalidate_capture_window(identity: &Identity, window: &Window) -> anyhow::Re
             == 1,
         "surface geometry is ambiguous"
     );
-    let app = Ax::application(identity.pid)?;
+    check_deadline(Some(deadline))?;
+    let app = Ax::application(identity.pid)?.with_deadline(deadline);
     anyhow::ensure!(!app.boolean("AXHidden")?, "application is hidden");
     let element = window
         .ax_identity
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("surface AX identity unavailable"))?
-        .element();
+        .element()
+        .with_deadline(deadline);
     anyhow::ensure!(
         element.process_id()? == identity.pid
             && element.string("AXRole")? == "AXWindow"
@@ -395,7 +418,7 @@ fn revalidate_capture_window(identity: &Identity, window: &Window) -> anyhow::Re
     );
     // Never authorize input here: only a complete fresh root set establishes
     // whether another application-modal window blocks this document.
-    Ok(())
+    check_deadline(Some(deadline))
 }
 
 fn validate_window(identity: &Identity, window: &Window, focus: bool) -> anyhow::Result<Ax> {
@@ -566,7 +589,7 @@ fn cg_window_list() -> anyhow::Result<Ax> {
 fn cg_window_list_with_options(options: u32) -> anyhow::Result<Ax> {
     // WindowServer metadata is cheap and fresh; SCShareableContent may block
     // for seconds. Only actual capture creation needs SCK window objects.
-    let windows = Ax(unsafe { CGWindowListCopyWindowInfo(options, 0) });
+    let windows = Ax(unsafe { CGWindowListCopyWindowInfo(options, 0) }, None);
     anyhow::ensure!(
         !windows.0.is_null() && unsafe { CFGetTypeID(windows.0) == CFArrayGetTypeID() },
         "surface enumeration unavailable"
@@ -1013,10 +1036,28 @@ impl Drop for MacApplication {
 
 // AX handles remain on the calling native worker. Every Copy/Create result has
 // one CF owner; bounds/booleans are type checked before calling typed CF APIs.
-struct Ax(*const c_void);
+struct Ax(*const c_void, Option<Instant>);
 
 impl Ax {
+    fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.1 = Some(deadline);
+        self
+    }
+
+    fn messaging_timeout(&self) -> anyhow::Result<f32> {
+        let remaining = self.1.map_or(Duration::from_millis(200), |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        });
+        // Zero means the OS default timeout, not a nonblocking request.
+        anyhow::ensure!(
+            remaining >= Duration::from_millis(1),
+            "native revalidation budget exhausted"
+        );
+        Ok(remaining.min(Duration::from_millis(200)).as_secs_f32())
+    }
+
     fn process_id(&self) -> anyhow::Result<i32> {
+        check_deadline(self.1)?;
         anyhow::ensure!(
             unsafe { CFGetTypeID(self.0) == AXUIElementGetTypeID() },
             "invalid AX element"
@@ -1026,6 +1067,7 @@ impl Ax {
             unsafe { AXUIElementGetPid(self.0, &mut pid) } == 0 && pid > 0,
             "AX element process identity unavailable"
         );
+        check_deadline(self.1)?;
         Ok(pid)
     }
 
@@ -1121,7 +1163,7 @@ impl Ax {
     }
 
     fn application(pid: i32) -> anyhow::Result<Self> {
-        let value = Self(unsafe { AXUIElementCreateApplication(pid) });
+        let value = Self(unsafe { AXUIElementCreateApplication(pid) }, None);
         anyhow::ensure!(!value.0.is_null(), "AX application unavailable");
         unsafe {
             AXUIElementSetMessagingTimeout(value.0, 0.2);
@@ -1130,24 +1172,29 @@ impl Ax {
     }
 
     fn attribute(&self, name: &str) -> anyhow::Result<Self> {
+        let timeout = self.messaging_timeout()?;
         anyhow::ensure!(
             unsafe { CFGetTypeID(self.0) == AXUIElementGetTypeID() },
             "invalid AX element"
         );
-        unsafe {
-            AXUIElementSetMessagingTimeout(self.0, 0.2);
-        }
+        let configured = unsafe { AXUIElementSetMessagingTimeout(self.0, timeout) };
+        anyhow::ensure!(
+            self.1.is_none() || configured == 0,
+            "cannot bound native AX messaging timeout"
+        );
         let key = cf_string(name)?;
         let mut value = std::ptr::null();
         let status = unsafe { AXUIElementCopyAttributeValue(self.0, key.0, &mut value) };
-        if status != 0 || value.is_null() {
+        let value = Self(value, self.1);
+        check_deadline(self.1)?;
+        if status != 0 || value.0.is_null() {
             return Err(AxAttributeError {
                 attribute: name.into(),
                 status: if status == 0 { -25212 } else { status },
             }
             .into());
         }
-        Ok(Self(value))
+        Ok(value)
     }
 
     fn children(&self, name: &str) -> anyhow::Result<Vec<Self>> {
@@ -1165,8 +1212,9 @@ impl Ax {
             unsafe {
                 CFRetain(value);
             }
-            values.push(Self(value));
+            values.push(Self(value, self.1));
         }
+        check_deadline(self.1)?;
         Ok(values)
     }
 
@@ -1314,7 +1362,7 @@ impl Ax {
     fn set_size(&self, width: f64, height: f64) -> anyhow::Result<()> {
         let key = cf_string("AXSize")?;
         let size = [width, height];
-        let value = Self(unsafe { AXValueCreate(2, size.as_ptr().cast()) });
+        let value = Self(unsafe { AXValueCreate(2, size.as_ptr().cast()) }, None);
         anyhow::ensure!(!value.0.is_null(), "invalid resize value");
         anyhow::ensure!(
             unsafe { AXUIElementSetAttributeValue(self.0, key.0, value.0) } == 0,
@@ -1345,8 +1393,10 @@ impl Drop for Ax {
 
 fn cf_string(value: &str) -> anyhow::Result<Ax> {
     let value = CString::new(value)?;
-    let result =
-        Ax(unsafe { CFStringCreateWithCString(std::ptr::null(), value.as_ptr(), 0x08000100) });
+    let result = Ax(
+        unsafe { CFStringCreateWithCString(std::ptr::null(), value.as_ptr(), 0x08000100) },
+        None,
+    );
     anyhow::ensure!(!result.0.is_null(), "CF string allocation failed");
     Ok(result)
 }
@@ -1592,7 +1642,7 @@ mod tests {
             })
         };
         let surfaces = app
-            .ax_not_ready_with(timeout(), |window| {
+            .ax_not_ready_with(timeout(), |window, _| {
                 anyhow::ensure!(window.surface.native_id == 43, "fresh facts unavailable");
                 Ok(())
             })
@@ -1600,7 +1650,7 @@ mod tests {
         assert_eq!(app.unavailable(), vec![42]);
         assert_eq!(surfaces.len(), 2, "no new surfaces may be discovered");
         assert!(surfaces.iter().all(|s| s.geometry_generation == 7));
-        app.ax_not_ready_with(timeout(), |_| Ok(())).unwrap();
+        app.ax_not_ready_with(timeout(), |_, _| Ok(())).unwrap();
         assert_eq!(
             app.unavailable(),
             vec![42],
@@ -1614,7 +1664,7 @@ mod tests {
                     status: -25204,
                 }
                 .into(),
-                |_| panic!("only a root enumeration timeout permits independent checks"),
+                |_, _| panic!("only a root enumeration timeout permits independent checks"),
             )
             .unwrap();
             assert_eq!(app.unavailable(), vec![42, 43]);
@@ -1625,13 +1675,44 @@ mod tests {
             surface.minimized = kind == 0;
             surface.modal = kind == 1;
             surface.parent = (kind == 2).then_some(42);
-            app.ax_not_ready_with(timeout(), |window| {
+            app.ax_not_ready_with(timeout(), |window, _| {
                 assert_eq!(window.surface.native_id, 42);
                 Ok(())
             })
             .unwrap();
             assert_eq!(app.unavailable(), vec![43]);
         }
+        app.unavailable.clear();
+        let surface = &mut app.windows.get_mut(&43).unwrap().surface;
+        surface.parent = None;
+        let mut calls = 0;
+        app.ax_not_ready_with(timeout(), |_, deadline| {
+            calls += 1;
+            std::thread::sleep(
+                deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(5),
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 1, "budget overrun must not start another verifier");
+        assert_eq!(
+            app.unavailable(),
+            vec![42, 43],
+            "even a successful verifier must be rejected after its deadline"
+        );
+    }
+
+    #[test]
+    fn ax_attribute_budget_caps_each_rpc_and_rejects_exhaustion_before_ffi() {
+        let element =
+            Ax(std::ptr::null(), None).with_deadline(Instant::now() + Duration::from_millis(40));
+        assert!(element.messaging_timeout().unwrap() <= 0.04);
+        let expired = element.with_deadline(Instant::now() - Duration::from_millis(1));
+        assert!(expired.messaging_timeout().is_err());
+        assert!(
+            expired.attribute("AXWindows").is_err(),
+            "an expired budget must return before touching even the AX pointer"
+        );
     }
 
     #[test]
@@ -1639,6 +1720,29 @@ mod tests {
     fn native_ax_discovery_timeout_preserves_independently_verified_sibling() {
         use crate::media::{FrameSink, VideoConfig};
         use std::sync::{atomic::AtomicU64, Arc};
+
+        fn discard_fixture_sheet(sheet: &Ax, pid: i32) -> anyhow::Result<()> {
+            anyhow::ensure!(sheet.owns_content(pid)?, "unowned fixture sheet");
+            let mut pending = sheet.children("AXChildren")?;
+            let mut visited = 0;
+            while let Some(element) = pending.pop() {
+                visited += 1;
+                anyhow::ensure!(visited <= 256, "fixture sheet exceeds traversal bound");
+                if element
+                    .string("AXRole")
+                    .is_ok_and(|role| role == "AXButton")
+                    && element
+                        .string("AXTitle")
+                        .is_ok_and(|title| title == "Discard")
+                    && sheet.owns_child(&element, pid)?
+                {
+                    element.perform("AXPress")?;
+                    return Ok(());
+                }
+                pending.extend(element.children("AXChildren").unwrap_or_default());
+            }
+            anyhow::bail!("owned fixture Discard button not found")
+        }
 
         struct Cleanup {
             identity: Identity,
@@ -1660,6 +1764,11 @@ mod tests {
                 }
                 let deadline = Instant::now() + Duration::from_secs(3);
                 while self.identity.check().is_ok() && Instant::now() < deadline {
+                    for (_, root) in &self.roots {
+                        for sheet in root.element().sheets(true).unwrap_or_default() {
+                            let _ = discard_fixture_sheet(&sheet, self.identity.pid);
+                        }
+                    }
                     if self.roots.iter().all(|(id, _)| live_window(*id).is_err()) {
                         // The fixture can remain resident after its documents
                         // close. Request normal Quit only after the owned
@@ -1681,7 +1790,7 @@ mod tests {
         assert_eq!(path.file_name().unwrap(), "NebulaSeamlessFixture.app");
         let mut app = MacApplication::launch(&ApplicationLaunch {
             launch_path: path.to_string_lossy().into_owned(),
-            launch_args: Vec::new(),
+            launch_args: vec!["--dirty-first".into()],
             working_dir: None,
         })
         .unwrap();
@@ -1710,12 +1819,53 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(25));
         }
-        let sibling = app.windows.values().next().unwrap().clone();
-        let minimized = app.windows.values().nth(1).unwrap().clone();
-        revalidate_capture_window(&app.identity, &sibling).unwrap();
+        let sibling = app
+            .windows
+            .values()
+            .find(|window| window.surface.title == "Nebula acceptance document 1")
+            .unwrap()
+            .clone();
+        let minimized = app
+            .windows
+            .values()
+            .find(|window| window.surface.title == "Nebula acceptance document 2")
+            .unwrap()
+            .clone();
+        let identity = app.identity.clone();
+        let verify = |window| {
+            revalidate_capture_window(
+                &identity,
+                window,
+                Instant::now() + Duration::from_millis(250),
+            )
+        };
+        verify(&sibling).unwrap();
         let mut wrong_geometry = sibling.clone();
         wrong_geometry.bounds.x += 10.0;
-        assert!(revalidate_capture_window(&app.identity, &wrong_geometry).is_err());
+        assert!(verify(&wrong_geometry).is_err());
+        let native_app = Ax::application(identity.pid).unwrap();
+        native_app.set_boolean("AXHidden", true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !native_app.boolean("AXHidden").unwrap() {
+            assert!(Instant::now() < deadline, "owned fixture did not hide");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            verify(&sibling).is_err(),
+            "hidden application must not retain capture authority"
+        );
+        native_app.set_boolean("AXHidden", false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while verify(&sibling).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "owned fixture did not become visible"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        eprintln!(
+            "fresh-authority negatives: changed geometry and actually hidden application rejected"
+        );
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let mut video = app.video(sibling.surface.native_id).unwrap();
         video
@@ -1756,7 +1906,7 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(25));
         }
-        assert!(revalidate_capture_window(&app.identity, &minimized).is_err());
+        assert!(verify(&minimized).is_err());
         // Force only the discovery failure. Every capture-authority check still
         // executes against the real WindowServer and the actual fixture AX server.
         let mut frames = 0;
@@ -1803,6 +1953,44 @@ mod tests {
              {frames} encoded frames/{fresh_frames} advancing timestamps, minimized surface unavailable",
             sibling.surface.geometry_generation
         );
+        app.operate(
+            sibling.surface.native_id,
+            &ApplicationMessage::Close {
+                surface_id: 0,
+                geometry_generation: sibling.surface.geometry_generation,
+            },
+        )
+        .unwrap();
+        let parent = sibling.ax_identity.as_ref().unwrap().element();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let sheet = loop {
+            if let Ok(mut sheets) = parent.sheets(true) {
+                if !sheets.is_empty() {
+                    assert_eq!(sheets.len(), 1);
+                    break sheets.remove(0);
+                }
+            }
+            assert!(Instant::now() < deadline, "owned save sheet did not appear");
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        assert!(
+            verify(&sibling).is_err(),
+            "a document with an actual attached sheet lacks fallback authority"
+        );
+        discard_fixture_sheet(&sheet, identity.pid).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while live_window(sibling.cg_id).is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "approved fixture close did not complete"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            verify(&sibling).is_err(),
+            "retaining a closed window's AX identity must not authorize capture"
+        );
+        eprintln!("fresh-authority negatives: actual attached sheet and closed retained AX element rejected");
         drop(cleanup);
         let deadline = Instant::now() + Duration::from_secs(5);
         while app.identity.check().is_ok() {
