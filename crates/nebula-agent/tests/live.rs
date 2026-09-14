@@ -263,7 +263,7 @@ async fn an_attached_agent_keeps_reporting_that_it_is_alive() {
 
 #[tokio::test]
 async fn the_real_agent_serves_a_real_client() {
-    real_client(None).await;
+    real_client(None, false).await;
 }
 
 /// Build with `scripts/build-seamless-fixture.sh`; point NEBULA_APP_PROBE_PATH
@@ -273,6 +273,18 @@ async fn the_real_agent_serves_a_real_client() {
 #[tokio::test]
 #[ignore = "requires an idle native desktop, existing permissions, and NEBULA_APP_PROBE_PATH"]
 async fn native_app_two_documents_resize_and_close_normally() {
+    native_app_regression(false).await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires the owned fixture and native grants; rejects sibling blackout or generation churn"]
+async fn native_app_strict_sibling_continuity_through_minimize_restore() {
+    native_app_regression(true).await;
+}
+
+#[cfg(target_os = "macos")]
+async fn native_app_regression(strict_sibling: bool) {
     let database = std::env::var("NEBULA_TEST_DATABASE_URL")
         .expect("native APP regression requires an explicit isolated NEBULA_TEST_DATABASE_URL");
     assert!(
@@ -283,12 +295,16 @@ async fn native_app_two_documents_resize_and_close_normally() {
         "explicitly set NEBULA_APP_PROBE_PATH to the controlled two-document fixture bundle",
     );
     assert!(path.ends_with(".app"), "publish a fixture app bundle");
-    tokio::time::timeout(Duration::from_secs(150), real_client(Some(&path)))
-        .await
-        .expect("native APP regression exceeded its overall deadline");
+    tokio::time::timeout(
+        Duration::from_secs(150),
+        real_client(Some(&path), strict_sibling),
+    )
+    .await
+    .expect("native APP regression exceeded its overall deadline");
 }
 
-async fn real_client(application: Option<&str>) {
+async fn real_client(application: Option<&str>, strict_sibling: bool) {
+    assert!(!strict_sibling || application.is_some());
     #[cfg(target_os = "macos")]
     let fixture_start = application.map(|_| native_app::FixtureDiscovery::snapshot());
     let deployment = Deployment::start().await;
@@ -514,7 +530,13 @@ async fn real_client(application: Option<&str>) {
 
     #[cfg(target_os = "macos")]
     if application.is_some() {
-        native_app::exercise(&client, &mut incoming, fixture_start.unwrap()).await;
+        native_app::exercise(
+            &client,
+            &mut incoming,
+            fixture_start.unwrap(),
+            strict_sibling,
+        )
+        .await;
         client.close(0, b"done");
         deployment.gateway.shutdown();
         deployment.relay.shutdown();
@@ -892,6 +914,14 @@ mod native_app {
         }
     }
 
+    struct StrictSibling {
+        id: u8,
+        generation: u32,
+        last_decoded: tokio::time::Instant,
+        maximum_gap: Duration,
+        decoded: usize,
+    }
+
     struct Probe {
         started: TimingMark,
         registry: SurfaceRegistry,
@@ -902,6 +932,7 @@ mod native_app {
         media: BTreeMap<u8, Media>,
         unavailable: BTreeSet<u8>,
         minimize_target: Option<u8>,
+        strict_sibling: Option<StrictSibling>,
         recovering: BTreeMap<u8, tokio::time::Instant>,
         stage: &'static str,
         fixture_pid: Option<u32>,
@@ -924,6 +955,7 @@ mod native_app {
                 media: BTreeMap::new(),
                 unavailable: BTreeSet::new(),
                 minimize_target: None,
+                strict_sibling: None,
                 recovering: BTreeMap::new(),
                 stage: "initial capture / APP negotiation",
                 fixture_pid: None,
@@ -984,7 +1016,15 @@ mod native_app {
         }
 
         async fn receive(&mut self, client: &Session, incoming: &mut SessionReceiver) {
-            let deadline = self.recovery_deadline();
+            // The fixture changes pixels every 100ms. A two-second decoded
+            // silence is a separate hard failure, not a recovery allowance.
+            let deadline =
+                self.strict_sibling
+                    .as_ref()
+                    .map_or(self.recovery_deadline(), |sibling| {
+                        self.recovery_deadline()
+                            .min(sibling.last_decoded + Duration::from_secs(2))
+                    });
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "native APP stage {}: surface recovery exceeded {:?} despite ongoing traffic",
@@ -994,7 +1034,7 @@ mod native_app {
             let message = tokio::time::timeout_at(deadline, incoming.recv())
                 .await
                 .unwrap_or_else(|_| panic!(
-                    "native APP stage {}: traffic stalled or surface failed to resume \
+                    "native APP stage {}: traffic stalled (strict sibling has a 2s decoded-frame deadline) or surface failed to resume \
                      with five current decoded pictures within {:?}; unavailable={:?}, recovering={:?}",
                     self.stage, CAPTURE_RECOVERY_TIMEOUT, self.unavailable, self.recovering.keys().collect::<Vec<_>>()
                 ))
@@ -1042,6 +1082,14 @@ mod native_app {
                             }
                             let id = surface.surface_id;
                             let generation = surface.geometry_generation;
+                            if let Some(sibling) = &self.strict_sibling {
+                                if id == sibling.id {
+                                    assert_eq!(
+                                        generation, sibling.generation,
+                                        "strict sibling generation churn"
+                                    );
+                                }
+                            }
                             let minimized = surface.minimized;
                             let was_minimized =
                                 self.registry.get(id).is_some_and(|old| old.minimized);
@@ -1087,6 +1135,13 @@ mod native_app {
                             assert!(self.ready && self.live.contains(&surface_id));
                             assert!(self.registry.get(surface_id).is_some());
                             assert_eq!(reason, ApplicationFailureReason::SurfaceUnavailable);
+                            assert!(
+                                self.strict_sibling
+                                    .as_ref()
+                                    .is_none_or(|sibling| sibling.id != surface_id),
+                                "strict sibling received SurfaceUnavailable during {}",
+                                self.stage
+                            );
                             // Capture loss is not window destruction. Repeated
                             // notices must not extend the recovery deadline.
                             self.unavailable.insert(surface_id);
@@ -1099,6 +1154,13 @@ mod native_app {
                             eprintln!("native APP stage {}: surface {surface_id} temporarily unavailable; retaining its ID, allowing {:?} to resume", self.stage, CAPTURE_RECOVERY_TIMEOUT);
                         }
                         ControlMessage::Application(App::SurfaceRemove { surface_id }) => {
+                            assert!(
+                                self.strict_sibling
+                                    .as_ref()
+                                    .is_none_or(|sibling| sibling.id != surface_id),
+                                "strict sibling was removed during {}",
+                                self.stage
+                            );
                             assert_eq!(message.header.kind, MsgKind::Application);
                             assert!(self.ready);
                             self.registry.remove(surface_id).unwrap();
@@ -1220,6 +1282,19 @@ mod native_app {
                         media.picture_hash = Some(blake3::hash(picture.y_plane()));
                         media.pictures += 1;
                         media.total_pictures += 1;
+                        if let Some(sibling) = &mut self.strict_sibling {
+                            if sibling.id == video.display {
+                                let now = tokio::time::Instant::now();
+                                assert!(
+                                    now - sibling.last_decoded <= Duration::from_secs(2),
+                                    "strict sibling decoded-frame silence exceeded 2s"
+                                );
+                                sibling.maximum_gap =
+                                    sibling.maximum_gap.max(now - sibling.last_decoded);
+                                sibling.last_decoded = now;
+                                sibling.decoded += 1;
+                            }
+                        }
                         if media.total_pictures == 1 {
                             timing(
                                 &format!("first_decoded_surface_{}", video.display),
@@ -1268,6 +1343,12 @@ mod native_app {
             if !self.bye || std::thread::panicking() {
                 eprintln!("native APP failed/cancelled: stage={}, fixture_pid={:?}, hello={}, ready={}, live={:?}, removed={:?}, unavailable={:?}, last_event={}",
                     self.stage, self.fixture_pid, self.hello, self.ready, self.live, self.removed, self.unavailable, self.last_event);
+                if let Some(sibling) = &self.strict_sibling {
+                    eprintln!("strict sibling {}: generation={}, decoded_since_arm={}, max_gap_ms={:.3}, last_decoded_ago_ms={:.3}",
+                        sibling.id, sibling.generation, sibling.decoded,
+                        sibling.maximum_gap.as_secs_f64() * 1000.0,
+                        sibling.last_decoded.elapsed().as_secs_f64() * 1000.0);
+                }
                 for (id, media) in &self.media {
                     eprintln!("surface {id}: metadata={:?}, media_generation={}, sequence={:?}, current_pictures={}, total_pictures={}, recovery_elapsed={:?}",
                         self.registry.get(*id), media.generation, media.sequence, media.pictures, media.total_pictures,
@@ -1835,6 +1916,7 @@ mod native_app {
         client: &Session,
         incoming: &mut SessionReceiver,
         fixture_start: FixtureDiscovery,
+        strict_sibling: bool,
     ) {
         let mut probe = Probe::new();
         timing("control_hello_start", probe.started, None, 0);
@@ -1964,6 +2046,19 @@ mod native_app {
         // a separate Restore command or per-command capability bit.
         probe.stage("Minimize first document / real NSWindow.isMiniaturized");
         let before_minimize = [probe.surface(first), probe.surface(second)];
+        if strict_sibling {
+            assert!(
+                !probe.unavailable.contains(&second) && !probe.recovering.contains_key(&second)
+            );
+            probe.strict_sibling = Some(StrictSibling {
+                id: second,
+                generation: before_minimize[1].geometry_generation,
+                last_decoded: tokio::time::Instant::now(),
+                maximum_gap: Duration::ZERO,
+                decoded: 0,
+            });
+            eprintln!("strict continuity armed: sibling {second}, generation {}; no Unavailable, no generation change, decoded-frame deadline 2s", before_minimize[1].geometry_generation);
+        }
         let previously_removed = probe.removed.clone();
         let minimize_started = TimingMark::now();
         probe.minimize_target = Some(first);
@@ -2034,6 +2129,7 @@ mod native_app {
             "minimization must invalidate the previous capture generation"
         );
         let restore_started = TimingMark::now();
+        let before_restore_sibling_count = probe.total_pictures(second);
         probe
             .send(
                 client,
@@ -2059,6 +2155,8 @@ mod native_app {
                         && probe.surface(first).geometry_generation > minimized.geometry_generation
                         && probe.pictures(first) >= 5
                         && probe.total_pictures(first) >= paused_count + 5
+                        && (!strict_sibling
+                            || probe.total_pictures(second) >= before_restore_sibling_count + 5)
                         && probe.recovering.is_empty()
                     {
                         break;
@@ -2084,6 +2182,15 @@ mod native_app {
             );
         }
         probe.minimize_target = None;
+        if let Some(sibling) = probe.strict_sibling.take() {
+            assert_eq!(
+                probe.surface(second).geometry_generation,
+                sibling.generation
+            );
+            assert!(probe.total_pictures(second) >= before_restore_sibling_count + 5);
+            assert!(sibling.decoded >= 10);
+            eprintln!("strict sibling continuity passed: surface {}, generation {}, {} decoded frames, max decoded gap {:.3}ms", sibling.id, sibling.generation, sibling.decoded, sibling.maximum_gap.as_secs_f64() * 1000.0);
+        }
         eprintln!("fixture PID {} confirmed Minimize and Focus restore for surface {first}, with sibling {second} streaming and no Remove", fixture.pid);
 
         probe.stage("normal Close first document");

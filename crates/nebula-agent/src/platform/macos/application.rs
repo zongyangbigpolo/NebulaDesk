@@ -5,6 +5,7 @@ use std::ffi::{c_void, CString};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use block2::RcBlock;
 use ndp_proto::application::ApplicationMessage;
 use ndp_proto::InputEvent;
@@ -300,6 +301,7 @@ pub struct MacApplication {
     input: Option<(u64, u32, input::ApplicationInput)>,
     first_window_deadline: Instant,
     seen_window: bool,
+    last_continuity_trace: Option<Instant>,
 }
 
 impl MacApplication {
@@ -404,6 +406,7 @@ impl MacApplication {
             input: None,
             first_window_deadline: Instant::now() + Duration::from_secs(15),
             seen_window: false,
+            last_continuity_trace: None,
         })
     }
 
@@ -462,20 +465,65 @@ impl MacApplication {
         // be interrupted. AX RPCs share the remaining budget; late results
         // are rejected and no further verifier is started.
         let deadline = Instant::now() + Duration::from_millis(250);
-        for window in self.windows.values() {
+        let trace = self
+            .last_continuity_trace
+            .is_none_or(|last| last.elapsed() >= Duration::from_secs(1));
+        if trace {
+            self.last_continuity_trace = Some(Instant::now());
+        }
+        for (index, window) in self.windows.values().enumerate() {
             // This is continuity, never discovery or recovery. In particular,
             // an already paused capture still needs normal generation/epoch
             // advancement after a complete successful snapshot.
-            if discovery_timeout
-                && Instant::now() < deadline
-                && !was_unavailable.contains(&window.surface.native_id)
-                && !window.surface.minimized
-                && !window.surface.modal
-                && window.surface.parent.is_none()
-                && verify(window, deadline).is_ok()
-                && Instant::now() < deadline
-            {
+            let skip = if !discovery_timeout {
+                Some("not-root-timeout")
+            } else if was_unavailable.contains(&window.surface.native_id) {
+                Some("already-unavailable")
+            } else if window.surface.minimized {
+                Some("already-minimized")
+            } else if window.surface.modal || window.surface.parent.is_some() {
+                Some("modal-or-child")
+            } else if Instant::now() >= deadline {
+                Some("budget-exhausted")
+            } else {
+                None
+            };
+            let started = Instant::now();
+            let remaining = deadline.saturating_duration_since(started);
+            let result = skip.is_none().then(|| verify(window, deadline));
+            let accepted = result.as_ref().is_some_and(Result::is_ok) && Instant::now() < deadline;
+            if accepted {
                 self.unavailable.remove(&window.surface.native_id);
+            }
+            if trace && index < usize::from(MAX_APPLICATION_SURFACES) {
+                let error = result.as_ref().and_then(|result| result.as_ref().err());
+                let check = error.and_then(|error| error.downcast_ref::<CaptureCheck>());
+                let attribute = error.and_then(|error| error.downcast_ref::<AxAttributeError>());
+                let failed_check = check.map(|check| check.0).or_else(|| {
+                    if error.is_some() {
+                        Some("unclassified-verifier-error")
+                    } else if result.is_some() && !accepted {
+                        Some("post-verifier-budget")
+                    } else {
+                        None
+                    }
+                });
+                tracing::info!(
+                    pid = self.identity.pid,
+                    native_id = window.surface.native_id,
+                    cg_window = window.cg_id,
+                    order = index,
+                    attempted = result.is_some(),
+                    ?skip,
+                    accepted,
+                    remaining_before_ms = remaining.as_millis(),
+                    elapsed_ms = started.elapsed().as_millis(),
+                    budget_exhausted = Instant::now() >= deadline,
+                    first_failed_check = failed_check,
+                    native_attribute = attribute.map(|error| error.attribute.as_str()),
+                    native_status = attribute.map(|error| error.status),
+                    "bounded per-window continuity verification"
+                );
             }
         }
         if self.unavailable != was_unavailable {
@@ -494,6 +542,24 @@ impl MacApplication {
     }
 }
 
+#[derive(Debug)]
+struct CaptureCheck(&'static str);
+
+impl std::fmt::Display for CaptureCheck {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+fn capture_fact(check: &'static str, result: anyhow::Result<bool>) -> anyhow::Result<()> {
+    result
+        .and_then(|valid| {
+            anyhow::ensure!(valid, "native capture fact not satisfied");
+            Ok(())
+        })
+        .context(CaptureCheck(check))
+}
+
 fn check_deadline(deadline: Option<Instant>) -> anyhow::Result<()> {
     anyhow::ensure!(
         deadline.is_none_or(|deadline| Instant::now() < deadline),
@@ -507,46 +573,69 @@ fn revalidate_capture_window(
     window: &Window,
     deadline: Instant,
 ) -> anyhow::Result<()> {
-    check_deadline(Some(deadline))?;
-    identity.check()?;
-    check_deadline(Some(deadline))?;
-    let (pid, bounds) = live_window_with_options(window.cg_id, 1)?;
-    check_deadline(Some(deadline))?;
-    anyhow::ensure!(
-        pid == identity.pid && bounds == window.bounds,
-        "surface is not visible with unchanged ownership and geometry"
-    );
-    anyhow::ensure!(
-        application_windows(identity.pid)?
-            .iter()
-            .filter(|(_, candidate)| candidate.matches(bounds))
-            .count()
-            == 1,
-        "surface geometry is ambiguous"
-    );
-    check_deadline(Some(deadline))?;
-    let app = Ax::application(identity.pid)?.with_deadline(deadline);
-    anyhow::ensure!(!app.boolean("AXHidden")?, "application is hidden");
+    check_deadline(Some(deadline)).context(CaptureCheck("initial-budget"))?;
+    identity.check().context(CaptureCheck("process-identity"))?;
+    check_deadline(Some(deadline)).context(CaptureCheck("after-identity-budget"))?;
+    let (pid, bounds) =
+        live_window_with_options(window.cg_id, 1).context(CaptureCheck("cg-visible"))?;
+    check_deadline(Some(deadline)).context(CaptureCheck("after-cg-visible-budget"))?;
+    capture_fact(
+        "cg-owner-geometry",
+        Ok(pid == identity.pid && bounds == window.bounds),
+    )?;
+    capture_fact(
+        "cg-unambiguous",
+        application_windows(identity.pid).map(|windows| {
+            windows
+                .iter()
+                .filter(|(_, candidate)| candidate.matches(bounds))
+                .count()
+                == 1
+        }),
+    )?;
+    check_deadline(Some(deadline)).context(CaptureCheck("after-cg-enumeration-budget"))?;
+    let app = Ax::application(identity.pid)
+        .context(CaptureCheck("ax-application"))?
+        .with_deadline(deadline);
+    capture_fact("AXHidden", app.boolean("AXHidden").map(|hidden| !hidden))?;
     let element = window
         .ax_identity
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("surface AX identity unavailable"))?
+        .ok_or_else(|| anyhow::anyhow!("surface AX identity unavailable"))
+        .context(CaptureCheck("retained-ax-identity"))?
         .element()
         .with_deadline(deadline);
-    anyhow::ensure!(
-        element.process_id()? == identity.pid
-            && element.string("AXRole")? == "AXWindow"
-            && unsafe { CFEqual(element.attribute("AXParent")?.0, app.0) }
-            && element.bounds()?.matches(bounds)
-            && !element.boolean("AXMinimized")?
-            && !element.boolean("AXModal")?
-            && element.sheets(true)?.is_empty()
-            && element.owns_content(identity.pid)?,
-        "surface lacks independent live capture authority"
-    );
+    capture_fact(
+        "ax-pid",
+        element.process_id().map(|pid| pid == identity.pid),
+    )?;
+    capture_fact(
+        "AXRole",
+        element.string("AXRole").map(|role| role == "AXWindow"),
+    )?;
+    capture_fact(
+        "AXParent",
+        element
+            .attribute("AXParent")
+            .map(|parent| unsafe { CFEqual(parent.0, app.0) }),
+    )?;
+    capture_fact(
+        "ax-bounds",
+        element.bounds().map(|current| current.matches(bounds)),
+    )?;
+    capture_fact(
+        "AXMinimized",
+        element.boolean("AXMinimized").map(|minimized| !minimized),
+    )?;
+    capture_fact("AXModal", element.boolean("AXModal").map(|modal| !modal))?;
+    capture_fact(
+        "AXSheets",
+        element.sheets(true).map(|sheets| sheets.is_empty()),
+    )?;
+    capture_fact("content-ownership", element.owns_content(identity.pid))?;
     // Never authorize input here: only a complete fresh root set establishes
     // whether another application-modal window blocks this document.
-    check_deadline(Some(deadline))
+    check_deadline(Some(deadline)).context(CaptureCheck("final-budget"))
 }
 
 fn validate_window(identity: &Identity, window: &Window, focus: bool) -> anyhow::Result<Ax> {
@@ -1601,6 +1690,25 @@ extern "C" {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn continuity_diagnostics_preserve_first_check_and_native_status_without_content() {
+        let error = capture_fact(
+            "ax-bounds",
+            Err(AxAttributeError {
+                attribute: "AXPosition".into(),
+                status: -25204,
+            }
+            .into()),
+        )
+        .unwrap_err();
+        assert_eq!(error.downcast_ref::<CaptureCheck>().unwrap().0, "ax-bounds");
+        let native = error.downcast_ref::<AxAttributeError>().unwrap();
+        assert_eq!(
+            (native.attribute.as_str(), native.status),
+            ("AXPosition", -25204)
+        );
+    }
+
+    #[test]
     fn launch_registration_retries_only_missing_lookup_before_strict_identity_match() {
         let expected = Identity {
             pid: 42,
@@ -1909,6 +2017,7 @@ mod tests {
             input: None,
             first_window_deadline: Instant::now() + Duration::from_secs(15),
             seen_window: false,
+            last_continuity_trace: None,
         };
         assert!(app.ax_not_ready(error()).unwrap().is_empty());
         assert!(
