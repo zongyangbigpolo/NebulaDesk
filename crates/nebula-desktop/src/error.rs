@@ -111,16 +111,19 @@ mod tests {
     async fn connection_refusal_is_not_reported_as_certificate_failure() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        // A bound but never-listening socket can drop SYNs instead of refusing.
         drop(listener);
-        let error = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .unwrap()
-            .get(format!("http://{addr}/"))
-            .send()
-            .await
-            .unwrap_err();
+        // Windows can retry a closed loopback port before reporting refusal.
+        // Bound the test, not the request whose error we need to classify.
+        let error = tokio::time::timeout(
+            Duration::from_secs(15),
+            client.get(format!("http://{addr}/")).send(),
+        )
+        .await
+        .expect("the closed loopback port did not refuse the connection")
+        .unwrap_err();
+        assert!(!error.is_timeout());
         assert_eq!(DesktopError::network(error).code, "network_connection");
     }
 }
