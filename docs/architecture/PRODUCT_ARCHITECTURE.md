@@ -564,3 +564,10 @@ cargo test -p nebula-agent --test live \
 允许至多两秒的身份确认重试，成功仍须匹配原始 PID、启动时间和规范化 bundle 路径；
 身份变化、超过期限或已建立会话中的验证失败仍关闭访问。原始查询缺口未再次复现，
 Apple 内部注册时序的具体原因尚未证实，新增诊断用于区分查询不可用与进程退出。
+
+另有更严格的 `native_app_strict_sibling_continuity_through_minimize_restore` 原生回归：
+拒绝另一窗口出现 Unavailable、generation 变化或移除，并要求持续解码，最长无帧间隔
+不超过两秒。该回归在 release 模式下仍失败。诊断显示另一窗口开始验证时还剩 248ms，
+但 `AXHidden` 请求约 224ms 后返回 `-25204`；改变查询顺序的实验仍在 `AXRole`
+请求上约 211ms 后超时，实验已撤销。该次失败不是另一窗口抢占了预算，而是新鲜 AX
+事实暂不可得；目前仍必须暂停，不能通过省略归属检查或放宽验收来声称连续性通过。
