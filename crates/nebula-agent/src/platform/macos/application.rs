@@ -48,16 +48,36 @@ pub fn capability() -> ApplicationCapability {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Identity {
     pid: i32,
     launched: f64,
     bundle: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+enum IdentityCheckFailure {
+    #[error("LaunchServices lookup unavailable")]
+    LookupUnavailable,
+    #[error("process identity changed")]
+    Changed,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("application identity verification failed during {phase}: {reason} ({expected:?}; OS executable={executable:?})")]
+struct IdentityCheckError {
+    phase: &'static str,
+    reason: IdentityCheckFailure,
+    expected: Identity,
+    // Diagnostics only: this cannot authorize or substitute for LaunchServices.
+    executable: Option<String>,
+}
+
 impl Identity {
     fn read(app: &NSRunningApplication) -> anyhow::Result<Self> {
         anyhow::ensure!(!app.isTerminated(), "application exited");
+        let pid = app.processIdentifier();
+        anyhow::ensure!(pid > 0, "application has no valid launched PID");
         let launched = app
             .launchDate()
             .ok_or_else(|| anyhow::anyhow!("no launch identity"))?
@@ -67,21 +87,101 @@ impl Identity {
             .and_then(|url| url.path())
             .ok_or_else(|| anyhow::anyhow!("no application bundle identity"))?;
         Ok(Self {
-            pid: app.processIdentifier(),
+            pid,
             launched,
             bundle: PathBuf::from(path.to_string()).canonicalize()?,
         })
     }
 
     fn check(&self) -> anyhow::Result<()> {
-        let app = NSRunningApplication::runningApplicationWithProcessIdentifier(self.pid)
-            .ok_or_else(|| anyhow::anyhow!("owned application exited"))?;
+        self.check_at("live-verification")
+    }
+
+    fn check_at(&self, phase: &'static str) -> anyhow::Result<()> {
+        let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(self.pid)
+        else {
+            let mut executable = [0u8; 4096];
+            let found = unsafe {
+                proc_pidpath(
+                    self.pid,
+                    executable.as_mut_ptr().cast(),
+                    executable.len() as u32,
+                )
+            };
+            let executable = (found > 0).then(|| {
+                let end = executable
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .unwrap_or(executable.len());
+                String::from_utf8_lossy(&executable[..end]).into_owned()
+            });
+            return Err(IdentityCheckError {
+                phase,
+                reason: IdentityCheckFailure::LookupUnavailable,
+                expected: self.clone(),
+                executable,
+            }
+            .into());
+        };
         let current = Self::read(&app)?;
-        anyhow::ensure!(
-            current.launched == self.launched && current.bundle == self.bundle,
-            "application process identity changed"
-        );
+        self.verify_observed(&current, phase)
+    }
+
+    fn verify_observed(&self, current: &Self, phase: &'static str) -> anyhow::Result<()> {
+        if current.pid != self.pid
+            || current.launched != self.launched
+            || current.bundle != self.bundle
+        {
+            tracing::warn!(phase, expected = ?self, observed = ?current, "application identity mismatch");
+            return Err(IdentityCheckError {
+                phase,
+                reason: IdentityCheckFailure::Changed,
+                expected: self.clone(),
+                executable: None,
+            }
+            .into());
+        }
         Ok(())
+    }
+}
+
+fn wait_for_registration(
+    deadline: Instant,
+    mut verify: impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<usize> {
+    let mut attempts = 0;
+    loop {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "LaunchServices registration deadline exceeded before verification"
+        );
+        attempts += 1;
+        match verify() {
+            Ok(()) => {
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "launch identity verification exceeded the registration deadline"
+                );
+                return Ok(attempts);
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<IdentityCheckError>()
+                    .is_some_and(|error| {
+                        error.phase == "launch-confirmation"
+                            && error.reason == IdentityCheckFailure::LookupUnavailable
+                    }) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(error.context("LaunchServices registration deadline exceeded"));
+                }
+                std::thread::sleep(
+                    Duration::from_millis(25)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -266,7 +366,35 @@ impl MacApplication {
             !existing.contains(&identity.pid) && identity.bundle == bundle,
             "LaunchServices reused or substituted an unowned application"
         );
-        identity.check()?;
+        tracing::info!(
+            pid = identity.pid,
+            launched = identity.launched,
+            bundle = %identity.bundle.display(),
+            "LaunchServices returned owned-instance candidate"
+        );
+        let confirmation_started = Instant::now();
+        let mut reported_missing = false;
+        let attempts = wait_for_registration(
+            confirmation_started + Duration::from_secs(2),
+            || {
+                let result = identity.check_at("launch-confirmation");
+                if let Err(error) = &result {
+                    if !reported_missing {
+                        tracing::warn!(%error, "launch identity not confirmed; capture and input remain disabled");
+                        reported_missing = true;
+                    }
+                }
+                result
+            },
+        )?;
+        if attempts > 1 {
+            tracing::info!(
+                pid = identity.pid,
+                attempts,
+                elapsed_ms = confirmation_started.elapsed().as_millis(),
+                "original launch identity strictly verified after registration became visible"
+            );
+        }
         Ok(Self {
             identity,
             windows: BTreeMap::new(),
@@ -659,7 +787,7 @@ impl ApplicationBackend for MacApplication {
             return Ok(Vec::new());
         }
         let started = Instant::now();
-        self.identity.check()?;
+        self.identity.check_at("surface-snapshot")?;
         let windows = application_windows(self.identity.pid)?;
         let cg_elapsed = started.elapsed();
         let app = Ax::application(self.identity.pid)?;
@@ -1424,6 +1552,11 @@ extern "C" {
     fn AXValueCreate(kind: u32, value: *const c_void) -> *const c_void;
 }
 
+#[link(name = "proc")]
+extern "C" {
+    fn proc_pidpath(pid: i32, buffer: *mut c_void, buffer_size: u32) -> i32;
+}
+
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     fn CFRetain(value: *const c_void) -> *const c_void;
@@ -1467,6 +1600,207 @@ extern "C" {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn launch_registration_retries_only_missing_lookup_before_strict_identity_match() {
+        let expected = Identity {
+            pid: 42,
+            launched: 123.5,
+            bundle: PathBuf::from("/fixture.app"),
+        };
+        let missing = |phase| {
+            anyhow::Error::new(IdentityCheckError {
+                phase,
+                reason: IdentityCheckFailure::LookupUnavailable,
+                expected: expected.clone(),
+                executable: Some("/fixture.app/Contents/MacOS/fixture".into()),
+            })
+        };
+        let mut calls = 0;
+        let attempts = wait_for_registration(Instant::now() + Duration::from_secs(1), || {
+            calls += 1;
+            if calls < 3 {
+                Err(missing("launch-confirmation"))
+            } else {
+                expected.verify_observed(&expected, "launch-confirmation")
+            }
+        })
+        .unwrap();
+        assert_eq!((attempts, calls), (3, 3));
+
+        for changed in [
+            Identity {
+                pid: 43,
+                ..expected.clone()
+            },
+            Identity {
+                launched: 124.5,
+                ..expected.clone()
+            },
+            Identity {
+                bundle: PathBuf::from("/other.app"),
+                ..expected.clone()
+            },
+        ] {
+            let mut calls = 0;
+            let error = wait_for_registration(Instant::now() + Duration::from_secs(1), || {
+                calls += 1;
+                if calls == 1 {
+                    Err(missing("launch-confirmation"))
+                } else {
+                    expected.verify_observed(&changed, "launch-confirmation")
+                }
+            })
+            .unwrap_err();
+            assert_eq!(
+                calls, 2,
+                "a changed PID/birth/bundle must never be retried or accepted"
+            );
+            assert_eq!(
+                error.downcast_ref::<IdentityCheckError>().unwrap().reason,
+                IdentityCheckFailure::Changed
+            );
+        }
+        let mut calls = 0;
+        assert!(
+            wait_for_registration(Instant::now() + Duration::from_secs(1), || {
+                calls += 1;
+                Err(missing("surface-snapshot"))
+            })
+            .is_err()
+        );
+        assert_eq!(
+            calls, 1,
+            "live verification must not gain startup retry semantics"
+        );
+    }
+
+    #[test]
+    fn launch_registration_deadline_prevents_new_probes_and_late_acceptance() {
+        assert!(wait_for_registration(Instant::now(), || {
+            panic!("expired registration budget must not invoke native APIs")
+        })
+        .is_err());
+        assert!(
+            wait_for_registration(Instant::now() + Duration::from_millis(5), || {
+                std::thread::sleep(Duration::from_millis(10));
+                Ok(())
+            })
+            .is_err()
+        );
+        let mut calls = 0;
+        assert!(
+            wait_for_registration(Instant::now() + Duration::from_secs(1), || {
+                calls += 1;
+                anyhow::bail!("not a missing registration")
+            })
+            .is_err()
+        );
+        assert_eq!(calls, 1);
+        let mut calls = 0;
+        assert!(
+            wait_for_registration(Instant::now() + Duration::from_millis(5), || {
+                calls += 1;
+                Err(IdentityCheckError {
+                    phase: "launch-confirmation",
+                    reason: IdentityCheckFailure::LookupUnavailable,
+                    expected: Identity {
+                        pid: 42,
+                        launched: 123.5,
+                        bundle: PathBuf::from("/fixture.app"),
+                    },
+                    executable: Some("/fixture.app/Contents/MacOS/fixture".into()),
+                }
+                .into())
+            })
+            .is_err()
+        );
+        assert!(
+            calls <= 1,
+            "persistent absence must stop before another native probe"
+        );
+    }
+
+    #[test]
+    #[ignore = "bounded launch-only registration diagnostic using the explicit owned fixture"]
+    fn native_launch_registration_timeline_probe() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let _lease = crate::application::ControllerLease::acquire(true).unwrap();
+        let path = PathBuf::from(std::env::var("NEBULA_APP_PROBE_PATH").unwrap());
+        assert_eq!(path.file_name().unwrap(), "NebulaSeamlessFixture.app");
+        for attempt in 1..=4 {
+            let launch = ApplicationLaunch {
+                launch_path: path.to_string_lossy().into_owned(),
+                launch_args: Vec::new(),
+                working_dir: None,
+            };
+            let result = std::thread::Builder::new()
+                .name("nebula-application".into())
+                .spawn(move || MacApplication::launch(&launch))
+                .unwrap()
+                .join()
+                .unwrap();
+            let (identity, registration_failed) = match result {
+                Ok(app) => (app.identity.clone(), false),
+                Err(error) => {
+                    let identity = error
+                        .downcast_ref::<IdentityCheckError>()
+                        .expect("expected only a typed identity failure")
+                        .expected
+                        .clone();
+                    eprintln!("registration attempt {attempt} failed: {error}");
+                    (identity, true)
+                }
+            };
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while identity.check_at("launch-probe-no-capture").is_err() {
+                assert!(
+                    Instant::now() < deadline,
+                    "strict registration never became visible"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            eprintln!(
+                "registration attempt {attempt}: pid={}, launch={}, initial_failure={registration_failed}; strict identity verified, no capture/input",
+                identity.pid, identity.launched
+            );
+            let status_path = path.parent().unwrap().join("status").join(format!(
+                "nebula-seamless-fixture-status-{}.json",
+                identity.pid
+            ));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !status_path.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "owned fixture did not publish status"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            let status: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(status_path).unwrap()).unwrap();
+            assert!(status["windows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|w| w["dirty"] == false));
+            identity.check().unwrap();
+            NSRunningApplication::runningApplicationWithProcessIdentifier(identity.pid)
+                .unwrap()
+                .terminate();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while identity.check_at("launch-probe-cleanup").is_ok() {
+                assert!(
+                    Instant::now() < deadline,
+                    "owned fixture normal Quit did not complete"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            assert!(
+                !registration_failed,
+                "fixture launch failed strict registration confirmation"
+            );
+        }
+    }
+
     #[test]
     fn modal_sheet_rejects_parent_focus_and_requires_the_nearest_surface() {
         // AXFocusedWindow may still report the document in all these cases;
