@@ -126,8 +126,9 @@ struct Window {
 #[derive(Debug)]
 struct AxIdentity(*const c_void);
 
-// This retained identity is only compared with CFEqual, never queried or
-// mutated across workers. Live attributes always come from fresh AX elements.
+// Retaining an AX address does not retain its attributes. Input compares this
+// identity with fresh elements; the snapshot worker may independently query it
+// when discovery times out, without treating any cached attributes as authority.
 unsafe impl Send for AxIdentity {}
 unsafe impl Sync for AxIdentity {}
 
@@ -138,6 +139,10 @@ impl AxIdentity {
 
     fn matches(&self, element: &Ax) -> bool {
         unsafe { CFEqual(self.0, element.0) }
+    }
+
+    fn element(&self) -> Ax {
+        Ax(unsafe { CFRetain(self.0) })
     }
 }
 
@@ -293,6 +298,15 @@ impl MacApplication {
     }
 
     fn ax_not_ready(&mut self, error: anyhow::Error) -> anyhow::Result<Vec<NativeSurface>> {
+        let identity = self.identity.clone();
+        self.ax_not_ready_with(error, |window| revalidate_capture_window(&identity, window))
+    }
+
+    fn ax_not_ready_with(
+        &mut self,
+        error: anyhow::Error,
+        mut verify: impl FnMut(&Window) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Vec<NativeSurface>> {
         if !error
             .downcast_ref::<AxAttributeError>()
             .is_some_and(AxAttributeError::is_readiness)
@@ -308,18 +322,80 @@ impl MacApplication {
             // or inject into while LaunchServices/AX initialization catches up.
             return Ok(Vec::new());
         }
-        if self.unavailable.is_empty() {
-            tracing::warn!(%error, pid = self.identity.pid,
-                "application AX temporarily unavailable; suspending authorized captures");
-        }
         self.release_input();
+        let was_unavailable = self.unavailable.clone();
         self.unavailable = self.windows.keys().copied().collect();
+        let discovery_timeout = error
+            .downcast_ref::<AxAttributeError>()
+            .is_some_and(|error| error.attribute == "AXWindows" && error.status == -25204);
+        let deadline = Instant::now() + Duration::from_millis(250);
+        for window in self.windows.values() {
+            // This is continuity, never discovery or recovery. In particular,
+            // an already paused capture still needs normal generation/epoch
+            // advancement after a complete successful snapshot.
+            if discovery_timeout
+                && Instant::now() < deadline
+                && !was_unavailable.contains(&window.surface.native_id)
+                && !window.surface.minimized
+                && !window.surface.modal
+                && window.surface.parent.is_none()
+                && verify(window).is_ok()
+            {
+                self.unavailable.remove(&window.surface.native_id);
+            }
+        }
+        if self.unavailable != was_unavailable {
+            tracing::warn!(
+                %error, pid = self.identity.pid,
+                suspended = self.unavailable.len(),
+                independently_verified = self.windows.len() - self.unavailable.len(),
+                "application AX discovery unavailable; suspending only unverified captures"
+            );
+        }
         Ok(self
             .windows
             .values()
             .map(|window| window.surface.clone())
             .collect())
     }
+}
+
+fn revalidate_capture_window(identity: &Identity, window: &Window) -> anyhow::Result<()> {
+    identity.check()?;
+    let (pid, bounds) = live_window_with_options(window.cg_id, 1)?;
+    anyhow::ensure!(
+        pid == identity.pid && bounds == window.bounds,
+        "surface is not visible with unchanged ownership and geometry"
+    );
+    anyhow::ensure!(
+        application_windows(identity.pid)?
+            .iter()
+            .filter(|(_, candidate)| candidate.matches(bounds))
+            .count()
+            == 1,
+        "surface geometry is ambiguous"
+    );
+    let app = Ax::application(identity.pid)?;
+    anyhow::ensure!(!app.boolean("AXHidden")?, "application is hidden");
+    let element = window
+        .ax_identity
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("surface AX identity unavailable"))?
+        .element();
+    anyhow::ensure!(
+        element.process_id()? == identity.pid
+            && element.string("AXRole")? == "AXWindow"
+            && unsafe { CFEqual(element.attribute("AXParent")?.0, app.0) }
+            && element.bounds()?.matches(bounds)
+            && !element.boolean("AXMinimized")?
+            && !element.boolean("AXModal")?
+            && element.sheets(true)?.is_empty()
+            && element.owns_content(identity.pid)?,
+        "surface lacks independent live capture authority"
+    );
+    // Never authorize input here: only a complete fresh root set establishes
+    // whether another application-modal window blocks this document.
+    Ok(())
 }
 
 fn validate_window(identity: &Identity, window: &Window, focus: bool) -> anyhow::Result<Ax> {
@@ -435,7 +511,11 @@ fn focus_matches_surface(modal_blocked: bool, nearest_surface_matches: Option<bo
 }
 
 fn live_window(id: u32) -> anyhow::Result<(i32, Bounds)> {
-    let windows = cg_window_list()?;
+    live_window_with_options(id, 0)
+}
+
+fn live_window_with_options(id: u32, options: u32) -> anyhow::Result<(i32, Bounds)> {
+    let windows = cg_window_list_with_options(options)?;
     for index in 0..unsafe { CFArrayGetCount(windows.0) } {
         let info = unsafe { CFArrayGetValueAtIndex(windows.0, index) };
         anyhow::ensure!(!info.is_null(), "invalid window metadata");
@@ -480,9 +560,13 @@ fn cg_window_geometry(info: *const c_void) -> anyhow::Result<(i32, Bounds)> {
 }
 
 fn cg_window_list() -> anyhow::Result<Ax> {
+    cg_window_list_with_options(0)
+}
+
+fn cg_window_list_with_options(options: u32) -> anyhow::Result<Ax> {
     // WindowServer metadata is cheap and fresh; SCShareableContent may block
     // for seconds. Only actual capture creation needs SCK window objects.
-    let windows = Ax(unsafe { CGWindowListCopyWindowInfo(0, 0) });
+    let windows = Ax(unsafe { CGWindowListCopyWindowInfo(options, 0) });
     anyhow::ensure!(
         !windows.0.is_null() && unsafe { CFGetTypeID(windows.0) == CFArrayGetTypeID() },
         "surface enumeration unavailable"
@@ -1495,6 +1579,240 @@ mod tests {
             app.retired.is_empty(),
             "temporary AX failure must not retire an owned ID"
         );
+
+        let mut sibling = app.windows[&42].clone();
+        sibling.surface.native_id = 43;
+        sibling.cg_id = 101;
+        app.windows.insert(43, sibling);
+        app.unavailable.clear();
+        let timeout = || {
+            anyhow::Error::new(AxAttributeError {
+                attribute: "AXWindows".into(),
+                status: -25204,
+            })
+        };
+        let surfaces = app
+            .ax_not_ready_with(timeout(), |window| {
+                anyhow::ensure!(window.surface.native_id == 43, "fresh facts unavailable");
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(app.unavailable(), vec![42]);
+        assert_eq!(surfaces.len(), 2, "no new surfaces may be discovered");
+        assert!(surfaces.iter().all(|s| s.geometry_generation == 7));
+        app.ax_not_ready_with(timeout(), |_| Ok(())).unwrap();
+        assert_eq!(
+            app.unavailable(),
+            vec![42],
+            "fresh per-window facts must not resume an already paused epoch"
+        );
+        for attribute in ["AXSheets", "AXChildren"] {
+            app.unavailable.clear();
+            app.ax_not_ready_with(
+                AxAttributeError {
+                    attribute: attribute.into(),
+                    status: -25204,
+                }
+                .into(),
+                |_| panic!("only a root enumeration timeout permits independent checks"),
+            )
+            .unwrap();
+            assert_eq!(app.unavailable(), vec![42, 43]);
+        }
+        for kind in 0..3 {
+            app.unavailable.clear();
+            let surface = &mut app.windows.get_mut(&43).unwrap().surface;
+            surface.minimized = kind == 0;
+            surface.modal = kind == 1;
+            surface.parent = (kind == 2).then_some(42);
+            app.ax_not_ready_with(timeout(), |window| {
+                assert_eq!(window.surface.native_id, 42);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(app.unavailable(), vec![43]);
+        }
+    }
+
+    #[test]
+    #[ignore = "launches the explicit task fixture; captures one native window and minimizes its sibling"]
+    fn native_ax_discovery_timeout_preserves_independently_verified_sibling() {
+        use crate::media::{FrameSink, VideoConfig};
+        use std::sync::{atomic::AtomicU64, Arc};
+
+        struct Cleanup {
+            identity: Identity,
+            roots: Vec<(u32, AxIdentity)>,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if self.identity.check().is_err() {
+                    return;
+                }
+                for (_, root) in &self.roots {
+                    let root = root.element();
+                    if root.owns_content(self.identity.pid).unwrap_or(false) {
+                        let _ = root.set_boolean("AXMinimized", false);
+                        if let Ok(button) = root.attribute("AXCloseButton") {
+                            let _ = button.perform("AXPress");
+                        }
+                    }
+                }
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while self.identity.check().is_ok() && Instant::now() < deadline {
+                    if self.roots.iter().all(|(id, _)| live_window(*id).is_err()) {
+                        // The fixture can remain resident after its documents
+                        // close. Request normal Quit only after the owned
+                        // document handles have disappeared.
+                        if let Some(app) =
+                            NSRunningApplication::runningApplicationWithProcessIdentifier(
+                                self.identity.pid,
+                            )
+                        {
+                            let _ = app.terminate();
+                        }
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
+        let path = PathBuf::from(std::env::var("NEBULA_APP_PROBE_PATH").unwrap());
+        assert_eq!(path.file_name().unwrap(), "NebulaSeamlessFixture.app");
+        let mut app = MacApplication::launch(&ApplicationLaunch {
+            launch_path: path.to_string_lossy().into_owned(),
+            launch_args: Vec::new(),
+            working_dir: None,
+        })
+        .unwrap();
+        eprintln!(
+            "AX timeout regression owned fixture PID {}, launch {}, bundle {:?}",
+            app.identity.pid, app.identity.launched, app.identity.bundle
+        );
+        let mut cleanup = Cleanup {
+            identity: app.identity.clone(),
+            roots: Vec::new(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            app.snapshot().unwrap();
+            cleanup.roots = app
+                .windows
+                .values()
+                .filter_map(|w| w.ax_identity.clone().map(|ax| (w.cg_id, ax)))
+                .collect();
+            if app.windows.len() == 2 && app.unavailable.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture roots did not become ready"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let sibling = app.windows.values().next().unwrap().clone();
+        let minimized = app.windows.values().nth(1).unwrap().clone();
+        revalidate_capture_window(&app.identity, &sibling).unwrap();
+        let mut wrong_geometry = sibling.clone();
+        wrong_geometry.bounds.x += 10.0;
+        assert!(revalidate_capture_window(&app.identity, &wrong_geometry).is_err());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let mut video = app.video(sibling.surface.native_id).unwrap();
+        video
+            .start(
+                VideoConfig {
+                    width: sibling.surface.width,
+                    height: sibling.surface.height,
+                    fps: 15,
+                    bitrate: 2_000_000,
+                },
+                FrameSink::application(
+                    tx,
+                    Arc::new(AtomicU64::new(1)),
+                    Arc::new(AtomicU64::new(0)),
+                ),
+            )
+            .unwrap();
+        app.operate(
+            minimized.surface.native_id,
+            &ApplicationMessage::Minimize {
+                surface_id: 0,
+                geometry_generation: minimized.surface.geometry_generation,
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !minimized
+            .ax_identity
+            .as_ref()
+            .unwrap()
+            .element()
+            .boolean("AXMinimized")
+            .unwrap_or(false)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "fixture did not actually minimize"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(revalidate_capture_window(&app.identity, &minimized).is_err());
+        // Force only the discovery failure. Every capture-authority check still
+        // executes against the real WindowServer and the actual fixture AX server.
+        let mut frames = 0;
+        let mut last_timestamp = 0;
+        let mut fresh_frames = 0;
+        while let Ok((frame, _)) = rx.try_recv() {
+            last_timestamp = frame.timestamp_us;
+        }
+        for _ in 0..20 {
+            let surfaces = app
+                .ax_not_ready(
+                    AxAttributeError {
+                        attribute: "AXWindows".into(),
+                        status: -25204,
+                    }
+                    .into(),
+                )
+                .unwrap();
+            assert_eq!(app.unavailable(), vec![minimized.surface.native_id]);
+            assert_eq!(
+                surfaces
+                    .iter()
+                    .find(|s| s.native_id == sibling.surface.native_id)
+                    .unwrap()
+                    .geometry_generation,
+                sibling.surface.geometry_generation
+            );
+            while let Ok((frame, epoch)) = rx.try_recv() {
+                assert_eq!(epoch, 1, "no pause/resume or frame relabeling");
+                assert!(!frame.data.is_empty());
+                fresh_frames += usize::from(frame.timestamp_us > last_timestamp);
+                last_timestamp = frame.timestamp_us;
+                frames += 1;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        video.stop();
+        assert!(
+            fresh_frames >= 5,
+            "sibling native capture stopped advancing"
+        );
+        eprintln!(
+            "20 AXWindows timeout snapshots: sibling generation {} unchanged, \
+             {frames} encoded frames/{fresh_frames} advancing timestamps, minimized surface unavailable",
+            sibling.surface.geometry_generation
+        );
+        drop(cleanup);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.identity.check().is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "normal fixture close did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        app.stop();
     }
 
     #[test]
