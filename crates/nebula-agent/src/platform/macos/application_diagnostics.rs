@@ -7,6 +7,201 @@ use serde_json::{json, Value};
 use std::process::{Child, Command, Stdio};
 use std::sync::{atomic::AtomicU64, mpsc, Arc};
 
+struct IdentityObservation {
+    expected: Identity,
+    retained: Option<objc2::rc::Retained<NSRunningApplication>>,
+    output: Arc<std::sync::Mutex<std::fs::File>>,
+    first_none: bool,
+    transaction_phase: String,
+}
+
+thread_local! {
+    static IDENTITY_OBSERVATION: std::cell::RefCell<Option<IdentityObservation>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn identity_value(expected: &Identity, app: &NSRunningApplication) -> Value {
+    let observed = Identity::read(app);
+    json!({
+        "object": format!("{:p}", app), "terminated": app.isTerminated(),
+        "pid": app.processIdentifier(),
+        "launch_bits": app.launchDate().map(|date| date.timeIntervalSince1970().to_bits()),
+        "bundle": app.bundleURL().and_then(|url| url.path()).map(|path| path.to_string()),
+        "canonical_bundle": observed.as_ref().ok().map(|value| &value.bundle),
+        "exact_identity_match": observed.as_ref().is_ok_and(|value|
+            value.pid == expected.pid && value.launched == expected.launched && value.bundle == expected.bundle),
+        "read_error": observed.err().map(|error| error.to_string())
+    })
+}
+
+fn identity_views(expected: &Identity, factory_was_none: bool) -> Value {
+    let factory = if factory_was_none {
+        None
+    } else {
+        NSRunningApplication::runningApplicationWithProcessIdentifier(expected.pid)
+    };
+    let enumerated: Vec<_> = NSWorkspace::sharedWorkspace()
+        .runningApplications()
+        .iter()
+        .filter(|app| app.processIdentifier() == expected.pid)
+        .map(|app| identity_value(expected, &app))
+        .collect();
+    let mut executable = [0u8; 4096];
+    let count = unsafe {
+        proc_pidpath(
+            expected.pid,
+            executable.as_mut_ptr().cast(),
+            executable.len() as u32,
+        )
+    };
+    let end = executable
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(executable.len());
+    json!({
+        "unix_ms": unix_ms(), "main_thread": unsafe { pthread_main_np() } != 0,
+        "thread": std::thread::current().name(), "pid": expected.pid,
+        "expected_launch_bits": expected.launched.to_bits(), "expected_bundle": expected.bundle,
+        "factory": factory.as_ref().map(|app| identity_value(expected, app)),
+        "factory_original_none_not_retried": factory_was_none,
+        "workspace_enumerated": enumerated,
+        "os_executable": (count > 0).then(|| String::from_utf8_lossy(&executable[..end]).into_owned())
+    })
+}
+
+fn write_identity_observation(output: &std::sync::Mutex<std::fs::File>, value: &Value) {
+    use std::io::Write;
+    let mut file = output.lock().unwrap();
+    serde_json::to_writer(&mut *file, value).unwrap();
+    writeln!(file).unwrap();
+    file.flush().unwrap();
+}
+
+pub(super) struct IdentityDiagnostic;
+
+impl IdentityDiagnostic {
+    pub(super) fn start(expected: &Identity) -> Option<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let root = PathBuf::from(std::env::var_os("NEBULA_IDENTITY_DIAGNOSTIC_ROOT")?)
+            .canonicalize()
+            .unwrap();
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        assert!(
+            root.starts_with(workspace.join("target")),
+            "diagnostic root must be project-local target"
+        );
+        let path = root.join(format!(
+            "identity-{}-{}.jsonl",
+            expected.pid,
+            uuid::Uuid::now_v7()
+        ));
+        let output = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        IDENTITY_OBSERVATION.with(|cell| {
+            assert!(cell.borrow().is_none());
+            *cell.borrow_mut() = Some(IdentityObservation {
+                expected: expected.clone(),
+                retained: NSRunningApplication::runningApplicationWithProcessIdentifier(
+                    expected.pid,
+                ),
+                output: Arc::new(std::sync::Mutex::new(output)),
+                first_none: false,
+                transaction_phase: "initializing".into(),
+            });
+        });
+        eprintln!("identity diagnostic output {}", path.display());
+        identity_phase("after-launch");
+        Some(Self)
+    }
+}
+
+impl Drop for IdentityDiagnostic {
+    fn drop(&mut self) {
+        identity_phase("diagnostic-end");
+        IDENTITY_OBSERVATION.with(|cell| cell.borrow_mut().take());
+    }
+}
+
+pub(super) fn identity_phase(phase: &str) {
+    IDENTITY_OBSERVATION.with(|cell| {
+        if let Some(observation) = cell.borrow_mut().as_mut() {
+            observation.transaction_phase = phase.into();
+            let mut value = identity_views(&observation.expected, false);
+            value["phase"] = json!(phase);
+            value["retained_diagnostic_only"] = observation
+                .retained
+                .as_ref()
+                .map(|app| identity_value(&observation.expected, app))
+                .unwrap_or(Value::Null);
+            write_identity_observation(&observation.output, &value);
+        }
+    });
+}
+
+pub(super) fn identity_lookup_unavailable(expected: &Identity, phase: &str) {
+    IDENTITY_OBSERVATION.with(|cell| {
+        let mut borrowed = cell.borrow_mut();
+        let Some(observation) = borrowed.as_mut() else {
+            return;
+        };
+        if observation.first_none {
+            return;
+        }
+        observation.first_none = true;
+        let mut value = identity_views(expected, true);
+        value["phase"] = json!(phase);
+        value["first_identity_factory_none"] = json!(true);
+        value["transaction_phase"] = json!(observation.transaction_phase);
+        value["retained_diagnostic_only"] = observation
+            .retained
+            .as_ref()
+            .map(|app| identity_value(expected, app))
+            .unwrap_or(Value::Null);
+        write_identity_observation(&observation.output, &value);
+        let expected = expected.clone();
+        let output = observation.output.clone();
+        let (tx, rx) = mpsc::sync_channel(1);
+        let block = RcBlock::new(move || {
+            let mut value = identity_views(&expected, false);
+            value["phase"] = json!("main-thread-read-only-after-first-none");
+            write_identity_observation(&output, &value);
+            let _ = tx.send(());
+        });
+        unsafe {
+            CFRunLoopPerformBlock(
+                CFRunLoopGetMain(),
+                kCFRunLoopCommonModes,
+                &*block as *const _ as *const c_void,
+            );
+            CFRunLoopWakeUp(CFRunLoopGetMain());
+        }
+        let observed = rx.recv_timeout(Duration::from_millis(100)).is_ok();
+        write_identity_observation(
+            &observation.output,
+            &json!({
+                "phase": "main-thread-query-budget", "completed_within_100ms": observed,
+                "original_identity_error_preserved": true, "unix_ms": unix_ms()
+            }),
+        );
+    });
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFRunLoopGetMain() -> *const c_void;
+    fn CFRunLoopPerformBlock(run_loop: *const c_void, mode: *const c_void, block: *const c_void);
+    fn CFRunLoopWakeUp(run_loop: *const c_void);
+    static kCFRunLoopCommonModes: *const c_void;
+    fn pthread_main_np() -> i32;
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Peer {
     pid: i32,

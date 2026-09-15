@@ -105,6 +105,8 @@ impl Identity {
     fn check_at(&self, phase: &'static str) -> anyhow::Result<()> {
         let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(self.pid)
         else {
+            #[cfg(test)]
+            diagnostics::identity_lookup_unavailable(self, phase);
             let mut executable = [0u8; 4096];
             let found = unsafe {
                 proc_pidpath(
@@ -2303,6 +2305,7 @@ mod tests {
             identity: app.identity.clone(),
             roots: Vec::new(),
         };
+        let _identity_diagnostic = diagnostics::IdentityDiagnostic::start(&app.identity);
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             app.snapshot().unwrap();
@@ -2345,6 +2348,7 @@ mod tests {
         wrong_geometry.bounds.x += 10.0;
         assert!(verify(&wrong_geometry).is_err());
         let native_app = Ax::application(identity.pid).unwrap();
+        diagnostics::identity_phase("before-hide");
         native_app.set_boolean("AXHidden", true).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !native_app.boolean("AXHidden").unwrap() {
@@ -2355,6 +2359,7 @@ mod tests {
             verify(&sibling).is_err(),
             "hidden application must not retain capture authority"
         );
+        diagnostics::identity_phase("after-hidden-rejection");
         native_app.set_boolean("AXHidden", false).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while verify(&sibling).is_err() {
@@ -2367,8 +2372,10 @@ mod tests {
         eprintln!(
             "fresh-authority negatives: changed geometry and actually hidden application rejected"
         );
+        diagnostics::identity_phase("after-unhide-verification");
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let mut video = app.video(sibling.surface.native_id).unwrap();
+        diagnostics::identity_phase("before-capture-start");
         video
             .start(
                 VideoConfig {
@@ -2384,14 +2391,17 @@ mod tests {
                 ),
             )
             .unwrap();
-        app.operate(
+        diagnostics::identity_phase("after-capture-start");
+        diagnostics::identity_phase("before-minimize-operation");
+        let operation = app.operate(
             minimized.surface.native_id,
             &ApplicationMessage::Minimize {
                 surface_id: 0,
                 geometry_generation: minimized.surface.geometry_generation,
             },
-        )
-        .unwrap();
+        );
+        diagnostics::identity_phase("after-minimize-operation");
+        operation.unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !minimized
             .ax_identity
@@ -2492,7 +2502,9 @@ mod tests {
             "retaining a closed window's AX identity must not authorize capture"
         );
         eprintln!("fresh-authority negatives: actual attached sheet and closed retained AX element rejected");
+        diagnostics::identity_phase("before-normal-cleanup");
         drop(cleanup);
+        diagnostics::identity_phase("after-normal-cleanup-request");
         let deadline = Instant::now() + Duration::from_secs(5);
         while app.identity.check().is_ok() {
             assert!(
