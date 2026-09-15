@@ -1,5 +1,50 @@
 import AppKit
 
+final class AXTransactionObservation {
+    private let lock = NSLock()
+    private var events: [[String: Any]] = []
+    private let output: URL
+    private var mainTimer: Timer?
+    private var backgroundTimer: DispatchSourceTimer?
+
+    init(directory: URL) {
+        output = directory.appendingPathComponent(
+            "ax-transaction-\(ProcessInfo.processInfo.processIdentifier).json")
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+            self?.record("main-common-heartbeat")
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        mainTimer = timer
+        let background = DispatchSource.makeTimerSource(
+            queue: DispatchQueue(label: "fixture-ax-observation"))
+        background.schedule(deadline: .now(), repeating: 0.1)
+        background.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.record("background-heartbeat")
+            self.lock.lock()
+            let snapshot = self.events
+            self.lock.unlock()
+            if let data = try? JSONSerialization.data(withJSONObject: snapshot, options: [.sortedKeys]) {
+                try? data.write(to: self.output, options: .atomic)
+            }
+        }
+        backgroundTimer = background
+        background.resume()
+    }
+
+    func record(_ kind: String) {
+        let event: [String: Any] = [
+            "kind": kind, "unix_ms": Date().timeIntervalSince1970 * 1000,
+            "main_thread": Thread.isMainThread,
+            "runloop_mode": RunLoop.current.currentMode?.rawValue ?? "none"
+        ]
+        lock.lock()
+        events.append(event)
+        if events.count > 512 { events.removeFirst(events.count - 512) }
+        lock.unlock()
+    }
+}
+
 final class ScrollContent: NSView {
     override var isFlipped: Bool { true }
 }
@@ -76,6 +121,7 @@ final class Document: NSObject, NSWindowDelegate, NSTextFieldDelegate {
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             guard let self else { return }
             self.tick += 1
+            if self.id == 1 { self.owner?.axObservation?.record("main-default-tick") }
             self.counter.stringValue = "Document \(self.id) - tick \(self.tick)"
             if self.tick % 10 == 0 { self.owner?.report() }
         }
@@ -136,7 +182,13 @@ final class Document: NSObject, NSWindowDelegate, NSTextFieldDelegate {
     }
 
     func windowDidResize(_ notification: Notification) { owner?.report() }
-    func windowDidMiniaturize(_ notification: Notification) { owner?.report() }
+    func windowWillMiniaturize(_ notification: Notification) {
+        owner?.axObservation?.record("will-miniaturize")
+    }
+    func windowDidMiniaturize(_ notification: Notification) {
+        owner?.axObservation?.record("did-miniaturize")
+        owner?.report()
+    }
     func windowDidDeminiaturize(_ notification: Notification) { owner?.report() }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -176,6 +228,7 @@ final class Fixture: NSObject, NSApplicationDelegate {
     var keyUpCodes: [Int] = []
     var mouseEvents: [[String: Any]] = []
     var inputMonitor: Any?
+    var axObservation: AXTransactionObservation?
     let statusDirectory = URL(fileURLWithPath:
         Bundle.main.object(forInfoDictionaryKey: "NebulaFixtureStatusDirectory") as? String ?? "/tmp")
     lazy var status = statusDirectory.appendingPathComponent(
@@ -183,6 +236,9 @@ final class Fixture: NSObject, NSApplicationDelegate {
     lazy var latestStatus = statusDirectory.appendingPathComponent("nebula-seamless-fixture-status.json")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if CommandLine.arguments.contains("--ax-transaction-observation") {
+            axObservation = AXTransactionObservation(directory: statusDirectory)
+        }
         inputMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .leftMouseDown, .leftMouseUp, .leftMouseDragged, .scrollWheel]) { [weak self] event in
             if let self {
                 if event.type == .keyDown {

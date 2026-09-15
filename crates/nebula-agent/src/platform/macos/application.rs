@@ -25,6 +25,10 @@ use crate::media::VideoSource;
 
 use super::{capture, input};
 
+#[cfg(test)]
+#[path = "application_diagnostics.rs"]
+mod diagnostics;
+
 /// Probe prerequisites without displaying consent prompts.
 pub fn capability() -> ApplicationCapability {
     // Probe permissions, native API availability and the real encoder here.

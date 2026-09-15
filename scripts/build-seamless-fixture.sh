@@ -6,7 +6,9 @@ if [[ "$(uname -s)" != Darwin ]]; then
   exit 1
 fi
 
-output="$PWD/target/seamless-fixture"
+output="${1:-$PWD/target/seamless-fixture}"
+mkdir -p "$output"
+output="$(cd "$output" && pwd)"
 bundle="$output/NebulaSeamlessFixture.app"
 status="$output/status"
 source_dir="crates/nebula-agent/tests/fixtures"
