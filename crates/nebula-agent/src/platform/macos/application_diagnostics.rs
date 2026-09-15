@@ -143,6 +143,16 @@ fn native_ax_transaction_peer() {
 #[test]
 #[ignore = "one minimize transaction on an explicit independent fixture; compares three AX clients"]
 fn native_ax_transaction_compare_clients() {
+    run_transaction(false);
+}
+
+#[test]
+#[ignore = "one owned minimize; tests fresh pre-mutation proof with the unchanged 200ms refresh cadence"]
+fn native_minimize_fresh_snapshot_phase_probe() {
+    run_transaction(true);
+}
+
+fn run_transaction(align_refresh: bool) {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let _lease = crate::application::ControllerLease::acquire(true).unwrap();
     let bundle =
@@ -235,6 +245,83 @@ fn native_ax_transaction_compare_clients() {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+    if align_refresh {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            app.snapshot().unwrap();
+            if app.unavailable.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pre-mutation snapshot did not fully verify"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let verified_at = Instant::now();
+        let verified_unix_ms = unix_ms();
+        let target = app.windows[&target.surface.native_id].clone();
+        let sibling = app.windows[&sibling.surface.native_id].clone();
+        let began = unix_ms();
+        let operation = app.operate(
+            target.surface.native_id,
+            &ApplicationMessage::Minimize {
+                surface_id: 0,
+                geometry_generation: target.surface.geometry_generation,
+            },
+        );
+        let operation_end = unix_ms();
+        // Match the existing worker's refresh period, measured from actual
+        // completed verification, not from the mutation or a cached result.
+        let due = verified_at + Duration::from_millis(200);
+        std::thread::sleep(due.saturating_duration_since(Instant::now()));
+        let refresh_begin = unix_ms();
+        let snapshot = app.snapshot();
+        let refresh_end = unix_ms();
+        let continuous = snapshot.is_ok()
+            && !app.unavailable.contains(&sibling.surface.native_id)
+            && app
+                .windows
+                .get(&sibling.surface.native_id)
+                .is_some_and(|window| {
+                    window.surface.geometry_generation == sibling.surface.geometry_generation
+                });
+        let result = json!({
+            "pid":app.identity.pid, "launched":app.identity.launched,
+            "fresh_verified_unix_ms":verified_unix_ms, "minimize_begin_unix_ms":began,
+            "minimize_end_unix_ms":operation_end, "operation_ok":operation.is_ok(),
+            "operation_error":operation.as_ref().err().map(ToString::to_string),
+            "refresh_begin_unix_ms":refresh_begin, "refresh_end_unix_ms":refresh_end,
+            "refresh_ok":snapshot.is_ok(), "unavailable":app.unavailable(),
+            "sibling_id":sibling.surface.native_id, "sibling_generation":sibling.surface.geometry_generation,
+            "sibling_still_verified":continuous, "cadence_ms":200, "continuity_budget_ms":250,
+        });
+        std::fs::write(
+            directory.join("phase-result.json"),
+            serde_json::to_vec_pretty(&result).unwrap(),
+        )
+        .unwrap();
+        eprintln!("AX fresh-snapshot phase result {result}");
+        for video in &mut videos {
+            video.stop();
+        }
+        drop(cleanup);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.identity.check().is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "owned phase fixture normal Quit did not complete"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        operation.unwrap();
+        snapshot.unwrap();
+        assert!(
+            continuous,
+            "fresh pre-mutation proof did not preserve sibling authority"
+        );
+        return;
     }
     let peer = Peer {
         pid: app.identity.pid,

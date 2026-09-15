@@ -12,6 +12,8 @@ use ndp_proto::InputEvent;
 
 use crate::media::VideoSource;
 
+const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
 #[derive(Debug, thiserror::Error)]
 #[error("application surface ID limit reached")]
 struct SurfaceLimit;
@@ -58,6 +60,11 @@ pub trait ApplicationBackend: Send + 'static {
     fn input(&mut self, native_id: u64, generation: u32, event: &InputEvent) -> anyhow::Result<()>;
     /// Perform a scoped native command, including its geometry check.
     fn operate(&mut self, native_id: u64, command: &ApplicationMessage) -> anyhow::Result<()>;
+    /// Scheduling hint only: request an additional full verification immediately
+    /// before a native transition, without lengthening the normal refresh period.
+    fn refresh_before_operation(&self, _native_id: u64, _command: &ApplicationMessage) -> bool {
+        false
+    }
     /// Release held input on rejection, focus loss and teardown.
     fn release_input(&mut self);
     /// Release capture/input; never terminate a user's pre-existing process.
@@ -421,6 +428,38 @@ impl Drop for Runtime {
 }
 
 impl Runtime {
+    fn refresh_for_operation(
+        &mut self,
+        command: &WorkerCommand,
+        input_allowed: bool,
+        events: &tokio::sync::mpsc::Sender<WorkerEvent>,
+    ) -> anyhow::Result<Option<std::time::Instant>> {
+        let WorkerCommand::Client(command) = command else {
+            return Ok(None);
+        };
+        if !input_allowed {
+            return Ok(None);
+        }
+        let Ok(native) = self.surfaces.target(command) else {
+            return Ok(None);
+        };
+        if !self.backend.refresh_before_operation(native, command) {
+            return Ok(None);
+        }
+        // Measure from before verification, never after a potentially slow
+        // capture start. Extra work cannot extend the authority's refresh age.
+        let next_refresh = std::time::Instant::now() + REFRESH_INTERVAL;
+        self.refresh(events)?;
+        tracing::info!(
+            native_id = native,
+            next_refresh_ms = next_refresh
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis(),
+            "completed additional fresh snapshot before native transition"
+        );
+        Ok(Some(next_refresh))
+    }
+
     fn command(&mut self, command: WorkerCommand, input_allowed: bool) -> anyhow::Result<()> {
         let command = match command {
             WorkerCommand::Keyframe(id) => {
@@ -717,6 +756,15 @@ pub(crate) fn spawn(
                                 "native application command queue was slow"
                             );
                         }
+                        if let Some(next_refresh) =
+                            runtime.refresh_for_operation(&command, input_allowed, &event_tx)?
+                        {
+                            if had_surface && runtime.surfaces.live.is_empty() {
+                                return Ok(());
+                            }
+                            had_surface |= !runtime.surfaces.live.is_empty();
+                            refresh = next_refresh;
+                        }
                         if let Err(error) = runtime.command(command, input_allowed) {
                             runtime.backend.release_input();
                             tracing::debug!(%error, "scoped application command rejected");
@@ -728,7 +776,7 @@ pub(crate) fn spawn(
                             return Ok(());
                         }
                         had_surface |= !runtime.surfaces.live.is_empty();
-                        refresh = Instant::now() + Duration::from_millis(200);
+                        refresh = Instant::now() + REFRESH_INTERVAL;
                     }
                     let mut ended = Vec::new();
                     for (&id, capture) in runtime.captures.iter_mut() {
@@ -863,6 +911,10 @@ mod tests {
         video_starts: std::sync::atomic::AtomicUsize,
         resume_generation: std::sync::atomic::AtomicBool,
         unchanged_video: std::sync::atomic::AtomicBool,
+        refresh_before_mutation: std::sync::atomic::AtomicBool,
+        snapshot_count: std::sync::atomic::AtomicUsize,
+        snapshot_failure: std::sync::atomic::AtomicBool,
+        snapshot_delay: std::sync::Mutex<Option<std::time::Duration>>,
     }
 
     struct SyntheticApplication(std::sync::Arc<Probe>);
@@ -941,7 +993,25 @@ mod tests {
                 && from.checked_add(1) == Some(to)
         }
         fn snapshot(&mut self) -> anyhow::Result<Vec<NativeSurface>> {
+            use std::sync::atomic::Ordering;
+            self.0.snapshot_count.fetch_add(1, Ordering::SeqCst);
+            anyhow::ensure!(
+                !self.0.snapshot_failure.load(Ordering::SeqCst),
+                "snapshot failure"
+            );
+            if let Some(delay) = *self.0.snapshot_delay.lock().unwrap() {
+                std::thread::sleep(delay);
+            }
             Ok(self.0.surfaces.lock().unwrap().clone())
+        }
+        fn refresh_before_operation(&self, _: u64, command: &ApplicationMessage) -> bool {
+            self.0
+                .refresh_before_mutation
+                .load(std::sync::atomic::Ordering::SeqCst)
+                && matches!(
+                    command,
+                    ApplicationMessage::Minimize { .. } | ApplicationMessage::Focus { .. }
+                )
         }
         fn unavailable(&self) -> Vec<u64> {
             if self.0.unavailable.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1175,6 +1245,91 @@ mod tests {
         assert_eq!(
             probe.operations.load(std::sync::atomic::Ordering::SeqCst),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn mutation_preflight_is_fresh_scoped_and_never_extends_refresh_deadline() {
+        use std::sync::{atomic::Ordering, Arc};
+        let probe = Arc::new(Probe::default());
+        probe.refresh_before_mutation.store(true, Ordering::SeqCst);
+        *probe.surfaces.lock().unwrap() = vec![surface(100, None)];
+        let (frames, _frames) = tokio::sync::mpsc::channel(8);
+        let (events, _events) = tokio::sync::mpsc::channel(64);
+        let mut runtime = Runtime {
+            backend: Box::new(SyntheticApplication(probe.clone())),
+            surfaces: Surfaces::new(),
+            captures: BTreeMap::new(),
+            retry: BTreeMap::new(),
+            bitrate: 4_000_000,
+            frames,
+        };
+        runtime
+            .surfaces
+            .reconcile(vec![surface(100, None)])
+            .unwrap();
+        let minimize = || {
+            WorkerCommand::Client(ApplicationMessage::Minimize {
+                surface_id: 0,
+                geometry_generation: 1,
+            })
+        };
+        assert!(runtime
+            .refresh_for_operation(&minimize(), false, &events)
+            .unwrap()
+            .is_none());
+        assert!(runtime
+            .refresh_for_operation(
+                &WorkerCommand::Client(ApplicationMessage::Minimize {
+                    surface_id: 0,
+                    geometry_generation: 99,
+                }),
+                true,
+                &events
+            )
+            .unwrap()
+            .is_none());
+        assert!(runtime
+            .refresh_for_operation(
+                &WorkerCommand::Client(ApplicationMessage::RequestKeyframe {
+                    surface_id: 0,
+                    geometry_generation: 1,
+                }),
+                true,
+                &events
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(probe.snapshot_count.load(Ordering::SeqCst), 0);
+
+        *probe.snapshot_delay.lock().unwrap() =
+            Some(REFRESH_INTERVAL + std::time::Duration::from_millis(10));
+        let due = runtime
+            .refresh_for_operation(&minimize(), true, &events)
+            .unwrap()
+            .unwrap();
+        assert!(
+            due <= std::time::Instant::now(),
+            "slow verification must not postpone the next check"
+        );
+        assert_eq!(probe.snapshot_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            probe.operations.load(Ordering::SeqCst),
+            0,
+            "verification must precede mutation"
+        );
+        runtime.command(minimize(), true).unwrap();
+        assert_eq!(probe.operations.load(Ordering::SeqCst), 1);
+
+        *probe.snapshot_delay.lock().unwrap() = None;
+        probe.snapshot_failure.store(true, Ordering::SeqCst);
+        assert!(runtime
+            .refresh_for_operation(&minimize(), true, &events)
+            .is_err());
+        assert_eq!(
+            probe.operations.load(Ordering::SeqCst),
+            1,
+            "failed preflight must not mutate"
         );
     }
 

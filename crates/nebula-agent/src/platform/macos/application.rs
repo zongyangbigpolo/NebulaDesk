@@ -853,6 +853,16 @@ fn application_windows(owner_pid: i32) -> anyhow::Result<Vec<(u32, Bounds)>> {
 }
 
 impl ApplicationBackend for MacApplication {
+    fn refresh_before_operation(&self, native_id: u64, command: &ApplicationMessage) -> bool {
+        self.windows
+            .get(&native_id)
+            .is_some_and(|window| match command {
+                ApplicationMessage::Minimize { .. } => !window.surface.minimized,
+                ApplicationMessage::Focus { .. } => window.surface.minimized,
+                _ => false,
+            })
+    }
+
     fn can_resume_capture(&self, native_id: u64, from: u32, to: u32) -> bool {
         self.windows.get(&native_id).is_some_and(|window| {
             window.resumable_from == Some(from)
@@ -1277,6 +1287,10 @@ impl Ax {
         Ok(remaining.min(Duration::from_millis(200)).as_secs_f32())
     }
 
+    fn can_retry_read(&self, status: i32, retried: bool) -> bool {
+        !retried && status == -25204 && self.1.is_some() && self.messaging_timeout().is_ok()
+    }
+
     fn process_id(&self) -> anyhow::Result<i32> {
         check_deadline(self.1)?;
         anyhow::ensure!(
@@ -1393,29 +1407,47 @@ impl Ax {
     }
 
     fn attribute(&self, name: &str) -> anyhow::Result<Self> {
-        let timeout = self.messaging_timeout()?;
+        self.messaging_timeout()?;
         anyhow::ensure!(
             unsafe { CFGetTypeID(self.0) == AXUIElementGetTypeID() },
             "invalid AX element"
         );
-        let configured = unsafe { AXUIElementSetMessagingTimeout(self.0, timeout) };
-        anyhow::ensure!(
-            self.1.is_none() || configured == 0,
-            "cannot bound native AX messaging timeout"
-        );
         let key = cf_string(name)?;
-        let mut value = std::ptr::null();
-        let status = unsafe { AXUIElementCopyAttributeValue(self.0, key.0, &mut value) };
-        let value = Self(value, self.1);
-        check_deadline(self.1)?;
-        if status != 0 || value.0.is_null() {
-            return Err(AxAttributeError {
-                attribute: name.into(),
-                status: if status == 0 { -25212 } else { status },
+        let started = Instant::now();
+        let mut retried = false;
+        loop {
+            let timeout = self.messaging_timeout()?;
+            let configured = unsafe { AXUIElementSetMessagingTimeout(self.0, timeout) };
+            anyhow::ensure!(
+                self.1.is_none() || configured == 0,
+                "cannot bound native AX messaging timeout"
+            );
+            let mut value = std::ptr::null();
+            let status = unsafe { AXUIElementCopyAttributeValue(self.0, key.0, &mut value) };
+            let value = Self(value, self.1);
+            check_deadline(self.1)?;
+            // A timed-out read is not authority. Only deadline-bearing capture
+            // verification may spend its remaining budget on one fresh request.
+            if self.can_retry_read(status, retried) {
+                retried = true;
+                continue;
             }
-            .into());
+            if status != 0 || value.0.is_null() {
+                return Err(AxAttributeError {
+                    attribute: name.into(),
+                    status: if status == 0 { -25212 } else { status },
+                }
+                .into());
+            }
+            if retried {
+                tracing::info!(
+                    attribute = name,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "native AX read recovered inside original verification deadline"
+                );
+            }
+            return Ok(value);
         }
-        Ok(value)
     }
 
     fn children(&self, name: &str) -> anyhow::Result<Vec<Self>> {
@@ -2065,6 +2097,21 @@ mod tests {
                 },
             },
         );
+        let focus = ApplicationMessage::Focus {
+            surface_id: 0,
+            geometry_generation: 7,
+        };
+        let minimize = ApplicationMessage::Minimize {
+            surface_id: 0,
+            geometry_generation: 7,
+        };
+        assert!(!app.refresh_before_operation(42, &focus));
+        assert!(app.refresh_before_operation(42, &minimize));
+        assert!(!app.refresh_before_operation(99, &minimize));
+        app.windows.get_mut(&42).unwrap().surface.minimized = true;
+        assert!(app.refresh_before_operation(42, &focus));
+        assert!(!app.refresh_before_operation(42, &minimize));
+        app.windows.get_mut(&42).unwrap().surface.minimized = false;
         let pending = app.ax_not_ready(error()).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(
@@ -2154,7 +2201,14 @@ mod tests {
         let element =
             Ax(std::ptr::null(), None).with_deadline(Instant::now() + Duration::from_millis(40));
         assert!(element.messaging_timeout().unwrap() <= 0.04);
+        assert!(element.can_retry_read(-25204, false));
+        assert!(!element.can_retry_read(-25204, true));
+        for status in [-25202, -25205, -25211, -25212] {
+            assert!(!element.can_retry_read(status, false));
+        }
+        assert!(!Ax(std::ptr::null(), None).can_retry_read(-25204, false));
         let expired = element.with_deadline(Instant::now() - Duration::from_millis(1));
+        assert!(!expired.can_retry_read(-25204, false));
         assert!(expired.messaging_timeout().is_err());
         assert!(
             expired.attribute("AXWindows").is_err(),
