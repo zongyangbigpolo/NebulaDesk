@@ -24,8 +24,12 @@ final class AXTransactionObservation {
             self.lock.lock()
             let snapshot = self.events
             self.lock.unlock()
-            if let data = try? JSONSerialization.data(withJSONObject: snapshot, options: [.sortedKeys]) {
-                try? data.write(to: self.output, options: .atomic)
+            do {
+                let data = try JSONSerialization.data(withJSONObject: snapshot, options: [.sortedKeys])
+                try data.write(to: self.output, options: .atomic)
+            } catch {
+                fputs("AX transaction observation write failed: \(error)\n", stderr)
+                self.backgroundTimer?.cancel()
             }
         }
         backgroundTimer = background
